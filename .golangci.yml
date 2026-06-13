@@ -1,0 +1,14 @@
+version: "2"
+linters:
+  enable:
+    - revive
+  settings:
+    revive:
+      rules:
+        # Flag import aliases that merely restate the package's path name,
+        # e.g. `ed25519 "crypto/ed25519"`. Aliases should only disambiguate.
+        - name: redundant-import-alias
+  exclusions:
+    # Don't nag about unchecked errors on deferred Close, fmt.Print*, etc.
+    presets:
+      - std-error-handling

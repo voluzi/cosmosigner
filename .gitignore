@@ -1,0 +1,6 @@
+/bin/
+/data/
+*.out
+*.test
+.idea/
+/vault-token
