@@ -10,7 +10,7 @@ require (
 	github.com/creasty/defaults v1.8.0
 	github.com/google/tink/go v1.7.0
 	github.com/hashicorp/go-hclog v1.6.3
-	github.com/hashicorp/raft v1.7.1
+	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/spf13/cobra v1.8.1
@@ -50,6 +50,7 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
+	github.com/hashicorp/go-metrics v0.5.4 // indirect
 	github.com/hashicorp/go-msgpack/v2 v2.1.2 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
