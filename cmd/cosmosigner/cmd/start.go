@@ -30,7 +30,7 @@ func NewStartCmd() *cobra.Command {
 			if cfgFile == "" {
 				cfgFile = os.Getenv("COSMOSIGNER_CONFIG")
 			}
-			cfg, err := config.Load(cfgFile, func(c *config.Config) { overlayStartFlags(cmd, c) })
+			cfg, err := config.Load(cfgFile, func(c *config.Config) error { return overlayStartFlags(cmd, c) })
 			if err != nil {
 				return err
 			}
@@ -61,7 +61,7 @@ func NewStartCmd() *cobra.Command {
 }
 
 // overlayStartFlags applies explicitly-set flags onto the loaded config.
-func overlayStartFlags(cmd *cobra.Command, c *config.Config) {
+func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 	f := cmd.Flags()
 	s := func(name string, dst *string) {
 		if f.Changed(name) {
@@ -93,22 +93,31 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) {
 	}
 	if f.Changed("raft-member") {
 		raw, _ := f.GetStringArray("raft-member")
-		c.Raft.Members = parseMembers(raw)
+		members, err := parseMembers(raw)
+		if err != nil {
+			return err
+		}
+		c.Raft.Members = members
 	}
 	s("raft-tls-cert", &c.Raft.TLSCert)
 	s("raft-tls-key", &c.Raft.TLSKey)
 	s("raft-tls-ca", &c.Raft.TLSCA)
 	overlayBackendFlags(cmd, &c.Backend)
+	return nil
 }
 
-func parseMembers(raw []string) []config.Member {
+func parseMembers(raw []string) ([]config.Member, error) {
 	members := make([]config.Member, 0, len(raw))
 	for _, m := range raw {
-		if id, addr, ok := strings.Cut(m, "="); ok {
-			members = append(members, config.Member{ID: id, Address: addr})
+		m = strings.TrimSpace(m)
+		id, addr, ok := strings.Cut(m, "=")
+		id, addr = strings.TrimSpace(id), strings.TrimSpace(addr)
+		if !ok || id == "" || addr == "" {
+			return nil, fmt.Errorf("invalid --raft-member %q: want id=address", m)
 		}
+		members = append(members, config.Member{ID: id, Address: addr})
 	}
-	return members
+	return members, nil
 }
 
 func runStart(cfg config.Config) error {

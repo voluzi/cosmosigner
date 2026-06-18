@@ -37,10 +37,11 @@ func TestLoad_EnvOverridesFile(t *testing.T) {
 
 func TestLoad_FlagOverlayWins(t *testing.T) {
 	t.Setenv("COSMOSIGNER_CHAIN_ID", "from-env")
-	cfg, err := Load("", func(c *Config) {
+	cfg, err := Load("", func(c *Config) error {
 		c.ChainID = "from-flag"
 		c.NodeAddrs = []string{"x:1"}
 		c.Backend.SoftwareKeyFile = "/k"
+		return nil
 	})
 	require.NoError(t, err)
 	require.Equal(t, "from-flag", cfg.ChainID) // flag > env
@@ -61,15 +62,16 @@ func TestLoad_EnvBackendAndSlices(t *testing.T) {
 
 func TestValidate_MutuallyExclusiveNodes(t *testing.T) {
 	t.Setenv("COSMOSIGNER_CHAIN_ID", "c")
-	_, err := Load("", func(c *Config) {
+	_, err := Load("", func(c *Config) error {
 		c.NodeAddrs = []string{"a:1"}
 		c.NodeService = "svc:5555"
 		c.Backend.SoftwareKeyFile = "/k"
+		return nil
 	})
 	require.ErrorContains(t, err, "mutually exclusive")
 }
 
 func TestValidate_RequiresChainID(t *testing.T) {
-	_, err := Load("", func(c *Config) { c.NodeAddrs = []string{"a:1"} })
+	_, err := Load("", func(c *Config) error { c.NodeAddrs = []string{"a:1"}; return nil })
 	require.ErrorContains(t, err, "chain_id")
 }

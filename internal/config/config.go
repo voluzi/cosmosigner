@@ -74,7 +74,7 @@ func Defaults() Config {
 
 // Load builds the configuration: defaults → YAML file (if path set) → env →
 // flag overlay (highest precedence), then validates.
-func Load(path string, overlay func(*Config)) (*Config, error) {
+func Load(path string, overlay func(*Config) error) (*Config, error) {
 	var c Config
 	if err := defaults.Set(&c); err != nil {
 		return nil, fmt.Errorf("apply defaults: %w", err)
@@ -88,7 +88,9 @@ func Load(path string, overlay func(*Config)) (*Config, error) {
 		return nil, fmt.Errorf("parse environment: %w", err)
 	}
 	if overlay != nil {
-		overlay(&c)
+		if err := overlay(&c); err != nil {
+			return nil, err
+		}
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
