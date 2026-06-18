@@ -109,7 +109,9 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 func parseMembers(raw []string) ([]config.Member, error) {
 	members := make([]config.Member, 0, len(raw))
 	for _, m := range raw {
+		m = strings.TrimSpace(m)
 		id, addr, ok := strings.Cut(m, "=")
+		id, addr = strings.TrimSpace(id), strings.TrimSpace(addr)
 		if !ok || id == "" || addr == "" {
 			return nil, fmt.Errorf("invalid --raft-member %q: want id=address", m)
 		}
