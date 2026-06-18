@@ -4,6 +4,34 @@ A Go-native CometBFT remote signer with **Vault-backed key custody** and
 **embedded-raft double-sign protection**. A modern replacement for tmkms that
 also borrows horcrux's high-availability model.
 
+## Project status
+
+Cosmosigner is early-stage validator infrastructure. Review the security model,
+run it in non-production first, and make sure your deployment has operational
+rollback and incident-response procedures before using it with real validator
+keys.
+
+## Install
+
+Install the latest release with the Voluzi installer:
+
+```sh
+curl -s https://get.voluzi.com/cosmosigner! | bash
+```
+
+You can also download binaries from GitHub Releases, use the published container
+image, or build from source:
+
+```sh
+go install github.com/voluzi/cosmosigner/cmd/cosmosigner@latest
+```
+
+Container images are published to GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/voluzi/cosmosigner:latest
+```
+
 ## Why
 
 - **Key custody in Vault or Cloud KMS.** The validator consensus key lives in
@@ -254,8 +282,35 @@ raft:
   # tls_ca: /tls/raft-ca.pem
 ```
 
-## Status
+## Development
 
-v1: software + Vault Transit + Google Cloud KMS backends (provision + BYOK
-import), embedded-raft state store, env-var config, single chain.
-Not yet: AWS KMS backend, external CP state stores.
+```sh
+make build
+make test
+make vet
+```
+
+`make test-cover` runs the race detector and writes `coverage.out`, matching CI.
+Integration tests for Vault and Google Cloud KMS are opt-in; see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for setup.
+
+## Security and responsible disclosure
+
+Cosmosigner is security-sensitive because it gates validator signatures. If you
+find a vulnerability, do not open a public issue; follow
+[`SECURITY.md`](SECURITY.md).
+
+For production deployments:
+
+- Prefer a remote custody backend (`vault` or `gcpkms`) over `software`.
+- Use private networking and firewall policy between validators, signers, raft
+  peers, Vault, and KMS endpoints.
+- Enable raft mTLS whenever signer replicas communicate over an untrusted
+  network.
+- Keep validator key files, Vault tokens, KMS credentials, raft data, and local
+  test data out of source control and unaudited backups.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).

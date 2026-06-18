@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible Cosmosigner bug
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include secrets, validator private keys, Vault tokens, cloud credentials, or private infrastructure details.
+
+        If this may be a security vulnerability, stop and follow SECURITY.md instead of opening a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Cosmosigner version, tag, or commit.
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - software
+        - vault
+        - gcpkms
+        - other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the issue and expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide a minimal reproduction with secrets redacted.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Paste relevant logs with secrets redacted.
+      render: text

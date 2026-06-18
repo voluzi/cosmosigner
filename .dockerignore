@@ -1,0 +1,12 @@
+.git
+.gitignore
+.github
+bin
+cosmosigner
+data
+coverage.out
+*.test
+*.out
+vault-token
+.DS_Store
+.idea

@@ -1,7 +1,7 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
-ARG VERSION
-ARG COMMIT
+ARG VERSION=dev
+ARG COMMIT=none
 
 RUN apk --no-cache add git make
 
