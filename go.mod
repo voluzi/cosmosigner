@@ -6,7 +6,7 @@ require (
 	cloud.google.com/go/kms v1.31.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cometbft/cometbft v0.37.4
-	github.com/cosmos/gogoproto v1.4.1
+	github.com/cosmos/gogoproto v1.7.2
 	github.com/creasty/defaults v1.8.0
 	github.com/google/tink/go v1.7.0
 	github.com/hashicorp/go-hclog v1.6.3
@@ -43,6 +43,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.16 // indirect
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
