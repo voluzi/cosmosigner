@@ -1,5 +1,12 @@
 # cosmosigner
 
+[![Test](https://github.com/voluzi/cosmosigner/actions/workflows/test.yml/badge.svg)](https://github.com/voluzi/cosmosigner/actions/workflows/test.yml)
+[![Build latest image](https://github.com/voluzi/cosmosigner/actions/workflows/docker-latest.yml/badge.svg)](https://github.com/voluzi/cosmosigner/actions/workflows/docker-latest.yml)
+[![Release image](https://github.com/voluzi/cosmosigner/actions/workflows/docker.yml/badge.svg)](https://github.com/voluzi/cosmosigner/actions/workflows/docker.yml)
+[![GoReleaser](https://github.com/voluzi/cosmosigner/actions/workflows/goreleaser.yml/badge.svg)](https://github.com/voluzi/cosmosigner/actions/workflows/goreleaser.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/voluzi/cosmosigner.svg)](https://pkg.go.dev/github.com/voluzi/cosmosigner)
+[![License](https://img.shields.io/github/license/voluzi/cosmosigner)](LICENSE)
+
 A Go-native CometBFT remote signer with **Vault-backed key custody** and
 **embedded-raft double-sign protection**. A modern replacement for tmkms that
 also borrows horcrux's high-availability model.
