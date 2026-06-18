@@ -1,0 +1,51 @@
+version: 2
+project_name: cosmosigner
+
+env:
+  - CGO_ENABLED=0
+
+builds:
+  - id: darwin
+    main: ./cmd/cosmosigner
+    binary: cosmosigner
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CC_darwin_amd64=o64-clang
+      - CC_darwin_arm64=oa64-clang
+      - 'CC={{ index .Env (print "CC_" .Os "_" .Arch) }}'
+    flags:
+      - -mod=readonly
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/voluzi/cosmosigner/internal/version.Version={{ .Version }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Commit={{ .Commit }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Date={{ .Date }}
+
+  - id: linux
+    main: ./cmd/cosmosigner
+    binary: cosmosigner
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CC_linux_amd64=x86_64-linux-gnu-gcc
+      - CC_linux_arm64=aarch64-linux-gnu-gcc
+      - 'CC={{ index .Env (print "CC_" .Os "_" .Arch) }}'
+    flags:
+      - -mod=readonly
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/voluzi/cosmosigner/internal/version.Version={{ .Version }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Commit={{ .Commit }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Date={{ .Date }}
+
+universal_binaries:
+  - id: darwin

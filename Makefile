@@ -21,6 +21,9 @@ test:
 test-race:
 	go test -race ./...
 
+test-cover:
+	go test -race -coverprofile=coverage.out ./...
+
 vet:
 	go vet ./...
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"hash/crc32"
@@ -40,6 +41,33 @@ type GCPKMS struct {
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
+// credTypeFromJSON infers the credentials type from the JSON content so we
+// can use the non-deprecated WithAuthCredentialsJSON.
+func credTypeFromJSON(data []byte) (option.CredentialsType, error) {
+	var f struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		return "", fmt.Errorf("parse credentials type: %w", err)
+	}
+	switch f.Type {
+	case "service_account":
+		return option.ServiceAccount, nil
+	case "authorized_user":
+		return option.AuthorizedUser, nil
+	case "impersonated_service_account":
+		return option.ImpersonatedServiceAccount, nil
+	case "external_account":
+		return option.ExternalAccount, nil
+	case "gdc_service_account":
+		return option.CredentialsType("gdc_service_account"), nil
+	case "external_account_authorized_user":
+		return option.CredentialsType("external_account_authorized_user"), nil
+	default:
+		return "", fmt.Errorf("unknown credentials type: %q", f.Type)
+	}
+}
+
 // GCPClientOptions builds Cloud KMS client options. When credsFile is set, its
 // JSON is read and passed explicitly; otherwise Application Default Credentials
 // are used (workload identity, GOOGLE_APPLICATION_CREDENTIALS, etc.).
@@ -51,9 +79,11 @@ func GCPClientOptions(credsFile string) ([]option.ClientOption, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read credentials file: %w", err)
 	}
-	// Deliberate: an explicit credentials file is the documented override;
-	// Application Default Credentials remain the preferred path.
-	return []option.ClientOption{option.WithCredentialsJSON(data)}, nil //nolint:staticcheck
+	credType, err := credTypeFromJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	return []option.ClientOption{option.WithAuthCredentialsJSON(credType, data)}, nil
 }
 
 // NewGCPKMS connects to Cloud KMS, validates the key algorithm, and caches the
