@@ -11,7 +11,7 @@ require (
 	github.com/google/tink/go v1.7.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
-	github.com/hashicorp/raft-boltdb/v2 v2.3.0
+	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
