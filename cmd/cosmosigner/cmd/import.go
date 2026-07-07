@@ -47,6 +47,10 @@ signing through cosmosigner.`,
 			// file, so a wrong-key import fails loudly instead of silently
 			// changing the validator identity.
 			verifyCfg := be
+			// deferVerify is set when the backend accepted the import but cannot
+			// yet serve the public key (KMS still finalizing the version); the
+			// automatic identity check is then deferred to a follow-up command.
+			deferVerify := false
 
 			switch be.Type {
 			case backend.TypeVault:
@@ -68,7 +72,7 @@ signing through cosmosigner.`,
 				if gcp.importJob == "" {
 					gcp.importJob = gcp.key + "-import"
 				}
-				version, err := backend.GCPImportKey(context.Background(), backend.GCPImportConfig{
+				version, ready, err := backend.GCPImportKey(context.Background(), backend.GCPImportConfig{
 					Project:         gcp.project,
 					Location:        gcp.location,
 					KeyRing:         gcp.keyring,
@@ -83,8 +87,22 @@ signing through cosmosigner.`,
 				fmt.Printf("imported key version: %s\n", version)
 				fmt.Printf("run cosmosigner with --backend gcpkms --gcp-key-version %s\n", version)
 				verifyCfg.GCPKMS.KeyVersion = version
+				deferVerify = !ready
 			default:
 				return fmt.Errorf("import targets vault or gcpkms (the file already IS the software backend)")
+			}
+
+			// KMS accepted the import but has not finished enabling the version,
+			// so its public key isn't readable yet. Print the identity the backend
+			// MUST serve and the command to confirm it, and defer the destroy
+			// reminder until that check passes.
+			if deferVerify {
+				fmt.Println("import accepted, but the key version is still finalizing in KMS — identity not verified yet.")
+				fmt.Println("the backend MUST end up serving this exact identity:")
+				printPubKey(pub.Address().String(), pub.Bytes())
+				fmt.Printf("once the version is ENABLED, verify it with:\n  cosmosigner pubkey --backend gcpkms --gcp-key-version %s\n", verifyCfg.GCPKMS.KeyVersion)
+				fmt.Println("destroy the source key file only AFTER that command prints the identity above")
+				return nil
 			}
 
 			if err := verifyImportedKey(verifyCfg, pub.Bytes()); err != nil {

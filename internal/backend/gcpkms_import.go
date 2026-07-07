@@ -28,20 +28,23 @@ type GCPImportConfig struct {
 }
 
 // GCPImportKey imports a PKCS#8 DER ed25519 private key into Cloud KMS as an
-// EC_SIGN_ED25519 key version and returns the version resource name.
+// EC_SIGN_ED25519 key version and returns the version resource name plus whether
+// it reached ENABLED. ready is false when the import was accepted but KMS is
+// still finalizing the version (the caller cannot read its public key yet, so it
+// must defer verification); it is always true alongside a nil error otherwise.
 //
 // Flow per Cloud KMS BYOK: create (or reuse) an ImportJob, wait until ACTIVE,
 // wrap the key material with the job's RSA public key (RSA-OAEP SHA-256, empty
 // label), then ImportCryptoKeyVersion. The target CryptoKey is created with no
 // initial version.
-func GCPImportKey(ctx context.Context, cfg GCPImportConfig, pkcs8DER []byte) (string, error) {
+func GCPImportKey(ctx context.Context, cfg GCPImportConfig, pkcs8DER []byte) (version string, ready bool, err error) {
 	opts, err := GCPClientOptions(cfg.CredentialsFile)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	client, err := kms.NewKeyManagementClient(ctx, opts...)
 	if err != nil {
-		return "", fmt.Errorf("new kms client: %w", err)
+		return "", false, fmt.Errorf("new kms client: %w", err)
 	}
 	defer client.Close()
 
@@ -53,7 +56,7 @@ func GCPImportKey(ctx context.Context, cfg GCPImportConfig, pkcs8DER []byte) (st
 		KeyRingId: cfg.KeyRing,
 		KeyRing:   &kmspb.KeyRing{},
 	}); err != nil && status.Code(err) != codes.AlreadyExists {
-		return "", fmt.Errorf("create key ring: %w", err)
+		return "", false, fmt.Errorf("create key ring: %w", err)
 	}
 
 	// Target crypto key with no initial version (idempotent).
@@ -70,7 +73,7 @@ func GCPImportKey(ctx context.Context, cfg GCPImportConfig, pkcs8DER []byte) (st
 		},
 		SkipInitialVersionCreation: true,
 	}); err != nil && status.Code(err) != codes.AlreadyExists {
-		return "", fmt.Errorf("create crypto key: %w", err)
+		return "", false, fmt.Errorf("create crypto key: %w", err)
 	}
 
 	// Import job (idempotent), then wait for ACTIVE.
@@ -83,41 +86,41 @@ func GCPImportKey(ctx context.Context, cfg GCPImportConfig, pkcs8DER []byte) (st
 			ProtectionLevel: cfg.Protection,
 		},
 	}); err != nil && status.Code(err) != codes.AlreadyExists {
-		return "", fmt.Errorf("create import job: %w", err)
+		return "", false, fmt.Errorf("create import job: %w", err)
 	}
 	job, err := waitImportJobActive(ctx, client, jobName)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	// Wrap the PKCS#8 key with the job's RSA public key (OAEP SHA-256, no label).
 	block, _ := pem.Decode([]byte(job.PublicKey.GetPem()))
 	if block == nil {
-		return "", fmt.Errorf("decode import job wrapping key PEM")
+		return "", false, fmt.Errorf("decode import job wrapping key PEM")
 	}
 	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return "", fmt.Errorf("parse wrapping key: %w", err)
+		return "", false, fmt.Errorf("parse wrapping key: %w", err)
 	}
 	rsaPub, ok := parsed.(*rsa.PublicKey)
 	if !ok {
-		return "", fmt.Errorf("wrapping key is not RSA (%T)", parsed)
+		return "", false, fmt.Errorf("wrapping key is not RSA (%T)", parsed)
 	}
 	wrapped, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPub, pkcs8DER, nil)
 	if err != nil {
-		return "", fmt.Errorf("wrap key material: %w", err)
+		return "", false, fmt.Errorf("wrap key material: %w", err)
 	}
 
-	version, err := client.ImportCryptoKeyVersion(ctx, &kmspb.ImportCryptoKeyVersionRequest{
+	imported, err := client.ImportCryptoKeyVersion(ctx, &kmspb.ImportCryptoKeyVersionRequest{
 		Parent:     keyName,
 		Algorithm:  kmspb.CryptoKeyVersion_EC_SIGN_ED25519,
 		ImportJob:  jobName,
 		WrappedKey: wrapped,
 	})
 	if err != nil {
-		return "", fmt.Errorf("import crypto key version: %w", err)
+		return "", false, fmt.Errorf("import crypto key version: %w", err)
 	}
-	return waitVersionEnabled(ctx, client, version.Name)
+	return waitVersionEnabled(ctx, client, imported.Name)
 }
 
 func waitImportJobActive(ctx context.Context, client *kms.KeyManagementClient, name string) (*kmspb.ImportJob, error) {
@@ -141,29 +144,29 @@ func waitImportJobActive(ctx context.Context, client *kms.KeyManagementClient, n
 	}
 }
 
-func waitVersionEnabled(ctx context.Context, client *kms.KeyManagementClient, name string) (string, error) {
+func waitVersionEnabled(ctx context.Context, client *kms.KeyManagementClient, name string) (string, bool, error) {
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		v, err := client.GetCryptoKeyVersion(ctx, &kmspb.GetCryptoKeyVersionRequest{Name: name})
 		if err != nil {
-			return "", fmt.Errorf("get crypto key version: %w", err)
+			return "", false, fmt.Errorf("get crypto key version: %w", err)
 		}
 		switch v.State {
 		case kmspb.CryptoKeyVersion_ENABLED:
-			return name, nil
+			return name, true, nil
 		case kmspb.CryptoKeyVersion_PENDING_IMPORT:
 			if time.Now().After(deadline) {
-				return name, nil // import accepted; let the user poll
+				return name, false, nil // import accepted but not yet ENABLED; caller defers verification
 			}
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", false, ctx.Err()
 			case <-time.After(time.Second):
 			}
 		case kmspb.CryptoKeyVersion_IMPORT_FAILED:
-			return "", fmt.Errorf("import failed: %s", v.ImportFailureReason)
+			return "", false, fmt.Errorf("import failed: %s", v.ImportFailureReason)
 		default:
-			return "", fmt.Errorf("unexpected key version state %s", v.State)
+			return "", false, fmt.Errorf("unexpected key version state %s", v.State)
 		}
 	}
 }
