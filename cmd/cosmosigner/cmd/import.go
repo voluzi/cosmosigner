@@ -100,7 +100,11 @@ signing through cosmosigner.`,
 				fmt.Println("import accepted, but the key version is still finalizing in KMS — identity not verified yet.")
 				fmt.Println("the backend MUST end up serving this exact identity:")
 				printPubKey(pub.Address().String(), pub.Bytes())
-				fmt.Printf("once the version is ENABLED, verify it with:\n  cosmosigner pubkey --backend gcpkms --gcp-key-version %s\n", verifyCfg.GCPKMS.KeyVersion)
+				verifyCmd := fmt.Sprintf("cosmosigner pubkey --backend gcpkms --gcp-key-version %s", verifyCfg.GCPKMS.KeyVersion)
+				if verifyCfg.GCPKMS.CredentialsFile != "" {
+					verifyCmd += " --gcp-credentials-file " + verifyCfg.GCPKMS.CredentialsFile
+				}
+				fmt.Printf("once the version is ENABLED, verify it with:\n  %s\n", verifyCmd)
 				fmt.Println("destroy the source key file only AFTER that command prints the identity above")
 				return nil
 			}
