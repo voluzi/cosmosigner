@@ -13,10 +13,6 @@ builds:
     goarch:
       - amd64
       - arm64
-    env:
-      - CC_darwin_amd64=o64-clang
-      - CC_darwin_arm64=oa64-clang
-      - 'CC={{ index .Env (print "CC_" .Os "_" .Arch) }}'
     flags:
       - -mod=readonly
       - -trimpath
@@ -34,10 +30,6 @@ builds:
     goarch:
       - amd64
       - arm64
-    env:
-      - CC_linux_amd64=x86_64-linux-gnu-gcc
-      - CC_linux_arm64=aarch64-linux-gnu-gcc
-      - 'CC={{ index .Env (print "CC_" .Os "_" .Arch) }}'
     flags:
       - -mod=readonly
       - -trimpath

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cometbft/cometbft/crypto"
@@ -39,6 +40,7 @@ type Vault struct {
 	keyVersion int
 
 	stopRenew chan struct{}
+	stopOnce  sync.Once
 }
 
 // NewVault connects to Vault, caches the public key, and starts token renewal.
@@ -157,11 +159,7 @@ func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
 }
 
 func (v *Vault) Close() error {
-	select {
-	case <-v.stopRenew:
-	default:
-		close(v.stopRenew)
-	}
+	v.stopOnce.Do(func() { close(v.stopRenew) })
 	return nil
 }
 
