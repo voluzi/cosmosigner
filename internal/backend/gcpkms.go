@@ -118,6 +118,31 @@ func NewGCPKMS(cfg GCPKMSConfig) (*GCPKMS, error) {
 
 func (g *GCPKMS) PubKey() (crypto.PubKey, error) { return g.pub, nil }
 
+// gcpPreflightMessage is signed by VerifyCanSign to prove the key is usable. It
+// is deliberately NOT valid CometBFT canonical sign-bytes (which are a
+// length-delimited CanonicalVote/CanonicalProposal protobuf), so signing it can
+// never be mistaken for a consensus message — the preflight cannot contribute
+// to a double-sign.
+var gcpPreflightMessage = []byte("cosmosigner/gcpkms preflight — not a consensus message")
+
+// VerifyCanSign checks at startup that the KMS key can actually sign, so a
+// misconfiguration fails fast at boot instead of at the first consensus vote.
+// NewGCPKMS only proves GetPublicKey access; an IAM policy can grant that while
+// withholding AsymmetricSign (roles/cloudkms.signerVerifier), and the key
+// version may not be ENABLED. This signs a non-consensus probe and verifies the
+// result against the cached public key, so a broken policy, a disabled key, or a
+// signature that does not match the advertised identity are all caught here.
+func (g *GCPKMS) VerifyCanSign() error {
+	sig, err := g.Sign(gcpPreflightMessage)
+	if err != nil {
+		return fmt.Errorf("kms key %q cannot sign (needs roles/cloudkms.signerVerifier and an ENABLED version): %w", g.keyVersion, err)
+	}
+	if !g.pub.VerifySignature(gcpPreflightMessage, sig) {
+		return fmt.Errorf("kms key %q produced a signature that does not verify against its public key", g.keyVersion)
+	}
+	return nil
+}
+
 func (g *GCPKMS) Sign(signBytes []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()

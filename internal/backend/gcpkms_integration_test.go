@@ -44,3 +44,23 @@ func TestGCPKMS_SignVerify(t *testing.T) {
 	require.Len(t, sig, 64, "ed25519 signature must be 64 bytes")
 	require.True(t, pub.VerifySignature(msg, sig), "KMS signature must verify against the public key")
 }
+
+// TestGCPKMS_VerifyCanSign proves the startup preflight passes against a
+// working, signable key. (The failure path — GetPublicKey allowed but
+// AsymmetricSign denied — depends on a restricted service-account/IAM binding
+// that is impractical to provision from a test.)
+func TestGCPKMS_VerifyCanSign(t *testing.T) {
+	keyVersion := os.Getenv("GCP_KMS_KEY_VERSION")
+	if keyVersion == "" {
+		t.Skip("set GCP_KMS_KEY_VERSION to run this test")
+	}
+
+	be, err := NewGCPKMS(GCPKMSConfig{
+		KeyVersion:      keyVersion,
+		CredentialsFile: os.Getenv("GCP_CREDENTIALS_FILE"), // optional; else ADC
+	})
+	require.NoError(t, err)
+	defer be.Close()
+
+	require.NoError(t, be.VerifyCanSign())
+}

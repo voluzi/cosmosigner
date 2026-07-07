@@ -121,6 +121,11 @@ The key never leaves KMS. Auth uses Application Default Credentials (GKE workloa
 identity, or `GOOGLE_APPLICATION_CREDENTIALS`); `--gcp-credentials-file` is an
 optional override.
 
+The identity needs `roles/cloudkms.signerVerifier` on the key (verify _and_
+sign). `start` runs a preflight that signs a non-consensus probe and verifies it
+against the key's public key, so a policy granting only `viewer` — or a key
+version that is not `ENABLED` — fails fast at boot instead of at the first vote.
+
 ```sh
 # create a signing key
 ./bin/cosmosigner provision --backend gcpkms \
