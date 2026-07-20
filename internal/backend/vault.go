@@ -289,21 +289,27 @@ func toInt(v any) (int, error) {
 	}
 }
 
-// renewLoop keeps the Vault token alive. It tolerates lookup/renew failures and
-// non-renewable tokens (e.g. when an external sidecar rotates the token file).
+// renewLoop keeps the Vault token alive while polling for token-file replacements independently of
+// long renewal deadlines. Lookup and renewal failures are retried without stopping the signer.
 func (v *Vault) renewLoop() {
+	v.renewLoopWithPollInterval(time.Minute)
+}
+
+func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
+	if pollInterval <= 0 {
+		pollInterval = time.Minute
+	}
+	var renewAt time.Time
 	for {
+		if raw, err := os.ReadFile(v.tokenFile); err == nil {
+			if token := strings.TrimSpace(string(raw)); token != "" && token != v.client.Token() {
+				v.client.SetToken(token)
+				renewAt = time.Time{}
+			}
+		}
 		secret, err := v.client.Auth().Token().LookupSelf()
 		if err != nil {
-			// The current token may have been revoked/expired; if a sidecar
-			// rotates the token file, pick up the fresh token from disk.
-			if raw, rerr := os.ReadFile(v.tokenFile); rerr == nil {
-				if tok := strings.TrimSpace(string(raw)); tok != "" && tok != v.client.Token() {
-					v.client.SetToken(tok)
-					continue
-				}
-			}
-			if sleepOrStop(v.stopRenew, 30*time.Second) {
+			if sleepOrStop(v.stopRenew, min(pollInterval, 30*time.Second)) {
 				return
 			}
 			continue
@@ -311,20 +317,28 @@ func (v *Vault) renewLoop() {
 		ttl, _ := secret.TokenTTL()
 		renewable, _ := secret.TokenIsRenewable()
 		if !renewable || ttl <= 0 {
-			if sleepOrStop(v.stopRenew, time.Minute) {
+			renewAt = time.Time{}
+			if sleepOrStop(v.stopRenew, pollInterval) {
 				return
 			}
 			continue
 		}
-		wait := max(ttl/2, time.Second)
-		if sleepOrStop(v.stopRenew, wait) {
-			return
+		if renewAt.IsZero() {
+			renewAt = time.Now().Add(max(ttl/2, time.Second))
 		}
-		if _, err := v.client.Auth().Token().RenewSelf(0); err != nil {
-			if sleepOrStop(v.stopRenew, 5*time.Second) {
+		if time.Now().Before(renewAt) {
+			if sleepOrStop(v.stopRenew, min(time.Until(renewAt), pollInterval)) {
 				return
 			}
+			continue
 		}
+		if _, err := v.client.Auth().Token().RenewSelf(0); err != nil {
+			if sleepOrStop(v.stopRenew, min(pollInterval, 5*time.Second)) {
+				return
+			}
+			continue
+		}
+		renewAt = time.Time{}
 	}
 }
 

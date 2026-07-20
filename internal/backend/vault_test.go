@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/stretchr/testify/require"
@@ -134,6 +135,59 @@ func TestVaultVerifyCanSignRejectsPublicOnlyKey(t *testing.T) {
 	defer func() { require.NoError(t, v.Close()) }()
 
 	require.ErrorContains(t, v.VerifyCanSign(), "cannot sign")
+}
+
+func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {
+	firstLookup := make(chan struct{}, 1)
+	replacementLookup := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
+			switch r.Header.Get("X-Vault-Token") {
+			case "initial-token":
+				select {
+				case firstLookup <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 3600, "renewable": true}})
+			case "replacement-token":
+				select {
+				case replacementLookup <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 0, "renewable": false}})
+			default:
+				http.Error(w, "unexpected token", http.StatusForbidden)
+			}
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/auth/token/renew-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"lease_duration": 2, "renewable": true}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("initial-token"), 0o600))
+	client, err := NewVaultClient(VaultConfig{Address: server.URL, TokenFile: tokenFile})
+	require.NoError(t, err)
+	v := &Vault{client: client, tokenFile: tokenFile, stopRenew: make(chan struct{})}
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+	go v.renewLoopWithPollInterval(10 * time.Millisecond)
+
+	select {
+	case <-firstLookup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop did not inspect the initial token")
+	}
+	require.NoError(t, os.WriteFile(tokenFile, []byte("replacement-token"), 0o600))
+
+	select {
+	case <-replacementLookup:
+	case <-time.After(3 * time.Second):
+		t.Fatal("renew loop did not reload the changed token file")
+	}
 }
 
 func newVaultBackendServer(t *testing.T, versionOne, versionTwo []byte) *httptest.Server {
