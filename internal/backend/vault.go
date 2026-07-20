@@ -206,6 +206,15 @@ func (v *Vault) fetchPubKeyIfExists() (crypto.PubKey, int, bool, error) {
 	if selected == 0 {
 		selected = latest
 	}
+	if raw, ok := secret.Data["min_encryption_version"]; ok {
+		minimum, err := toInt(raw)
+		if err != nil {
+			return nil, 0, true, fmt.Errorf("transit key min_encryption_version: %w", err)
+		}
+		if selected < minimum {
+			return nil, 0, true, fmt.Errorf("transit key %q version %d is below Vault's minimum signing version %d", v.keyName, selected, minimum)
+		}
+	}
 	verRaw, ok := keys[strconv.Itoa(selected)]
 	if !ok {
 		return nil, 0, true, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
