@@ -10,9 +10,14 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"strings"
 
 	"github.com/google/tink/go/kwp/subtle"
+	vaultapi "github.com/hashicorp/vault/api"
 )
+
+// Vault returns this only after confirming the selected version already contains private material.
+const vaultPrivateKeyAlreadyImported = "private key imported, key version cannot be updated"
 
 // VaultImportKey imports a PKCS#8 DER ed25519 private key into the Vault
 // Transit engine under cfg.KeyName (non-exportable) using the BYOK flow:
@@ -37,18 +42,44 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 	}
 	wantPublicKey := privateKey.Public().(ed25519.PublicKey)
 
-	// Import is a create-only Vault operation. Treat an existing identical version as success so a
-	// controller can safely retry after Vault accepted the key but its status write was interrupted.
+	// Creating a Transit key is create-only. A matching existing version is accepted only after a
+	// signing probe succeeds or Vault's version-import endpoint proves or completes private material.
 	// A different existing identity is never overwritten.
-	existing, selectedVersion, exists, err := (&Vault{
+	existing, selectedVersion, minimumSigningVersion, exists, err := (&Vault{
 		client: client, mount: cfg.Mount, keyName: cfg.KeyName, requestedKeyVersion: cfg.KeyVersion,
-	}).fetchPubKeyIfExists()
+	}).fetchPubKeyIfExists(false)
 	if err != nil {
 		return err
 	}
 	if exists {
 		if bytes.Equal(existing.Bytes(), wantPublicKey) {
-			return nil
+			var signErr error
+			if selectedVersion >= minimumSigningVersion {
+				vault := &Vault{
+					client: client, mount: cfg.Mount, keyName: cfg.KeyName,
+					pub: existing, keyVersion: selectedVersion,
+				}
+				if signErr = vault.verifySigningKey(); signErr == nil {
+					return nil
+				}
+			}
+
+			ciphertext, err := wrapVaultImportKey(client, cfg.Mount, pkcs8DER)
+			if err != nil {
+				return err
+			}
+			_, err = client.Logical().Write(cfg.Mount+"/keys/"+cfg.KeyName+"/import_version", map[string]any{
+				"ciphertext":    ciphertext,
+				"hash_function": "SHA256",
+				"version":       selectedVersion,
+			})
+			if err == nil || strings.Contains(err.Error(), vaultPrivateKeyAlreadyImported) {
+				return nil
+			}
+			if signErr != nil {
+				return fmt.Errorf("transit key %q version %d has the expected public key but failed both the signing probe (%v) and private-key completion: %w", cfg.KeyName, selectedVersion, signErr, err)
+			}
+			return fmt.Errorf("prove transit key %q version %d has private signing material: %w", cfg.KeyName, selectedVersion, err)
 		}
 		return fmt.Errorf("transit key %q version %d already exists with a different public key; use a new key name instead of overwriting a validator identity", cfg.KeyName, selectedVersion)
 	}
@@ -56,50 +87,11 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 		return fmt.Errorf("new Vault imports create key version 1; requested version %d", cfg.KeyVersion)
 	}
 
-	// 1. The mount's RSA-4096 wrapping public key.
-	secret, err := client.Logical().Read(cfg.Mount + "/wrapping_key")
+	ciphertext, err := wrapVaultImportKey(client, cfg.Mount, pkcs8DER)
 	if err != nil {
-		return fmt.Errorf("read transit wrapping key: %w", err)
-	}
-	if secret == nil || secret.Data == nil {
-		return fmt.Errorf("transit wrapping key not available (Vault >= 1.12 required)")
-	}
-	pemStr, _ := secret.Data["public_key"].(string)
-	block, _ := pem.Decode([]byte(pemStr))
-	if block == nil {
-		return fmt.Errorf("decode wrapping key PEM")
-	}
-	wrappingPublicKey, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("parse wrapping key: %w", err)
-	}
-	rsaPub, ok := wrappingPublicKey.(*rsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("wrapping key is not RSA (%T)", wrappingPublicKey)
+		return err
 	}
 
-	// 2. Ephemeral AES-256 key wraps the PKCS#8 material (AES-KWP).
-	aesKey := make([]byte, 32)
-	if _, err := rand.Read(aesKey); err != nil {
-		return fmt.Errorf("generate ephemeral key: %w", err)
-	}
-	kwp, err := subtle.NewKWP(aesKey)
-	if err != nil {
-		return fmt.Errorf("init AES-KWP: %w", err)
-	}
-	wrappedTarget, err := kwp.Wrap(pkcs8DER)
-	if err != nil {
-		return fmt.Errorf("wrap key material: %w", err)
-	}
-
-	// 3. RSA-OAEP-SHA256 wraps the ephemeral AES key; ciphertext is the concat.
-	wrappedAES, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPub, aesKey, nil)
-	if err != nil {
-		return fmt.Errorf("wrap ephemeral key: %w", err)
-	}
-	ciphertext := base64.StdEncoding.EncodeToString(append(wrappedAES, wrappedTarget...))
-
-	// 4. Import as a non-exportable ed25519 key.
 	if _, err := client.Logical().Write(cfg.Mount+"/keys/"+cfg.KeyName+"/import", map[string]any{
 		"ciphertext":    ciphertext,
 		"type":          "ed25519",
@@ -109,4 +101,48 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 		return fmt.Errorf("transit import: %w", err)
 	}
 	return nil
+}
+
+func wrapVaultImportKey(client *vaultapi.Client, mount string, pkcs8DER []byte) (string, error) {
+	secret, err := client.Logical().Read(mount + "/wrapping_key")
+	if err != nil {
+		return "", fmt.Errorf("read transit wrapping key: %w", err)
+	}
+	if secret == nil || secret.Data == nil {
+		return "", fmt.Errorf("transit wrapping key not available (Vault >= 1.12 required)")
+	}
+	pemStr, _ := secret.Data["public_key"].(string)
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return "", fmt.Errorf("decode wrapping key PEM")
+	}
+	wrappingPublicKey, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse wrapping key: %w", err)
+	}
+	rsaPub, ok := wrappingPublicKey.(*rsa.PublicKey)
+	if !ok {
+		return "", fmt.Errorf("wrapping key is not RSA (%T)", wrappingPublicKey)
+	}
+
+	// An ephemeral AES-256 key wraps the PKCS#8 material (AES-KWP).
+	aesKey := make([]byte, 32)
+	if _, err := rand.Read(aesKey); err != nil {
+		return "", fmt.Errorf("generate ephemeral key: %w", err)
+	}
+	kwp, err := subtle.NewKWP(aesKey)
+	if err != nil {
+		return "", fmt.Errorf("init AES-KWP: %w", err)
+	}
+	wrappedTarget, err := kwp.Wrap(pkcs8DER)
+	if err != nil {
+		return "", fmt.Errorf("wrap key material: %w", err)
+	}
+
+	// RSA-OAEP-SHA256 wraps the ephemeral AES key; ciphertext is the concat.
+	wrappedAES, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPub, aesKey, nil)
+	if err != nil {
+		return "", fmt.Errorf("wrap ephemeral key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(append(wrappedAES, wrappedTarget...)), nil
 }

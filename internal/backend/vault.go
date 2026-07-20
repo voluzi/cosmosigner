@@ -15,6 +15,10 @@ import (
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
+// vaultPreflightMessage cannot be decoded as CometBFT canonical vote/proposal bytes, so proving a
+// Vault key can sign it cannot create a consensus signature.
+var vaultPreflightMessage = []byte("cosmosigner/vault preflight - not a consensus message")
+
 // VaultConfig configures the Vault Transit backend.
 type VaultConfig struct {
 	Address    string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
@@ -134,6 +138,9 @@ func (v *Vault) VerifyCanSign() error {
 	if ttl > 0 && !renewable {
 		return fmt.Errorf("vault token has a finite TTL (%s) and is not renewable; cosmosigner cannot keep it alive — use a renewable or periodic token", ttl)
 	}
+	if err := v.verifySigningKey(); err != nil {
+		return fmt.Errorf("vault key %q version %d cannot sign: %w", v.keyName, v.keyVersion, err)
+	}
 	return nil
 }
 
@@ -167,13 +174,24 @@ func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
 	return parseTransitSignature(sigField)
 }
 
+func (v *Vault) verifySigningKey() error {
+	signature, err := v.Sign(vaultPreflightMessage)
+	if err != nil {
+		return err
+	}
+	if !v.pub.VerifySignature(vaultPreflightMessage, signature) {
+		return fmt.Errorf("signature does not verify against the selected public key")
+	}
+	return nil
+}
+
 func (v *Vault) Close() error {
 	v.stopOnce.Do(func() { close(v.stopRenew) })
 	return nil
 }
 
 func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
-	pub, version, exists, err := v.fetchPubKeyIfExists()
+	pub, version, _, exists, err := v.fetchPubKeyIfExists(true)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -183,60 +201,61 @@ func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
 	return pub, version, nil
 }
 
-func (v *Vault) fetchPubKeyIfExists() (crypto.PubKey, int, bool, error) {
+func (v *Vault) fetchPubKeyIfExists(requireSigningVersion bool) (crypto.PubKey, int, int, bool, error) {
 	secret, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.mount, v.keyName))
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("read transit key: %w", err)
+		return nil, 0, 0, false, fmt.Errorf("read transit key: %w", err)
 	}
 	if secret == nil || secret.Data == nil {
-		return nil, 0, false, nil
+		return nil, 0, 0, false, nil
 	}
 	if kt, _ := secret.Data["type"].(string); kt != "" && kt != "ed25519" {
-		return nil, 0, true, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
+		return nil, 0, 0, true, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
 	}
 	latest, err := toInt(secret.Data["latest_version"])
 	if err != nil {
-		return nil, 0, true, fmt.Errorf("transit key latest_version: %w", err)
+		return nil, 0, 0, true, fmt.Errorf("transit key latest_version: %w", err)
 	}
 	keys, ok := secret.Data["keys"].(map[string]any)
 	if !ok {
-		return nil, 0, true, fmt.Errorf("transit key %q has no keys map", v.keyName)
+		return nil, 0, 0, true, fmt.Errorf("transit key %q has no keys map", v.keyName)
 	}
 	selected := v.requestedKeyVersion
 	if selected == 0 {
 		selected = latest
 	}
+	minimum := 0
 	if raw, ok := secret.Data["min_encryption_version"]; ok {
-		minimum, err := toInt(raw)
+		minimum, err = toInt(raw)
 		if err != nil {
-			return nil, 0, true, fmt.Errorf("transit key min_encryption_version: %w", err)
+			return nil, 0, 0, true, fmt.Errorf("transit key min_encryption_version: %w", err)
 		}
-		if selected < minimum {
-			return nil, 0, true, fmt.Errorf("transit key %q version %d is below Vault's minimum signing version %d", v.keyName, selected, minimum)
+		if requireSigningVersion && selected < minimum {
+			return nil, 0, minimum, true, fmt.Errorf("transit key %q version %d is below Vault's minimum signing version %d", v.keyName, selected, minimum)
 		}
 	}
 	verRaw, ok := keys[strconv.Itoa(selected)]
 	if !ok {
-		return nil, 0, true, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
+		return nil, 0, minimum, true, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
 	}
 	verMap, ok := verRaw.(map[string]any)
 	if !ok {
-		return nil, 0, true, fmt.Errorf("transit key version %d malformed", selected)
+		return nil, 0, minimum, true, fmt.Errorf("transit key version %d malformed", selected)
 	}
 	pkB64, ok := verMap["public_key"].(string)
 	if !ok || pkB64 == "" {
-		return nil, 0, true, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
+		return nil, 0, minimum, true, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
 	}
 	raw, err := base64.StdEncoding.DecodeString(pkB64)
 	if err != nil {
-		return nil, 0, true, fmt.Errorf("decode public_key: %w", err)
+		return nil, 0, minimum, true, fmt.Errorf("decode public_key: %w", err)
 	}
 	if len(raw) != ed25519.PubKeySize {
-		return nil, 0, true, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
+		return nil, 0, minimum, true, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
 	}
 	pk := make(ed25519.PubKey, ed25519.PubKeySize)
 	copy(pk, raw)
-	return pk, selected, true, nil
+	return pk, selected, minimum, true, nil
 }
 
 // parseTransitSignature parses Vault's "vault:v<n>:<base64>" signature format
