@@ -173,23 +173,34 @@ func (v *Vault) Close() error {
 }
 
 func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
-	secret, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.mount, v.keyName))
+	pub, version, exists, err := v.fetchPubKeyIfExists()
 	if err != nil {
-		return nil, 0, fmt.Errorf("read transit key: %w", err)
+		return nil, 0, err
 	}
-	if secret == nil || secret.Data == nil {
+	if !exists {
 		return nil, 0, fmt.Errorf("transit key %q not found", v.keyName)
 	}
+	return pub, version, nil
+}
+
+func (v *Vault) fetchPubKeyIfExists() (crypto.PubKey, int, bool, error) {
+	secret, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.mount, v.keyName))
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("read transit key: %w", err)
+	}
+	if secret == nil || secret.Data == nil {
+		return nil, 0, false, nil
+	}
 	if kt, _ := secret.Data["type"].(string); kt != "" && kt != "ed25519" {
-		return nil, 0, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
+		return nil, 0, true, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
 	}
 	latest, err := toInt(secret.Data["latest_version"])
 	if err != nil {
-		return nil, 0, fmt.Errorf("transit key latest_version: %w", err)
+		return nil, 0, true, fmt.Errorf("transit key latest_version: %w", err)
 	}
 	keys, ok := secret.Data["keys"].(map[string]any)
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key %q has no keys map", v.keyName)
+		return nil, 0, true, fmt.Errorf("transit key %q has no keys map", v.keyName)
 	}
 	selected := v.requestedKeyVersion
 	if selected == 0 {
@@ -197,26 +208,26 @@ func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
 	}
 	verRaw, ok := keys[strconv.Itoa(selected)]
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
+		return nil, 0, true, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
 	}
 	verMap, ok := verRaw.(map[string]any)
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key version %d malformed", selected)
+		return nil, 0, true, fmt.Errorf("transit key version %d malformed", selected)
 	}
 	pkB64, ok := verMap["public_key"].(string)
 	if !ok || pkB64 == "" {
-		return nil, 0, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
+		return nil, 0, true, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
 	}
 	raw, err := base64.StdEncoding.DecodeString(pkB64)
 	if err != nil {
-		return nil, 0, fmt.Errorf("decode public_key: %w", err)
+		return nil, 0, true, fmt.Errorf("decode public_key: %w", err)
 	}
 	if len(raw) != ed25519.PubKeySize {
-		return nil, 0, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
+		return nil, 0, true, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
 	}
 	pk := make(ed25519.PubKey, ed25519.PubKeySize)
 	copy(pk, raw)
-	return pk, selected, nil
+	return pk, selected, true, nil
 }
 
 // parseTransitSignature parses Vault's "vault:v<n>:<base64>" signature format

@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -25,6 +27,34 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 	if err != nil {
 		return err
 	}
+	parsed, err := x509.ParsePKCS8PrivateKey(pkcs8DER)
+	if err != nil {
+		return fmt.Errorf("parse PKCS#8 private key: %w", err)
+	}
+	privateKey, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		return fmt.Errorf("PKCS#8 private key is %T, want ed25519", parsed)
+	}
+	wantPublicKey := privateKey.Public().(ed25519.PublicKey)
+
+	// Import is a create-only Vault operation. Treat an existing identical version as success so a
+	// controller can safely retry after Vault accepted the key but its status write was interrupted.
+	// A different existing identity is never overwritten.
+	existing, selectedVersion, exists, err := (&Vault{
+		client: client, mount: cfg.Mount, keyName: cfg.KeyName, requestedKeyVersion: cfg.KeyVersion,
+	}).fetchPubKeyIfExists()
+	if err != nil {
+		return err
+	}
+	if exists {
+		if bytes.Equal(existing.Bytes(), wantPublicKey) {
+			return nil
+		}
+		return fmt.Errorf("transit key %q version %d already exists with a different public key; use a new key name instead of overwriting a validator identity", cfg.KeyName, selectedVersion)
+	}
+	if cfg.KeyVersion < 0 || cfg.KeyVersion > 1 {
+		return fmt.Errorf("new Vault imports create key version 1; requested version %d", cfg.KeyVersion)
+	}
 
 	// 1. The mount's RSA-4096 wrapping public key.
 	secret, err := client.Logical().Read(cfg.Mount + "/wrapping_key")
@@ -39,13 +69,13 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 	if block == nil {
 		return fmt.Errorf("decode wrapping key PEM")
 	}
-	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	wrappingPublicKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		return fmt.Errorf("parse wrapping key: %w", err)
 	}
-	rsaPub, ok := parsed.(*rsa.PublicKey)
+	rsaPub, ok := wrappingPublicKey.(*rsa.PublicKey)
 	if !ok {
-		return fmt.Errorf("wrapping key is not RSA (%T)", parsed)
+		return fmt.Errorf("wrapping key is not RSA (%T)", wrappingPublicKey)
 	}
 
 	// 2. Ephemeral AES-256 key wraps the PKCS#8 material (AES-KWP).

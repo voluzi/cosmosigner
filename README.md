@@ -104,7 +104,12 @@ make build
 # OR migrate an existing validator key (BYOK, imported non-exportable)
 ./bin/cosmosigner import --backend vault --from priv_validator_key.json \
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
-  --vault-key my-validator
+  --vault-key my-validator --vault-key-version 1
+
+# resolve the exact pinned key identity used below
+./bin/cosmosigner pubkey --backend vault \
+  --vault-addr https://vault:8200 --vault-token-file /vault/token \
+  --vault-key my-validator --vault-key-version 1
 
 ./bin/cosmosigner start \
   --chain-id my-chain --node 127.0.0.1:5555 \
@@ -114,6 +119,10 @@ make build
   --expected-public-key '<base64 pubkey from cosmosigner pubkey>' \
   --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070
 ```
+
+Vault import is retry-safe: if the selected key version already contains the same public key,
+Cosmosigner reports success without calling the create-only import endpoint. It refuses an existing
+different identity; use a new Transit key name instead of attempting an in-place overwrite.
 
 Cosmosigner renews renewable and periodic Vault tokens itself, scheduling each
 renewal at half the current TTL. A separate token-renewer sidecar is not needed.
