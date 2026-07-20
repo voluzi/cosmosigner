@@ -19,6 +19,7 @@ func registerBackendFlags(cmd *cobra.Command) {
 	f.String("vault-token-file", "", "vault token file path")
 	f.String("vault-mount", d.Vault.Mount, "vault transit mount path")
 	f.String("vault-key", "", "vault transit key name")
+	f.Int("vault-key-version", 0, "vault transit key version (0 selects the latest once at startup)")
 	f.String("vault-namespace", "", "vault namespace")
 	f.String("vault-ca-cert", "", "vault CA cert path")
 	f.String("gcp-key-version", "", "gcp kms cryptoKeyVersion resource name")
@@ -39,6 +40,9 @@ func overlayBackendFlags(cmd *cobra.Command, c *backend.Config) {
 	s("vault-token-file", &c.Vault.TokenFile)
 	s("vault-mount", &c.Vault.Mount)
 	s("vault-key", &c.Vault.KeyName)
+	if cmd.Flags().Changed("vault-key-version") {
+		c.Vault.KeyVersion, _ = cmd.Flags().GetInt("vault-key-version")
+	}
 	s("vault-namespace", &c.Vault.Namespace)
 	s("vault-ca-cert", &c.Vault.TLSCACert)
 	s("gcp-key-version", &c.GCPKMS.KeyVersion)

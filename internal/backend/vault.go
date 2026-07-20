@@ -17,23 +17,25 @@ import (
 
 // VaultConfig configures the Vault Transit backend.
 type VaultConfig struct {
-	Address   string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
-	TokenFile string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
-	Mount     string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
-	KeyName   string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"`                     // transit key name
-	Namespace string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
-	TLSCACert string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
+	Address    string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
+	TokenFile  string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
+	Mount      string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
+	KeyName    string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"`                     // transit key name
+	KeyVersion int    `yaml:"key_version" env:"COSMOSIGNER_VAULT_KEY_VERSION"`
+	Namespace  string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
+	TLSCACert  string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
 }
 
 // Vault signs via the Vault Transit engine. The consensus key is created
 // non-exportable inside Vault and never leaves it; only signatures cross the
 // wire. The public key is fetched once and cached.
 type Vault struct {
-	client    *vaultapi.Client
-	mount     string
-	keyName   string
-	tokenFile string
-	pub       crypto.PubKey
+	client              *vaultapi.Client
+	mount               string
+	keyName             string
+	tokenFile           string
+	pub                 crypto.PubKey
+	requestedKeyVersion int
 	// keyVersion pins Sign to the version the cached pubkey belongs to, so a
 	// transit key rotation cannot silently switch signing to a new key the
 	// node does not know.
@@ -54,13 +56,20 @@ func NewVault(cfg VaultConfig) (*Vault, error) {
 	if cfg.TokenFile == "" {
 		return nil, fmt.Errorf("vault backend requires a token file")
 	}
+	if cfg.KeyVersion < 0 {
+		return nil, fmt.Errorf("vault key version must be zero or greater")
+	}
 
 	client, err := NewVaultClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	v := &Vault{client: client, mount: cfg.Mount, keyName: cfg.KeyName, tokenFile: cfg.TokenFile, stopRenew: make(chan struct{})}
+	v := &Vault{
+		client: client, mount: cfg.Mount, keyName: cfg.KeyName,
+		tokenFile: cfg.TokenFile, requestedKeyVersion: cfg.KeyVersion,
+		stopRenew: make(chan struct{}),
+	}
 	pub, version, err := v.fetchPubKey()
 	if err != nil {
 		return nil, err
@@ -182,13 +191,17 @@ func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
 	if !ok {
 		return nil, 0, fmt.Errorf("transit key %q has no keys map", v.keyName)
 	}
-	verRaw, ok := keys[strconv.Itoa(latest)]
+	selected := v.requestedKeyVersion
+	if selected == 0 {
+		selected = latest
+	}
+	verRaw, ok := keys[strconv.Itoa(selected)]
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key %q missing version %d", v.keyName, latest)
+		return nil, 0, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
 	}
 	verMap, ok := verRaw.(map[string]any)
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key version %d malformed", latest)
+		return nil, 0, fmt.Errorf("transit key version %d malformed", selected)
 	}
 	pkB64, ok := verMap["public_key"].(string)
 	if !ok || pkB64 == "" {
@@ -203,7 +216,7 @@ func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
 	}
 	pk := make(ed25519.PubKey, ed25519.PubKeySize)
 	copy(pk, raw)
-	return pk, latest, nil
+	return pk, selected, nil
 }
 
 // parseTransitSignature parses Vault's "vault:v<n>:<base64>" signature format

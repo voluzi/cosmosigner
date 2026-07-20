@@ -52,12 +52,45 @@ func TestLoad_EnvBackendAndSlices(t *testing.T) {
 	t.Setenv("COSMOSIGNER_NODE", "a:5555,b:5555")
 	t.Setenv("COSMOSIGNER_BACKEND", "vault")
 	t.Setenv("COSMOSIGNER_VAULT_KEY", "val")
+	t.Setenv("COSMOSIGNER_VAULT_KEY_VERSION", "7")
 	t.Setenv("COSMOSIGNER_VAULT_TOKEN_FILE", "/t")
+	t.Setenv("COSMOSIGNER_EXPECTED_PUBLIC_KEY", "cHVia2V5")
 	cfg, err := Load("", nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"a:5555", "b:5555"}, cfg.NodeAddrs)
 	require.Equal(t, backend.TypeVault, cfg.Backend.Type)
 	require.Equal(t, "val", cfg.Backend.Vault.KeyName)
+	require.Equal(t, 7, cfg.Backend.Vault.KeyVersion)
+	require.Equal(t, "cHVia2V5", cfg.ExpectedPublicKey)
+}
+
+func TestLoad_VaultKeyVersionFromYAML(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "c.yaml")
+	require.NoError(t, os.WriteFile(file, []byte(
+		"chain_id: c\nnodes: [a:5555]\nexpected_public_key: cHVia2V5\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_version: 4\n"), 0o600))
+
+	cfg, err := Load(file, nil)
+	require.NoError(t, err)
+	require.Equal(t, 4, cfg.Backend.Vault.KeyVersion)
+	require.Equal(t, "cHVia2V5", cfg.ExpectedPublicKey)
+}
+
+func TestLoad_RejectsUnknownYAMLField(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "c.yaml")
+	require.NoError(t, os.WriteFile(file, []byte(
+		"chain_id: c\nnodes: [a:5555]\nbackend:\n  key_file: /k\nexpected_pubkey: silently-ignored-typo\n"), 0o600))
+
+	_, err := Load(file, nil)
+	require.ErrorContains(t, err, "field expected_pubkey not found")
+}
+
+func TestLoad_RejectsUnknownNestedYAMLField(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "c.yaml")
+	require.NoError(t, os.WriteFile(file, []byte(
+		"chain_id: c\nnodes: [a:5555]\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_verison: 4\n"), 0o600))
+
+	_, err := Load(file, nil)
+	require.ErrorContains(t, err, "field key_verison not found")
 }
 
 func TestValidate_MutuallyExclusiveNodes(t *testing.T) {

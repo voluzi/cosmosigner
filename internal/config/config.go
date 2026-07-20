@@ -17,7 +17,8 @@ import (
 // Config is the full runtime configuration. Each field carries its YAML key,
 // environment variable, and default in one place.
 type Config struct {
-	ChainID string `yaml:"chain_id" env:"COSMOSIGNER_CHAIN_ID"`
+	ChainID           string `yaml:"chain_id" env:"COSMOSIGNER_CHAIN_ID"`
+	ExpectedPublicKey string `yaml:"expected_public_key" env:"COSMOSIGNER_EXPECTED_PUBLIC_KEY"`
 	// NodeAddrs is a static list of node privval addresses (host:port).
 	NodeAddrs []string `yaml:"nodes" env:"COSMOSIGNER_NODE" envSeparator:","`
 	// NodeService is a Kubernetes headless service FQDN + port (host:port);
@@ -136,6 +137,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Backend.Vault.TokenFile == "" {
 			return fmt.Errorf("vault backend requires backend.vault.token_file")
+		}
+		if c.Backend.Vault.KeyVersion < 0 {
+			return fmt.Errorf("vault backend key version must be zero or greater")
 		}
 	case backend.TypeGCPKMS:
 		if c.Backend.GCPKMS.KeyVersion == "" {

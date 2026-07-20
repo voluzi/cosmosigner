@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -41,6 +43,7 @@ func NewStartCmd() *cobra.Command {
 	d := config.Defaults()
 	f := cmd.Flags()
 	f.String("chain-id", "", "chain id")
+	f.String("expected-public-key", "", "expected consensus public key (base64); refuse startup on mismatch")
 	f.StringSlice("node", nil, "node privval address (repeatable)")
 	f.String("node-service", "", "headless service host:port to auto-discover nodes from (mutually exclusive with --node)")
 	f.String("conn-key", d.ConnKey, "path to the SecretConnection identity key")
@@ -69,6 +72,7 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 		}
 	}
 	s("chain-id", &c.ChainID)
+	s("expected-public-key", &c.ExpectedPublicKey)
 	if f.Changed("node") {
 		c.NodeAddrs, _ = f.GetStringSlice("node")
 	}
@@ -133,6 +137,9 @@ func runStart(cfg config.Config) error {
 		return err
 	}
 	defer be.Close()
+	if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
+		return err
+	}
 
 	// Fail fast if the backend can't actually sign (e.g. a Vault token missing
 	// the sign capability, or one that will expire and can't be renewed) rather
@@ -200,6 +207,24 @@ func runStart(cfg config.Config) error {
 		return err
 	}
 	logger.Info("cosmosigner stopped")
+	return nil
+}
+
+func verifyExpectedPublicKey(be backend.KeyBackend, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	want, err := base64.StdEncoding.DecodeString(expected)
+	if err != nil {
+		return fmt.Errorf("decode expected public key: %w", err)
+	}
+	pub, err := be.PubKey()
+	if err != nil {
+		return fmt.Errorf("get backend public key: %w", err)
+	}
+	if !bytes.Equal(pub.Bytes(), want) {
+		return fmt.Errorf("backend public key does not match expected public key")
+	}
 	return nil
 }
 

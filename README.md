@@ -110,9 +110,22 @@ make build
   --chain-id my-chain --node 127.0.0.1:5555 \
   --backend vault \
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
-  --vault-key my-validator \
+  --vault-key my-validator --vault-key-version 1 \
+  --expected-public-key '<base64 pubkey from cosmosigner pubkey>' \
   --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070
 ```
+
+Cosmosigner renews renewable and periodic Vault tokens itself, scheduling each
+renewal at half the current TTL. A separate token-renewer sidecar is not needed.
+Tokens with a finite TTL that cannot be renewed are rejected by the startup
+preflight.
+
+Pin `vault-key-version` for production validators. Version `0` selects Vault's
+latest version once at startup and pins signing to that version for the life of
+the process, but an explicit version also preserves the intended identity
+across restarts after a Transit key rotation. Set `expected-public-key` to the
+canonical base64 public key printed by `cosmosigner pubkey`; startup then fails
+before opening Raft state if the configured backend resolves to another key.
 
 ## Google Cloud KMS backend
 
@@ -267,6 +280,7 @@ flags override it.
 
 ```yaml
 chain_id: my-chain
+expected_public_key: <canonical base64 consensus public key>
 nodes:                       # static list, OR use node_service (mutually exclusive)
   - 10.0.0.1:5555
   - 10.0.0.2:5555
@@ -278,6 +292,7 @@ backend:
     address: https://vault:8200
     token_file: /vault/token
     key_name: my-validator
+    key_version: 1
 raft:
   node_id: node-1
   bind_addr: 0.0.0.0:7070

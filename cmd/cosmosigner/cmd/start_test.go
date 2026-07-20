@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"testing"
 
+	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/stretchr/testify/require"
 
+	"github.com/voluzi/cosmosigner/internal/backend"
 	"github.com/voluzi/cosmosigner/internal/config"
 )
 
@@ -69,4 +72,38 @@ func TestOverlayStartFlags_MalformedMemberFails(t *testing.T) {
 
 	err := overlayStartFlags(cmd, &config.Config{})
 	require.Error(t, err)
+}
+
+func TestOverlayStartFlags_ExpectedPublicKey(t *testing.T) {
+	cmd := NewStartCmd()
+	require.NoError(t, cmd.Flags().Set("expected-public-key", "cHVia2V5"))
+	require.NoError(t, cmd.Flags().Set("vault-key-version", "9"))
+
+	cfg := &config.Config{}
+	require.NoError(t, overlayStartFlags(cmd, cfg))
+	require.Equal(t, "cHVia2V5", cfg.ExpectedPublicKey)
+	require.Equal(t, 9, cfg.Backend.Vault.KeyVersion)
+}
+
+func TestVerifyExpectedPublicKey(t *testing.T) {
+	priv := ed25519.GenPrivKey()
+	be := backend.NewSoftwareFromPriv(priv)
+	expected := base64.StdEncoding.EncodeToString(priv.PubKey().Bytes())
+
+	require.NoError(t, verifyExpectedPublicKey(be, expected))
+}
+
+func TestVerifyExpectedPublicKeyMismatchFailsClosed(t *testing.T) {
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	different := ed25519.GenPrivKey().PubKey().Bytes()
+
+	err := verifyExpectedPublicKey(be, base64.StdEncoding.EncodeToString(different))
+	require.ErrorContains(t, err, "does not match")
+}
+
+func TestVerifyExpectedPublicKeyRejectsMalformedValue(t *testing.T) {
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+
+	err := verifyExpectedPublicKey(be, "not-base64")
+	require.ErrorContains(t, err, "expected public key")
 }
