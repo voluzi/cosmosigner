@@ -120,8 +120,12 @@ func (v *Vault) PubKey() (crypto.PubKey, error) { return v.pub, nil }
 // alive (renewable, or non-expiring). Read access to the key is already proven
 // by the public-key fetch in NewVault.
 func (v *Vault) VerifyCanSign() error {
+	return v.verifyClientCanSign(v.client)
+}
+
+func (v *Vault) verifyClientCanSign(client *vaultapi.Client) error {
 	signPath := fmt.Sprintf("%s/sign/%s", v.mount, v.keyName)
-	caps, err := v.client.Sys().CapabilitiesSelf(signPath)
+	caps, err := client.Sys().CapabilitiesSelf(signPath)
 	if err != nil {
 		return fmt.Errorf("check token capabilities on %s: %w", signPath, err)
 	}
@@ -129,7 +133,7 @@ func (v *Vault) VerifyCanSign() error {
 		return fmt.Errorf("vault token lacks 'update' on %s (capabilities: %v) — it cannot sign", signPath, caps)
 	}
 
-	secret, err := v.client.Auth().Token().LookupSelf()
+	secret, err := client.Auth().Token().LookupSelf()
 	if err != nil {
 		return fmt.Errorf("look up vault token: %w", err)
 	}
@@ -138,7 +142,7 @@ func (v *Vault) VerifyCanSign() error {
 	if ttl > 0 && !renewable {
 		return fmt.Errorf("vault token has a finite TTL (%s) and is not renewable; cosmosigner cannot keep it alive — use a renewable or periodic token", ttl)
 	}
-	if err := v.verifySigningKey(); err != nil {
+	if err := v.verifySigningKeyWithClient(client); err != nil {
 		return fmt.Errorf("vault key %q version %d cannot sign: %w", v.keyName, v.keyVersion, err)
 	}
 	return nil
@@ -154,7 +158,11 @@ func hasCapability(caps []string, want string) bool {
 }
 
 func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
-	secret, err := v.client.Logical().Write(
+	return v.signWithClient(v.client, signBytes)
+}
+
+func (v *Vault) signWithClient(client *vaultapi.Client, signBytes []byte) ([]byte, error) {
+	secret, err := client.Logical().Write(
 		fmt.Sprintf("%s/sign/%s", v.mount, v.keyName),
 		map[string]any{
 			"input":       base64.StdEncoding.EncodeToString(signBytes),
@@ -175,7 +183,11 @@ func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
 }
 
 func (v *Vault) verifySigningKey() error {
-	signature, err := v.Sign(vaultPreflightMessage)
+	return v.verifySigningKeyWithClient(v.client)
+}
+
+func (v *Vault) verifySigningKeyWithClient(client *vaultapi.Client) error {
+	signature, err := v.signWithClient(client, vaultPreflightMessage)
 	if err != nil {
 		return err
 	}
@@ -303,8 +315,16 @@ func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
 	for {
 		if raw, err := os.ReadFile(v.tokenFile); err == nil {
 			if token := strings.TrimSpace(string(raw)); token != "" && token != v.client.Token() {
-				v.client.SetToken(token)
-				renewAt = time.Time{}
+				// Keep signing with the last proven token until a projected Secret replacement satisfies
+				// the same lifetime, capability, and key-signing checks enforced at startup.
+				candidate, cloneErr := v.client.CloneWithHeaders()
+				if cloneErr == nil {
+					candidate.SetToken(token)
+					if verifyErr := v.verifyClientCanSign(candidate); verifyErr == nil {
+						v.client.SetToken(token)
+						renewAt = time.Time{}
+					}
+				}
 			}
 		}
 		secret, err := v.client.Auth().Token().LookupSelf()

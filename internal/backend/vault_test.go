@@ -138,11 +138,14 @@ func TestVaultVerifyCanSignRejectsPublicOnlyKey(t *testing.T) {
 }
 
 func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {
+	privateKey := ed25519.GenPrivKey()
 	firstLookup := make(chan struct{}, 1)
 	replacementLookup := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"capabilities": []string{"update"}}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
 			switch r.Header.Get("X-Vault-Token") {
 			case "initial-token":
@@ -162,6 +165,16 @@ func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {
 			}
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/auth/token/renew-self":
 			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"lease_duration": 2, "renewable": true}})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/transit/sign/validator":
+			var request map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			input, err := base64.StdEncoding.DecodeString(request["input"].(string))
+			require.NoError(t, err)
+			signature, err := privateKey.Sign(input)
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signature),
+			}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -172,7 +185,10 @@ func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(tokenFile, []byte("initial-token"), 0o600))
 	client, err := NewVaultClient(VaultConfig{Address: server.URL, TokenFile: tokenFile})
 	require.NoError(t, err)
-	v := &Vault{client: client, tokenFile: tokenFile, stopRenew: make(chan struct{})}
+	v := &Vault{
+		client: client, mount: "transit", keyName: "validator", keyVersion: 1, pub: privateKey.PubKey(),
+		tokenFile: tokenFile, stopRenew: make(chan struct{}),
+	}
 	t.Cleanup(func() { require.NoError(t, v.Close()) })
 	go v.renewLoopWithPollInterval(10 * time.Millisecond)
 
@@ -188,6 +204,103 @@ func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("renew loop did not reload the changed token file")
 	}
+	require.Eventually(t, func() bool { return client.Token() == "replacement-token" }, 250*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestVaultRenewLoopRejectsFiniteNonRenewableReplacementToken(t *testing.T) {
+	replacementLookup := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"capabilities": []string{"update"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
+			switch r.Header.Get("X-Vault-Token") {
+			case "initial-token":
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 3600, "renewable": true}})
+			case "replacement-token":
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 60, "renewable": false}})
+				select {
+				case replacementLookup <- struct{}{}:
+				default:
+				}
+			default:
+				http.Error(w, "unexpected token", http.StatusForbidden)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("initial-token"), 0o600))
+	client, err := NewVaultClient(VaultConfig{Address: server.URL, TokenFile: tokenFile})
+	require.NoError(t, err)
+	v := &Vault{
+		client: client, mount: "transit", keyName: "validator", keyVersion: 1,
+		tokenFile: tokenFile, stopRenew: make(chan struct{}),
+	}
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+	go v.renewLoopWithPollInterval(10 * time.Millisecond)
+
+	require.NoError(t, os.WriteFile(tokenFile, []byte("replacement-token"), 0o600))
+	select {
+	case <-replacementLookup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop did not inspect the replacement token")
+	}
+	require.Eventually(t, func() bool { return client.Token() == "initial-token" }, 250*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestVaultRenewLoopValidatesReplacementTokenBeforeAdopting(t *testing.T) {
+	privateKey := ed25519.GenPrivKey()
+	replacementSigned := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"capabilities": []string{"update"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 3600, "renewable": true}})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/transit/sign/validator":
+			var request map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			input, err := base64.StdEncoding.DecodeString(request["input"].(string))
+			require.NoError(t, err)
+			signature, err := privateKey.Sign(input)
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signature),
+			}})
+			select {
+			case replacementSigned <- struct{}{}:
+			default:
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("initial-token"), 0o600))
+	client, err := NewVaultClient(VaultConfig{Address: server.URL, TokenFile: tokenFile})
+	require.NoError(t, err)
+	v := &Vault{
+		client: client, mount: "transit", keyName: "validator", keyVersion: 1, pub: privateKey.PubKey(),
+		tokenFile: tokenFile, stopRenew: make(chan struct{}),
+	}
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+	go v.renewLoopWithPollInterval(10 * time.Millisecond)
+
+	require.NoError(t, os.WriteFile(tokenFile, []byte("replacement-token"), 0o600))
+	select {
+	case <-replacementSigned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop adopted the replacement token without proving that it can sign")
+	}
+	require.Eventually(t, func() bool { return client.Token() == "replacement-token" }, 250*time.Millisecond, 10*time.Millisecond)
 }
 
 func newVaultBackendServer(t *testing.T, versionOne, versionTwo []byte) *httptest.Server {
