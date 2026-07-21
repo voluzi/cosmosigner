@@ -15,25 +15,31 @@ import (
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
+// vaultPreflightMessage cannot be decoded as CometBFT canonical vote/proposal bytes, so proving a
+// Vault key can sign it cannot create a consensus signature.
+var vaultPreflightMessage = []byte("cosmosigner/vault preflight - not a consensus message")
+
 // VaultConfig configures the Vault Transit backend.
 type VaultConfig struct {
-	Address   string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
-	TokenFile string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
-	Mount     string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
-	KeyName   string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"`                     // transit key name
-	Namespace string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
-	TLSCACert string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
+	Address    string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
+	TokenFile  string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
+	Mount      string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
+	KeyName    string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"`                     // transit key name
+	KeyVersion int    `yaml:"key_version" env:"COSMOSIGNER_VAULT_KEY_VERSION"`
+	Namespace  string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
+	TLSCACert  string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
 }
 
 // Vault signs via the Vault Transit engine. The consensus key is created
 // non-exportable inside Vault and never leaves it; only signatures cross the
 // wire. The public key is fetched once and cached.
 type Vault struct {
-	client    *vaultapi.Client
-	mount     string
-	keyName   string
-	tokenFile string
-	pub       crypto.PubKey
+	client              *vaultapi.Client
+	mount               string
+	keyName             string
+	tokenFile           string
+	pub                 crypto.PubKey
+	requestedKeyVersion int
 	// keyVersion pins Sign to the version the cached pubkey belongs to, so a
 	// transit key rotation cannot silently switch signing to a new key the
 	// node does not know.
@@ -54,13 +60,20 @@ func NewVault(cfg VaultConfig) (*Vault, error) {
 	if cfg.TokenFile == "" {
 		return nil, fmt.Errorf("vault backend requires a token file")
 	}
+	if cfg.KeyVersion < 0 {
+		return nil, fmt.Errorf("vault key version must be zero or greater")
+	}
 
 	client, err := NewVaultClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	v := &Vault{client: client, mount: cfg.Mount, keyName: cfg.KeyName, tokenFile: cfg.TokenFile, stopRenew: make(chan struct{})}
+	v := &Vault{
+		client: client, mount: cfg.Mount, keyName: cfg.KeyName,
+		tokenFile: cfg.TokenFile, requestedKeyVersion: cfg.KeyVersion,
+		stopRenew: make(chan struct{}),
+	}
 	pub, version, err := v.fetchPubKey()
 	if err != nil {
 		return nil, err
@@ -107,8 +120,12 @@ func (v *Vault) PubKey() (crypto.PubKey, error) { return v.pub, nil }
 // alive (renewable, or non-expiring). Read access to the key is already proven
 // by the public-key fetch in NewVault.
 func (v *Vault) VerifyCanSign() error {
+	return v.verifyClientCanSign(v.client)
+}
+
+func (v *Vault) verifyClientCanSign(client *vaultapi.Client) error {
 	signPath := fmt.Sprintf("%s/sign/%s", v.mount, v.keyName)
-	caps, err := v.client.Sys().CapabilitiesSelf(signPath)
+	caps, err := client.Sys().CapabilitiesSelf(signPath)
 	if err != nil {
 		return fmt.Errorf("check token capabilities on %s: %w", signPath, err)
 	}
@@ -116,7 +133,7 @@ func (v *Vault) VerifyCanSign() error {
 		return fmt.Errorf("vault token lacks 'update' on %s (capabilities: %v) — it cannot sign", signPath, caps)
 	}
 
-	secret, err := v.client.Auth().Token().LookupSelf()
+	secret, err := client.Auth().Token().LookupSelf()
 	if err != nil {
 		return fmt.Errorf("look up vault token: %w", err)
 	}
@@ -124,6 +141,9 @@ func (v *Vault) VerifyCanSign() error {
 	renewable, _ := secret.TokenIsRenewable()
 	if ttl > 0 && !renewable {
 		return fmt.Errorf("vault token has a finite TTL (%s) and is not renewable; cosmosigner cannot keep it alive — use a renewable or periodic token", ttl)
+	}
+	if err := v.verifySigningKeyWithClient(client); err != nil {
+		return fmt.Errorf("vault key %q version %d cannot sign: %w", v.keyName, v.keyVersion, err)
 	}
 	return nil
 }
@@ -138,7 +158,11 @@ func hasCapability(caps []string, want string) bool {
 }
 
 func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
-	secret, err := v.client.Logical().Write(
+	return v.signWithClient(v.client, signBytes)
+}
+
+func (v *Vault) signWithClient(client *vaultapi.Client, signBytes []byte) ([]byte, error) {
+	secret, err := client.Logical().Write(
 		fmt.Sprintf("%s/sign/%s", v.mount, v.keyName),
 		map[string]any{
 			"input":       base64.StdEncoding.EncodeToString(signBytes),
@@ -158,52 +182,92 @@ func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
 	return parseTransitSignature(sigField)
 }
 
+func (v *Vault) verifySigningKey() error {
+	return v.verifySigningKeyWithClient(v.client)
+}
+
+func (v *Vault) verifySigningKeyWithClient(client *vaultapi.Client) error {
+	signature, err := v.signWithClient(client, vaultPreflightMessage)
+	if err != nil {
+		return err
+	}
+	if !v.pub.VerifySignature(vaultPreflightMessage, signature) {
+		return fmt.Errorf("signature does not verify against the selected public key")
+	}
+	return nil
+}
+
 func (v *Vault) Close() error {
 	v.stopOnce.Do(func() { close(v.stopRenew) })
 	return nil
 }
 
 func (v *Vault) fetchPubKey() (crypto.PubKey, int, error) {
-	secret, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.mount, v.keyName))
+	pub, version, _, exists, err := v.fetchPubKeyIfExists(true)
 	if err != nil {
-		return nil, 0, fmt.Errorf("read transit key: %w", err)
+		return nil, 0, err
 	}
-	if secret == nil || secret.Data == nil {
+	if !exists {
 		return nil, 0, fmt.Errorf("transit key %q not found", v.keyName)
 	}
+	return pub, version, nil
+}
+
+func (v *Vault) fetchPubKeyIfExists(requireSigningVersion bool) (crypto.PubKey, int, int, bool, error) {
+	secret, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.mount, v.keyName))
+	if err != nil {
+		return nil, 0, 0, false, fmt.Errorf("read transit key: %w", err)
+	}
+	if secret == nil || secret.Data == nil {
+		return nil, 0, 0, false, nil
+	}
 	if kt, _ := secret.Data["type"].(string); kt != "" && kt != "ed25519" {
-		return nil, 0, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
+		return nil, 0, 0, true, fmt.Errorf("transit key %q has type %q, want ed25519", v.keyName, kt)
 	}
 	latest, err := toInt(secret.Data["latest_version"])
 	if err != nil {
-		return nil, 0, fmt.Errorf("transit key latest_version: %w", err)
+		return nil, 0, 0, true, fmt.Errorf("transit key latest_version: %w", err)
 	}
 	keys, ok := secret.Data["keys"].(map[string]any)
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key %q has no keys map", v.keyName)
+		return nil, 0, 0, true, fmt.Errorf("transit key %q has no keys map", v.keyName)
 	}
-	verRaw, ok := keys[strconv.Itoa(latest)]
+	selected := v.requestedKeyVersion
+	if selected == 0 {
+		selected = latest
+	}
+	minimum := 0
+	if raw, ok := secret.Data["min_encryption_version"]; ok {
+		minimum, err = toInt(raw)
+		if err != nil {
+			return nil, 0, 0, true, fmt.Errorf("transit key min_encryption_version: %w", err)
+		}
+		if requireSigningVersion && selected < minimum {
+			return nil, 0, minimum, true, fmt.Errorf("transit key %q version %d is below Vault's minimum signing version %d", v.keyName, selected, minimum)
+		}
+	}
+	verRaw, ok := keys[strconv.Itoa(selected)]
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key %q missing version %d", v.keyName, latest)
+		return nil, 0, minimum, true, fmt.Errorf("transit key %q missing version %d", v.keyName, selected)
 	}
 	verMap, ok := verRaw.(map[string]any)
 	if !ok {
-		return nil, 0, fmt.Errorf("transit key version %d malformed", latest)
+		return nil, 0, minimum, true, fmt.Errorf("transit key version %d malformed", selected)
 	}
 	pkB64, ok := verMap["public_key"].(string)
 	if !ok || pkB64 == "" {
-		return nil, 0, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
+		return nil, 0, minimum, true, fmt.Errorf("transit key %q has no public_key (must be an ed25519 key)", v.keyName)
 	}
 	raw, err := base64.StdEncoding.DecodeString(pkB64)
 	if err != nil {
-		return nil, 0, fmt.Errorf("decode public_key: %w", err)
+		return nil, 0, minimum, true, fmt.Errorf("decode public_key: %w", err)
 	}
 	if len(raw) != ed25519.PubKeySize {
-		return nil, 0, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
+		return nil, 0, minimum, true, fmt.Errorf("public key size %d, want %d", len(raw), ed25519.PubKeySize)
 	}
 	pk := make(ed25519.PubKey, ed25519.PubKeySize)
 	copy(pk, raw)
-	return pk, latest, nil
+	return pk, selected, minimum, true, nil
 }
 
 // parseTransitSignature parses Vault's "vault:v<n>:<base64>" signature format
@@ -237,21 +301,35 @@ func toInt(v any) (int, error) {
 	}
 }
 
-// renewLoop keeps the Vault token alive. It tolerates lookup/renew failures and
-// non-renewable tokens (e.g. when an external sidecar rotates the token file).
+// renewLoop keeps the Vault token alive while polling for token-file replacements independently of
+// long renewal deadlines. Lookup and renewal failures are retried without stopping the signer.
 func (v *Vault) renewLoop() {
+	v.renewLoopWithPollInterval(time.Minute)
+}
+
+func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
+	if pollInterval <= 0 {
+		pollInterval = time.Minute
+	}
+	var renewAt time.Time
 	for {
-		secret, err := v.client.Auth().Token().LookupSelf()
-		if err != nil {
-			// The current token may have been revoked/expired; if a sidecar
-			// rotates the token file, pick up the fresh token from disk.
-			if raw, rerr := os.ReadFile(v.tokenFile); rerr == nil {
-				if tok := strings.TrimSpace(string(raw)); tok != "" && tok != v.client.Token() {
-					v.client.SetToken(tok)
-					continue
+		if raw, err := os.ReadFile(v.tokenFile); err == nil {
+			if token := strings.TrimSpace(string(raw)); token != "" && token != v.client.Token() {
+				// Keep signing with the last proven token until a projected Secret replacement satisfies
+				// the same lifetime, capability, and key-signing checks enforced at startup.
+				candidate, cloneErr := v.client.CloneWithHeaders()
+				if cloneErr == nil {
+					candidate.SetToken(token)
+					if verifyErr := v.verifyClientCanSign(candidate); verifyErr == nil {
+						v.client.SetToken(token)
+						renewAt = time.Time{}
+					}
 				}
 			}
-			if sleepOrStop(v.stopRenew, 30*time.Second) {
+		}
+		secret, err := v.client.Auth().Token().LookupSelf()
+		if err != nil {
+			if sleepOrStop(v.stopRenew, min(pollInterval, 30*time.Second)) {
 				return
 			}
 			continue
@@ -259,20 +337,28 @@ func (v *Vault) renewLoop() {
 		ttl, _ := secret.TokenTTL()
 		renewable, _ := secret.TokenIsRenewable()
 		if !renewable || ttl <= 0 {
-			if sleepOrStop(v.stopRenew, time.Minute) {
+			renewAt = time.Time{}
+			if sleepOrStop(v.stopRenew, pollInterval) {
 				return
 			}
 			continue
 		}
-		wait := max(ttl/2, time.Second)
-		if sleepOrStop(v.stopRenew, wait) {
-			return
+		if renewAt.IsZero() {
+			renewAt = time.Now().Add(max(ttl/2, time.Second))
 		}
-		if _, err := v.client.Auth().Token().RenewSelf(0); err != nil {
-			if sleepOrStop(v.stopRenew, 5*time.Second) {
+		if time.Now().Before(renewAt) {
+			if sleepOrStop(v.stopRenew, min(time.Until(renewAt), pollInterval)) {
 				return
 			}
+			continue
 		}
+		if _, err := v.client.Auth().Token().RenewSelf(0); err != nil {
+			if sleepOrStop(v.stopRenew, min(pollInterval, 5*time.Second)) {
+				return
+			}
+			continue
+		}
+		renewAt = time.Time{}
 	}
 }
 
