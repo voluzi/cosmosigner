@@ -48,6 +48,49 @@ type raftStore struct {
 	applyTimeout time.Duration
 }
 
+var (
+	// advertiseResolveTimeout bounds how long startup waits for the advertise address to become
+	// resolvable. It stays well inside a typical Kubernetes startup probe budget, so a genuinely
+	// wrong address still fails the pod rather than hanging invisibly. Variables, not constants,
+	// so tests can shrink the budget.
+	advertiseResolveTimeout = 90 * time.Second
+	// advertiseResolveInterval is how often resolution is retried within that budget.
+	advertiseResolveInterval = time.Second
+)
+
+// resolveAdvertise resolves the address peers use to reach this node, retrying until
+// advertiseResolveTimeout.
+//
+// Raft needs a concrete, advertisable *net.TCPAddr before the transport is built: the plain-TCP
+// transport rejects a non-TCP or unspecified address, and NewRaft captures the local address once.
+// So resolution cannot be deferred. But under a StatefulSet the per-pod headless DNS record is
+// published moments after the pod starts, so a signer that resolves once and exits turns an
+// ordinary startup race into a crashloop — one that resolves itself only via CrashLoopBackOff,
+// after backoff has grown well past the DNS delay it was waiting on.
+//
+// Retrying here is safe: the resolved value only becomes visible to raft through the transport and
+// BootstrapCluster, both strictly later, so a few seconds of waiting changes no bootstrap or
+// membership assumption. Peer addresses are not resolved here at all — raft dials those lazily and
+// retries on its own — so this waits on this node's own record only.
+func resolveAdvertise(advertise string, logger hclog.Logger) (*net.TCPAddr, error) {
+	deadline := time.Now().Add(advertiseResolveTimeout)
+	for attempt := 1; ; attempt++ {
+		addr, err := net.ResolveTCPAddr("tcp", advertise)
+		if err == nil {
+			if attempt > 1 {
+				logger.Info("resolved advertise address", "advertise", advertise, "addr", addr.String(), "attempts", attempt)
+			}
+			return addr, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
+		}
+		logger.Warn("advertise address not resolvable yet, retrying",
+			"advertise", advertise, "attempt", attempt, "err", err)
+		time.Sleep(advertiseResolveInterval)
+	}
+}
+
 // NewRaftStore creates an embedded-raft StateStore.
 func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 	if cfg.ApplyTimeout <= 0 {
@@ -76,9 +119,9 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 		return nil, fmt.Errorf("snapshot store: %w", err)
 	}
 
-	advertiseAddr, err := net.ResolveTCPAddr("tcp", cfg.Advertise)
+	advertiseAddr, err := resolveAdvertise(cfg.Advertise, logger)
 	if err != nil {
-		return nil, fmt.Errorf("resolve advertise address %q: %w", cfg.Advertise, err)
+		return nil, err
 	}
 	var transport *raft.NetworkTransport
 	if cfg.TLS.Enabled() {

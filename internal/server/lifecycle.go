@@ -60,6 +60,45 @@ func (ns *nodeServer) silentFor() time.Duration {
 	return time.Since(time.Unix(0, ns.lastActivity.Load()))
 }
 
+// retireReason classifies why a connection should be recreated, or retireNone to keep it.
+type retireReason int
+
+const (
+	retireNone retireReason = iota
+	retireSilent
+	retireExhausted
+)
+
+// observe updates the connection-state latch and reports whether this connection should be
+// retired. It is the single classifier shared by the reconcile pass and the between-tick health
+// scan, so both agree on when a connection is dead — a scan with its own copy of these rules
+// silently disagreed with reconcile about the latch and never fired.
+//
+// Callers must hold Lifecycle.mu.
+func (ns *nodeServer) observe(staleTimeout, dialBudget time.Duration) retireReason {
+	if ns.ep.IsConnected() {
+		// Start the silence clock at connection establishment, not at connector creation — a
+		// connector that spent time dialing a not-yet-up node must not be judged "silent" the
+		// instant it connects (that would kill the handshake before the first request).
+		if !ns.connected {
+			ns.connected = true
+			ns.touch()
+			return retireNone
+		}
+		// Live socket gone silent → dead peer / EOF-spin.
+		if ns.silentFor() > staleTimeout {
+			return retireSilent
+		}
+		return retireNone
+	}
+	ns.connected = false
+	// Not connected and past the dial budget → connector exhausted.
+	if time.Since(ns.createdAt) > dialBudget {
+		return retireExhausted
+	}
+	return retireNone
+}
+
 // Lifecycle serves the gated PrivValidator to a dynamic set of target nodes,
 // but only while this process holds raft leadership. On every reconcile it
 // resolves the NodeSource and diffs it against the live connections: new nodes
@@ -76,6 +115,90 @@ type Lifecycle struct {
 
 	mu      sync.Mutex
 	servers map[string]*nodeServer // keyed by node address
+
+	// wake requests an immediate reconcile instead of waiting out the tick. Buffered with size 1:
+	// a pending wake already covers any further request, so signalling never blocks.
+	wake chan struct{}
+	// stopping tracks in-flight asynchronous connection teardowns so shutdown can wait for them.
+	stopping sync.WaitGroup
+}
+
+// retire stops a node connection and drops it from the serving set.
+//
+// The map entry is deleted synchronously — that is what makes the connection unreachable — while
+// srv.Stop() runs in the background. Stop() blocks until the service loop leaves its in-flight
+// ReadMessage, up to TimeoutReadWrite (3s by default) per connection, and it is called with l.mu
+// held; doing it inline stalls discovery for every other node behind a socket that is already dead.
+// That is the compounding cost behind a rendezvous that takes minutes: each reconcile pass pays the
+// teardown of every dead peer before it can redial any of them.
+//
+// This does not widen any signing window. Removing the entry is what stops the connection being
+// served, and every signature is gated by the shared raft-backed reserve/commit path regardless of
+// how many endpoints are connected — a torn-down endpoint that lingers a moment cannot sign
+// anything a live one could not.
+func (l *Lifecycle) retire(addr string, ns *nodeServer) {
+	delete(l.servers, addr)
+	l.stopping.Add(1)
+	go func() {
+		defer l.stopping.Done()
+		_ = ns.srv.Stop()
+		// A retired connection usually means the node is being replaced (new pod, new IP), so the
+		// resolved node set is likely stale too. Re-resolve now rather than waiting out the tick.
+		l.requestReconcile()
+	}()
+}
+
+// requestReconcile asks the run loop to reconcile before its next tick. It never blocks.
+func (l *Lifecycle) requestReconcile() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
+
+// dialBudget is how long a connector may keep dialing before it is recreated: the endpoint's own
+// retry budget plus one reconcile interval of slack, so a connector is never judged exhausted by
+// the same pass that would have let it finish its last retry.
+func (l *Lifecycle) dialBudget() time.Duration {
+	return time.Duration(l.cfg.MaxRetries)*l.cfg.RetryWait + l.cfg.ReconcileInterval
+}
+
+// watchInterval is how often connection health is sampled between reconciles. Detecting a dead
+// connection is cheap; acting on it is not, so the scan only ever signals the run loop.
+func (l *Lifecycle) watchInterval() time.Duration {
+	// Sample well inside StaleConnTimeout so a dead socket is noticed promptly after it goes stale,
+	// but never faster than 250ms.
+	d := l.cfg.StaleConnTimeout / 4
+	if d < 250*time.Millisecond {
+		d = 250 * time.Millisecond
+	}
+	if d > l.cfg.ReconcileInterval {
+		d = l.cfg.ReconcileInterval
+	}
+	return d
+}
+
+// hasDeadConnection reports whether any served connection is eligible for retirement, using the
+// same classifier as the reconcile pass so the two cannot disagree.
+//
+// This exists because a node pod that dies is usually replaced at a NEW address, so the resolved
+// target set is stale from the moment the pod dies. Waiting a full ReconcileInterval to notice
+// couples rendezvous latency to a tick that has no relationship to how fast pods churn — which is
+// what makes a healthy restart look like a multi-minute outage.
+//
+// observe() latches connection state, so this is not read-only; reconcile remains the only mutator
+// of the servers map itself.
+func (l *Lifecycle) hasDeadConnection() bool {
+	dialBudget := l.dialBudget()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, ns := range l.servers {
+		if ns.observe(l.cfg.StaleConnTimeout, dialBudget) != retireNone {
+			return true
+		}
+	}
+	return false
 }
 
 func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.PrivKey, store state.StateStore, logger cmtlog.Logger) *Lifecycle {
@@ -102,24 +225,38 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 		store:   store,
 		logger:  logger,
 		servers: make(map[string]*nodeServer),
+		wake:    make(chan struct{}, 1),
 	}
 }
 
 // Run reconciles serving state with raft leadership and the resolved node set
 // until ctx is cancelled. The periodic tick backstops a missed LeaderCh
 // transition, refreshes node discovery, and recovers dead/exhausted connectors.
+// Retiring a connection also wakes the loop directly, so a node replaced by a
+// new pod (and so a new IP) is rediscovered without waiting out the tick.
 func (l *Lifecycle) Run(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.ReconcileInterval)
 	defer ticker.Stop()
+	watch := time.NewTicker(l.watchInterval())
+	defer watch.Stop()
 
 	l.reconcile()
 	for {
 		select {
 		case <-ctx.Done():
 			l.stopAll()
+			l.stopping.Wait()
 			return ctx.Err()
 		case <-l.store.LeaderCh():
 			l.reconcile()
+		case <-l.wake:
+			l.reconcile()
+		case <-watch.C:
+			// Cheap health scan between ticks: a dead connection means the node is likely being
+			// replaced at a new address, so reconcile now instead of waiting out the interval.
+			if l.hasDeadConnection() {
+				l.reconcile()
+			}
 		case <-ticker.C:
 			l.reconcile()
 		}
@@ -144,41 +281,25 @@ func (l *Lifecycle) reconcile() {
 		want[addr] = struct{}{}
 	}
 
-	dialBudget := time.Duration(l.cfg.MaxRetries) * l.cfg.RetryWait
+	dialBudget := l.dialBudget()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	for addr, ns := range l.servers {
-		_, wanted := want[addr]
-		switch {
-		case !wanted:
-			_ = ns.srv.Stop()
-			delete(l.servers, addr)
+		if _, wanted := want[addr]; !wanted {
+			l.retire(addr, ns)
 			l.logger.Info("stopped serving node", "node", addr)
-		case ns.ep.IsConnected():
-			// Start the silence clock at connection establishment, not at
-			// connector creation — a connector that spent time dialing a
-			// not-yet-up node must not be judged "silent" the instant it
-			// connects (that would kill the handshake before the first request).
-			if !ns.connected {
-				ns.connected = true
-				ns.touch()
-			}
-			// Live socket gone silent → dead peer / EOF-spin.
-			if ns.silentFor() > l.cfg.StaleConnTimeout {
-				_ = ns.srv.Stop()
-				delete(l.servers, addr)
-				l.logger.Info("recycling silent signer connection", "node", addr, "silent", ns.silentFor().Round(time.Second))
-			}
-		default:
-			ns.connected = false
-			// Not connected and past the dial budget → connector exhausted.
-			if time.Since(ns.createdAt) > dialBudget+l.cfg.ReconcileInterval {
-				_ = ns.srv.Stop()
-				delete(l.servers, addr)
-				l.logger.Info("redialing exhausted connector", "node", addr)
-			}
+			continue
+		}
+		switch ns.observe(l.cfg.StaleConnTimeout, dialBudget) {
+		case retireSilent:
+			silent := ns.silentFor().Round(time.Second)
+			l.retire(addr, ns)
+			l.logger.Info("recycling silent signer connection", "node", addr, "silent", silent)
+		case retireExhausted:
+			l.retire(addr, ns)
+			l.logger.Info("redialing exhausted connector", "node", addr)
 		}
 	}
 	for addr := range want {
@@ -223,7 +344,6 @@ func (l *Lifecycle) stopAll() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for addr, ns := range l.servers {
-		_ = ns.srv.Stop()
-		delete(l.servers, addr)
+		l.retire(addr, ns)
 	}
 }

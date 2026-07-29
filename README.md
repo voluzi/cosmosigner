@@ -207,6 +207,19 @@ Discovery applies only to the *target nodes* (signature consumers, protected by
 the raft gate). The raft member set stays **static** on purpose — it's the
 signing quorum's trust boundary, not something to auto-join.
 
+Reconciliation is not purely periodic: connection health is also sampled between
+ticks, and a connection that dies triggers an immediate re-resolve rather than
+waiting out `--reconcile-interval`. This matters because a node pod that dies is
+usually replaced at a **new IP**, so the resolved address is stale the moment the
+pod goes away — tying recovery to the tick makes an ordinary node restart look
+like a multi-minute outage.
+
+Cosmosigner also waits for its own `--raft-advertise` address to become
+resolvable at startup (up to 90s) instead of exiting immediately. Under a
+StatefulSet the per-pod DNS record is published moments after the pod starts, so
+resolving once and exiting turns an ordinary startup race into a crashloop. A
+genuinely wrong address still fails, just after the retry budget.
+
 ## High availability (raft cluster)
 
 Run an odd number of replicas (3 tolerates 1 failure, 5 tolerates 2). Every node
