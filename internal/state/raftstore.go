@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -72,22 +73,55 @@ var (
 // BootstrapCluster, both strictly later, so a few seconds of waiting changes no bootstrap or
 // membership assumption. Peer addresses are not resolved here at all — raft dials those lazily and
 // retries on its own — so this waits on this node's own record only.
-func resolveAdvertise(advertise string, logger hclog.Logger) (*net.TCPAddr, error) {
-	deadline := time.Now().Add(advertiseResolveTimeout)
+//
+// Only the DNS lookup is retried. A malformed address (missing or non-numeric port, no host) fails
+// identically on every attempt, so retrying it would turn an operator typo into a 90-second hang
+// instead of the immediate error it used to be. Each lookup is bound to the remaining budget, so a
+// stalled resolver cannot hang past it either.
+func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger) (*net.TCPAddr, error) {
+	host, portStr, err := net.SplitHostPort(advertise)
+	if err != nil {
+		return nil, fmt.Errorf("parse advertise address %q: %w", advertise, err)
+	}
+	port, err := net.DefaultResolver.LookupPort(ctx, "tcp", portStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse advertise port of %q: %w", advertise, err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.TCPAddr{IP: ip, Port: port}, nil
+	}
+
+	// A hostname: this is the part that legitimately needs waiting on.
+	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
+	defer cancel()
+
 	for attempt := 1; ; attempt++ {
-		addr, err := net.ResolveTCPAddr("tcp", advertise)
-		if err == nil {
+		// Bound each lookup by the remaining budget so a stalled resolver cannot hang past it.
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err == nil && len(ips) > 0 {
+			addr := &net.TCPAddr{IP: ips[0], Port: port}
 			if attempt > 1 {
 				logger.Info("resolved advertise address", "advertise", advertise, "addr", addr.String(), "attempts", attempt)
 			}
 			return addr, nil
 		}
-		if time.Now().After(deadline) {
+		if err == nil {
+			err = fmt.Errorf("no addresses for host %q", host)
+		}
+		if ctx.Err() != nil {
 			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
 		}
 		logger.Warn("advertise address not resolvable yet, retrying",
 			"advertise", advertise, "attempt", attempt, "err", err)
-		time.Sleep(advertiseResolveInterval)
+
+		select {
+		case <-time.After(advertiseResolveInterval):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
+		}
 	}
 }
 
@@ -119,7 +153,7 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 		return nil, fmt.Errorf("snapshot store: %w", err)
 	}
 
-	advertiseAddr, err := resolveAdvertise(cfg.Advertise, logger)
+	advertiseAddr, err := resolveAdvertise(context.Background(), cfg.Advertise, logger)
 	if err != nil {
 		return nil, err
 	}

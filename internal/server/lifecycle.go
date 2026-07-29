@@ -52,13 +52,44 @@ type nodeServer struct {
 	createdAt    time.Time
 	connected    bool         // last observed connection state (reconcile-only)
 	lastActivity atomic.Int64 // unix nanos of the last handled request (pings included)
+	// retired marks this connection as no longer serving. It is set synchronously when the
+	// connection is dropped from the serving set, before the (blocking) Stop() runs — see retire.
+	retired atomic.Bool
 }
 
 func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
 
+// handleRequest serves one privval request, recording inbound activity (pings included) for
+// dead-socket detection.
+//
+// A retired connection must not serve, even before its asynchronous Stop() has landed: the
+// SignerServer service loop does not consult the serving set, so this check is what makes
+// retirement take effect immediately. Without it, a node removed from the target set could keep
+// signing until Stop() completed — long enough to race its replacement for a height/round/step
+// reservation.
+func (ns *nodeServer) handleRequest(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
+	if ns.retired.Load() {
+		return privval.DefaultValidationRequestHandler(pv, req, retiredChainID)
+	}
+	ns.touch()
+	return privval.DefaultValidationRequestHandler(pv, req, chainID)
+}
+
 func (ns *nodeServer) silentFor() time.Duration {
 	return time.Since(time.Unix(0, ns.lastActivity.Load()))
 }
+
+// retiredChainID is a sentinel passed to cometbft's request handler to make it refuse every
+// request on a retired connection.
+//
+// Refusing this way, rather than returning a bare error, is deliberate: SignerServer replies with
+// whatever message the handler returns, so a refusal must still be a well-formed response. The
+// chain-ID mismatch path is the only one that produces a properly wrapped RemoteSignerError for
+// *every* request type — notably PubKeyRequest, where a handler error yields an empty response
+// message instead. Gating the PrivValidator itself would leave that case malformed.
+//
+// The value cannot collide with a real chain ID: chain IDs are non-empty and cannot contain spaces.
+const retiredChainID = "\x00 cosmosigner retired connection"
 
 // retireReason classifies why a connection should be recreated, or retireNone to keep it.
 type retireReason int
@@ -132,11 +163,14 @@ type Lifecycle struct {
 // That is the compounding cost behind a rendezvous that takes minutes: each reconcile pass pays the
 // teardown of every dead peer before it can redial any of them.
 //
-// This does not widen any signing window. Removing the entry is what stops the connection being
-// served, and every signature is gated by the shared raft-backed reserve/commit path regardless of
-// how many endpoints are connected — a torn-down endpoint that lingers a moment cannot sign
-// anything a live one could not.
+// Deleting the map entry is NOT what stops the connection serving: SignerServer's service loop
+// never consults the map, so until Stop() lands the endpoint would still answer signing requests.
+// The retired flag closes that gap synchronously — the request handler refuses every request once
+// it is set, so a removed node cannot race its replacement to reserve a height/round/step while the
+// asynchronous Stop() is still in flight.
 func (l *Lifecycle) retire(addr string, ns *nodeServer) {
+	// Synchronous: disables signing on this connection before the caller releases l.mu.
+	ns.retired.Store(true)
 	delete(l.servers, addr)
 	l.stopping.Add(1)
 	go func() {
@@ -328,12 +362,7 @@ func (l *Lifecycle) startOne(addr string) (*nodeServer, error) {
 	srv := privval.NewSignerServer(ep, l.cfg.ChainID, l.pv)
 	ns := &nodeServer{srv: srv, ep: ep, createdAt: time.Now()}
 	ns.touch()
-	// Wrap the default handler to record inbound activity (pings included) for
-	// dead-socket detection.
-	srv.SetRequestHandler(func(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
-		ns.touch()
-		return privval.DefaultValidationRequestHandler(pv, req, chainID)
-	})
+	srv.SetRequestHandler(ns.handleRequest)
 	if err := srv.Start(); err != nil {
 		return nil, err
 	}
