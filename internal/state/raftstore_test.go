@@ -31,6 +31,33 @@ func TestResolveAdvertiseReturnsAdvertisableTCPAddr(t *testing.T) {
 	require.Equal(t, 7070, addr.Port)
 }
 
+// TestResolveAdvertiseAcceptsIPLiterals verifies IP literals resolve without any DNS lookup, and
+// that an IPv6 zone survives. net.ParseIP rejects a zoned literal like "fe80::1%eth0", so a naive
+// literal check sends link-local addresses to DNS, where they never resolve.
+func TestResolveAdvertiseAcceptsIPLiterals(t *testing.T) {
+	// A budget so short that any DNS fallback would fail the assertions below.
+	restoreBudget(t, 50*time.Millisecond, 10*time.Millisecond)
+
+	for _, tc := range []struct {
+		name      string
+		advertise string
+		wantIP    string
+		wantZone  string
+	}{
+		{"ipv4", "10.0.0.5:7070", "10.0.0.5", ""},
+		{"ipv6", "[fd00::1]:7070", "fd00::1", ""},
+		{"ipv6 link-local with zone", "[fe80::1%eth0]:7070", "fe80::1", "eth0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, err := resolveAdvertise(context.Background(), tc.advertise, hclog.NewNullLogger())
+			require.NoError(t, err)
+			require.Equal(t, tc.wantIP, addr.IP.String())
+			require.Equal(t, tc.wantZone, addr.Zone)
+			require.Equal(t, 7070, addr.Port)
+		})
+	}
+}
+
 // TestResolveAdvertiseRejectsMalformedImmediately verifies a permanent syntax error is not retried.
 // Retrying one would turn an operator typo into a full-budget hang instead of an immediate failure.
 func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {

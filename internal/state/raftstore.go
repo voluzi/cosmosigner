@@ -90,19 +90,18 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 	if host == "" {
 		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return &net.TCPAddr{IP: ip, Port: port}, nil
-	}
-
-	// A hostname: this is the part that legitimately needs waiting on.
+	// LookupIPAddr resolves an IP literal (including a zoned one like "fe80::1%eth0") locally and
+	// instantly, so literals fall out of the loop below on the first pass without touching DNS. It
+	// is used rather than LookupIP because only the *IPAddr* form carries the IPv6 zone, which a
+	// link-local advertise address needs to stay routable.
 	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
 	defer cancel()
 
 	for attempt := 1; ; attempt++ {
 		// Bound each lookup by the remaining budget so a stalled resolver cannot hang past it.
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err == nil && len(ips) > 0 {
-			addr := &net.TCPAddr{IP: ips[0], Port: port}
+			addr := &net.TCPAddr{IP: ips[0].IP, Port: port, Zone: ips[0].Zone}
 			if attempt > 1 {
 				logger.Info("resolved advertise address", "advertise", advertise, "addr", addr.String(), "attempts", attempt)
 			}
