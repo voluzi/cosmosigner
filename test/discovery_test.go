@@ -278,3 +278,73 @@ func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
 	}, 15*time.Second, 200*time.Millisecond,
 		"discovery must keep re-resolving until the replacement address is served")
 }
+
+// TestDiscovery_ReplacementOfOneNodeInMultiNodeSet covers the multi-node shape: a headless service
+// briefly resolves to only the SURVIVING pods while one is replaced. Reconcile drops the dead
+// address entirely, so no connector is left unconnected — every remaining one is healthy — and the
+// replacement IP is published only afterwards.
+//
+// ReconcileInterval is 30s, far beyond the assertion window, so this passes only if discovery stays
+// fast for a bounded window after a retirement rather than keying solely on live connector state.
+func TestDiscovery_ReplacementOfOneNodeInMultiNodeSet(t *testing.T) {
+	dir := t.TempDir()
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	store, err := state.NewRaftStore(state.RaftConfig{
+		NodeID:    "n1",
+		BindAddr:  freeAddr(t),
+		DataDir:   filepath.Join(dir, "raft"),
+		Bootstrap: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	defer store.Close()
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	pv, err := signer.New(be, store)
+	require.NoError(t, err)
+
+	slKeep, addrKeep := startNodeListener(t)
+	defer func() { _ = slKeep.Stop() }()
+	slDying, addrDying := startNodeListener(t)
+
+	src := &mutableNodes{}
+	src.set(addrKeep, addrDying)
+
+	lc := server.New(server.Config{
+		ChainID:           itestChain,
+		ReconcileInterval: 30 * time.Second, // must not be what rescues this
+		// Long enough that the healthy survivor (pinged ~every 3s) is never recycled, so it cannot
+		// keep fast discovery alive on its own and mask the gap under test.
+		StaleConnTimeout: 5 * time.Second,
+	}, src, pv, ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lc.Run(ctx) }()
+
+	clientKeep, err := privval.NewSignerClient(slKeep, itestChain)
+	require.NoError(t, err)
+	clientDying, err := privval.NewSignerClient(slDying, itestChain)
+	require.NoError(t, err)
+	require.NoError(t, clientKeep.SignVote(itestChain, makeVote(10, 0, time.Now().UTC(), "K")))
+	require.NoError(t, clientDying.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "D")))
+
+	// One pod dies and DNS drops it, leaving only the healthy survivor. Once the dead connection is
+	// noticed and retired, nothing in the serving set looks unhealthy any more.
+	_ = slDying.Stop()
+	src.set(addrKeep)
+	time.Sleep(9 * time.Second)
+
+	// Only now is the replacement published — after the retirement, so liveness state alone no
+	// longer points at anything pending.
+	slNew, addrNew := startNodeListener(t)
+	defer func() { _ = slNew.Stop() }()
+	src.set(addrKeep, addrNew)
+
+	clientNew, err := privval.NewSignerClient(slNew, itestChain)
+	require.NoError(t, err)
+	swapAt := time.Now()
+	require.Eventually(t, func() bool {
+		return clientNew.SignVote(itestChain, makeVote(12, 0, time.Now().UTC(), "N")) == nil
+	}, 15*time.Second, 200*time.Millisecond,
+		"replacement must be served without waiting out the reconcile tick")
+	t.Logf("TIME-TO-SERVE: %v", time.Since(swapAt))
+}
