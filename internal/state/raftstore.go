@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -70,6 +71,14 @@ const boltOpenTimeout = 30 * time.Second
 // same "no such host" — so a persistent failure is surfaced rather than pre-rejected.
 const advertiseTypoHint = 10 * time.Second
 
+// zoneSuffix returns the IPv6 zone suffix of a host ("eth0" for "fe80::1%eth0"), or "" if absent.
+func zoneSuffix(host string) string {
+	if i := strings.LastIndex(host, "%"); i >= 0 {
+		return host[i+1:]
+	}
+	return ""
+}
+
 // resolveAdvertise resolves the address peers use to reach this node, retrying until
 // advertiseResolveTimeout.
 //
@@ -103,6 +112,15 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 	}
 	if host == "" {
 		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
+	}
+	// A zone suffix is only meaningful on an IPv6 literal. On an IPv4 literal ("127.0.0.1%eth0") it
+	// can never resolve, and the resolver reports it as an ordinary "no such host" — so without this
+	// it would be retried for the whole budget. Hostname spelling is deliberately NOT checked here
+	// (see above); this rejects only a combination that is impossible by construction.
+	if zone := zoneSuffix(host); zone != "" {
+		if ip := net.ParseIP(strings.TrimSuffix(host, "%"+zone)); ip != nil && ip.To4() != nil {
+			return nil, fmt.Errorf("advertise address %q has a zone on an IPv4 literal; zones apply to IPv6 only", advertise)
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
 	defer cancel()
