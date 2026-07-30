@@ -67,6 +67,17 @@ func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
 // retirement take effect immediately. Without it, a node removed from the target set could keep
 // signing until Stop() completed — long enough to race its replacement for a height/round/step
 // reservation.
+//
+// The check is not a drain: a request that has already passed it runs to completion (bounded by the
+// backend signing call) even as the replacement connection starts, because SignerServer.Stop() does
+// not wait for in-flight handlers. That residual overlap is safe rather than merely unlikely — both
+// connections share one GatedPrivValidator, so both reserve through raft, and fsm.applyReserve is
+// total over the H/R/S comparison: identical signBytes reuse the cached signature (or re-sign
+// deterministically), a timestamp-only difference signs the *reserved* bytes, and anything else at
+// the same H/R/S is refused with ErrConflict. Ordering is decided by the raft log, not by goroutine
+// scheduling. So the overlap can cost one refused-and-retried request, never a second distinct
+// signature at one H/R/S. Draining would mean blocking replacement creation on an in-flight count —
+// new synchronization on the signing path in exchange for a liveness blip that already fails closed.
 func (ns *nodeServer) handleRequest(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
 	if ns.retired.Load() {
 		return privval.DefaultValidationRequestHandler(pv, req, retiredChainID)
