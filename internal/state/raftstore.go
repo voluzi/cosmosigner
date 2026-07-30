@@ -124,8 +124,17 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 	}
 }
 
-// NewRaftStore creates an embedded-raft StateStore.
+// NewRaftStore creates an embedded-raft StateStore. Startup waits are bounded by their own budgets
+// but are not externally cancellable; prefer NewRaftStoreContext from a signal-aware caller.
 func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
+	return NewRaftStoreContext(context.Background(), cfg, logger)
+}
+
+// NewRaftStoreContext creates an embedded-raft StateStore, using ctx for the startup waits that can
+// block — currently advertise-address resolution, which retries while the per-pod DNS record is
+// published. A terminating pod must exit on SIGTERM during that window rather than sit until its
+// grace period expires.
+func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 	if cfg.ApplyTimeout <= 0 {
 		cfg.ApplyTimeout = 10 * time.Second
 	}
@@ -152,7 +161,7 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 		return nil, fmt.Errorf("snapshot store: %w", err)
 	}
 
-	advertiseAddr, err := resolveAdvertise(context.Background(), cfg.Advertise, logger)
+	advertiseAddr, err := resolveAdvertise(ctx, cfg.Advertise, logger)
 	if err != nil {
 		return nil, err
 	}

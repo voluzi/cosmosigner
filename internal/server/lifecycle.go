@@ -223,23 +223,29 @@ func (l *Lifecycle) watchInterval() time.Duration {
 	return d
 }
 
-// hasDeadConnection reports whether any served connection is eligible for retirement, using the
-// same classifier as the reconcile pass so the two cannot disagree.
+// needsFastDiscovery reports whether discovery should keep running at the watch cadence instead of
+// falling back to ReconcileInterval. True when any connection is eligible for retirement, and also
+// while any connector is merely unconnected.
 //
-// This exists because a node pod that dies is usually replaced at a NEW address, so the resolved
-// target set is stale from the moment the pod dies. Waiting a full ReconcileInterval to notice
-// couples rendezvous latency to a tick that has no relationship to how fast pods churn — which is
-// what makes a healthy restart look like a multi-minute outage.
+// The unconnected case matters because DNS lags pod churn: when a node is replaced, the first wake
+// after teardown often still resolves the dead address, so reconcile recreates a connector for it.
+// That connector is not "exhausted" for MaxRetries×RetryWait (~10min by default), so keying re-
+// resolution on retirement alone would go quiet exactly when the replacement record is about to
+// appear — leaving the tick to find it, which is the delay this is meant to remove. Staying fast
+// while anything is unconnected keeps re-resolving until the replacement is actually being served.
 //
 // observe() latches connection state, so this is not read-only; reconcile remains the only mutator
 // of the servers map itself.
-func (l *Lifecycle) hasDeadConnection() bool {
+func (l *Lifecycle) needsFastDiscovery() bool {
 	dialBudget := l.dialBudget()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, ns := range l.servers {
 		if ns.observe(l.cfg.StaleConnTimeout, dialBudget) != retireNone {
+			return true
+		}
+		if !ns.connected {
 			return true
 		}
 	}
@@ -297,9 +303,10 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		case <-l.wake:
 			l.reconcile()
 		case <-watch.C:
-			// Cheap health scan between ticks: a dead connection means the node is likely being
-			// replaced at a new address, so reconcile now instead of waiting out the interval.
-			if l.hasDeadConnection() {
+			// Cheap health scan between ticks: a dead or still-unconnected connection means a node is
+			// likely being replaced at a new address, so keep re-resolving at this cadence until the
+			// replacement is actually served instead of waiting out the interval.
+			if l.needsFastDiscovery() {
 				l.reconcile()
 			}
 		case <-ticker.C:
