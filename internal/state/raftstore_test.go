@@ -47,7 +47,6 @@ func TestResolveAdvertiseAcceptsIPLiterals(t *testing.T) {
 		{"ipv4", "10.0.0.5:7070", "10.0.0.5", ""},
 		{"ipv6", "[fd00::1]:7070", "fd00::1", ""},
 		{"ipv6 link-local with zone", "[fe80::1%eth0]:7070", "fe80::1", "eth0"},
-		{"ipv6 with empty zone", "[fe80::1%]:7070", "fe80::1", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			addr, err := resolveAdvertise(context.Background(), tc.advertise, hclog.NewNullLogger())
@@ -75,6 +74,7 @@ func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {
 		{"non-numeric port", "signer-0.signer.ns.svc:http-alt-typo", "parse advertise port"},
 		{"empty host", ":7070", "has no host"},
 		{"zone on IPv4 literal", "127.0.0.1%eth0:7070", "zones apply to IPv6 only"},
+		{"empty IPv6 zone", "[fe80::1%]:7070", "empty IPv6 zone"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			start := time.Now()
