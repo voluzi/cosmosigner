@@ -98,10 +98,15 @@ func TestDiscovery_DynamicNodeSet(t *testing.T) {
 	require.NoError(t, clientB.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "B")))
 
 	// Drop node A → its connection should be torn down; B keeps working.
+	//
+	// The budget is generous on purpose: a dropped node stops being served only once cometbft's
+	// endpoint notices the closed socket, which is EOF-driven and takes ~1.3s locally (unchanged by
+	// the reconcile interval). A loaded CI runner is slower still, so a tight bound here fails for
+	// timing rather than for behaviour.
 	src.set(addrB)
 	require.Eventually(t, func() bool {
 		return clientA.SignVote(itestChain, makeVote(12, 0, time.Now().UTC(), "A")) != nil
-	}, 6*time.Second, 200*time.Millisecond, "removed node should lose its signer connection")
+	}, 20*time.Second, 200*time.Millisecond, "removed node should lose its signer connection")
 	require.NoError(t, clientB.SignVote(itestChain, makeVote(13, 0, time.Now().UTC(), "B")))
 
 	_ = slA.Stop()
@@ -161,4 +166,120 @@ func TestDiscovery_NodeAppearsAfterDialTimeout(t *testing.T) {
 	// And keep serving a moment later (proves it wasn't recycled right after).
 	time.Sleep(1 * time.Second)
 	require.NoError(t, client.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "A")))
+}
+
+// TestDiscovery_NodeReplacedAtNewAddress reproduces the rendezvous loop from cosmopilot#66: a node
+// pod dies and is recreated at a NEW address, so the signer's resolved target is stale the moment
+// it is resolved. Retiring the dead connection must not block the reconcile behind a multi-second
+// srv.Stop(), and must wake discovery instead of waiting out the tick.
+//
+// The reconcile interval is deliberately long here: if rendezvous only happened on the tick, this
+// test would time out. Passing it proves the retire path drives the recovery.
+func TestDiscovery_NodeReplacedAtNewAddress(t *testing.T) {
+	dir := t.TempDir()
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	store, err := state.NewRaftStore(state.RaftConfig{
+		NodeID:    "n1",
+		BindAddr:  freeAddr(t),
+		DataDir:   filepath.Join(dir, "raft"),
+		Bootstrap: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	defer store.Close()
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	pv, err := signer.New(be, store)
+	require.NoError(t, err)
+
+	slOld, addrOld := startNodeListener(t)
+	src := &mutableNodes{}
+	src.set(addrOld)
+
+	lc := server.New(server.Config{
+		ChainID: itestChain,
+		// Far longer than the assertions below: recovery must not depend on it.
+		ReconcileInterval: 30 * time.Second,
+		StaleConnTimeout:  500 * time.Millisecond,
+	}, src, pv, ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lc.Run(ctx) }()
+
+	clientOld, err := privval.NewSignerClient(slOld, itestChain)
+	require.NoError(t, err)
+	require.NoError(t, clientOld.SignVote(itestChain, makeVote(10, 0, time.Now().UTC(), "A")))
+
+	// The node dies and comes back at a different address, exactly as a recreated pod does.
+	_ = slOld.Stop()
+	slNew, addrNew := startNodeListener(t)
+	defer func() { _ = slNew.Stop() }()
+	require.NotEqual(t, addrOld, addrNew)
+	src.set(addrNew)
+
+	clientNew, err := privval.NewSignerClient(slNew, itestChain)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return clientNew.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "A")) == nil
+	}, 20*time.Second, 200*time.Millisecond,
+		"replaced node must be served well before the reconcile tick")
+}
+
+// TestDiscovery_ReplacementAddressAppearsAfterWake covers the DNS-lag case: the node is replaced,
+// but the resolved set still returns only the DEAD address at the moment of the teardown wake. The
+// replacement record shows up shortly after.
+//
+// A one-shot wake is not enough here — reconcile recreates a connector for the stale address, which
+// is not "exhausted" for MaxRetries×RetryWait (~10min), so discovery would go quiet and leave the
+// periodic tick to find the replacement. ReconcileInterval is set to 30s, far beyond the assertion
+// window, so this passes only if discovery keeps re-resolving while a connector is unconnected.
+func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
+	dir := t.TempDir()
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	store, err := state.NewRaftStore(state.RaftConfig{
+		NodeID:    "n1",
+		BindAddr:  freeAddr(t),
+		DataDir:   filepath.Join(dir, "raft"),
+		Bootstrap: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	defer store.Close()
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	pv, err := signer.New(be, store)
+	require.NoError(t, err)
+
+	slOld, addrOld := startNodeListener(t)
+	src := &mutableNodes{}
+	src.set(addrOld)
+
+	lc := server.New(server.Config{
+		ChainID:           itestChain,
+		ReconcileInterval: 30 * time.Second, // must not be what rescues this
+		StaleConnTimeout:  500 * time.Millisecond,
+	}, src, pv, ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lc.Run(ctx) }()
+
+	clientOld, err := privval.NewSignerClient(slOld, itestChain)
+	require.NoError(t, err)
+	require.NoError(t, clientOld.SignVote(itestChain, makeVote(10, 0, time.Now().UTC(), "A")))
+
+	// Node dies. DNS still advertises only the dead address, so the wake after teardown re-resolves
+	// to a stale target and builds a connector that will never connect.
+	_ = slOld.Stop()
+	time.Sleep(2 * time.Second)
+
+	// Only now does the replacement record appear.
+	slNew, addrNew := startNodeListener(t)
+	defer func() { _ = slNew.Stop() }()
+	require.NotEqual(t, addrOld, addrNew)
+	src.set(addrNew)
+
+	clientNew, err := privval.NewSignerClient(slNew, itestChain)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return clientNew.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "A")) == nil
+	}, 15*time.Second, 200*time.Millisecond,
+		"discovery must keep re-resolving until the replacement address is served")
 }

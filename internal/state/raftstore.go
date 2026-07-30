@@ -1,16 +1,19 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"go.etcd.io/bbolt"
 )
 
 // Member is a raft cluster member (id + advertise address) used to seed the
@@ -48,8 +51,127 @@ type raftStore struct {
 	applyTimeout time.Duration
 }
 
-// NewRaftStore creates an embedded-raft StateStore.
+var (
+	// advertiseResolveTimeout bounds how long startup waits for the advertise address to become
+	// resolvable. It stays well inside a typical Kubernetes startup probe budget, so a genuinely
+	// wrong address still fails the pod rather than hanging invisibly. Variables, not constants,
+	// so tests can shrink the budget.
+	advertiseResolveTimeout = 90 * time.Second
+	// advertiseResolveInterval is how often resolution is retried within that budget.
+	advertiseResolveInterval = time.Second
+)
+
+// boltOpenTimeout bounds the raft.db file-lock wait, so a database still held by a previous pod
+// fails startup rather than blocking it indefinitely in a call that cannot observe cancellation.
+const boltOpenTimeout = 30 * time.Second
+
+// advertiseTypoHint is logged once a hostname has failed to resolve for this long, to name the
+// likely cause. Hostname syntax is not a usable resolvability test — DNS labels may contain bytes
+// that RFC 1123 forbids, and the resolver reports a typo and a not-yet-published record with the
+// same "no such host" — so a persistent failure is surfaced rather than pre-rejected.
+const advertiseTypoHint = 10 * time.Second
+
+// resolveAdvertise resolves the address peers use to reach this node, retrying until
+// advertiseResolveTimeout.
+//
+// Raft needs a concrete, advertisable *net.TCPAddr before the transport is built: the plain-TCP
+// transport rejects a non-TCP or unspecified address, and NewRaft captures the local address once.
+// So resolution cannot be deferred. But under a StatefulSet the per-pod headless DNS record is
+// published moments after the pod starts, so a signer that resolves once and exits turns an
+// ordinary startup race into a crashloop — one that resolves itself only via CrashLoopBackOff,
+// after backoff has grown well past the DNS delay it was waiting on.
+//
+// Retrying here is safe: the resolved value only becomes visible to raft through the transport and
+// BootstrapCluster, both strictly later, so a few seconds of waiting changes no bootstrap or
+// membership assumption. Peer addresses are not resolved here at all — raft dials those lazily and
+// retries on its own — so this waits on this node's own record only.
+//
+// Only the DNS lookup is retried. A structurally malformed address (missing or non-numeric port, no
+// host) fails identically on every attempt, so retrying it would turn an operator typo into a
+// 90-second hang instead of the immediate error it used to be. Hostname *spelling* is deliberately
+// not pre-validated: a DNS label may legally contain bytes RFC 1123 forbids, and the resolver
+// reports a typo and a not-yet-published record identically, so a syntax screen would reject names
+// that do resolve. A persistent failure is surfaced with a hint instead. Each lookup is bound to the
+// remaining budget, so a stalled resolver cannot hang past it either.
+func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger) (*net.TCPAddr, error) {
+	host, portStr, err := net.SplitHostPort(advertise)
+	if err != nil {
+		return nil, fmt.Errorf("parse advertise address %q: %w", advertise, err)
+	}
+	port, err := net.DefaultResolver.LookupPort(ctx, "tcp", portStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse advertise port of %q: %w", advertise, err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
+	}
+	// Validate a zone suffix on an IP literal. A zone applies only to IPv6 and must name an interface,
+	// so "127.0.0.1%eth0" and "fe80::1%" can never resolve — yet the resolver reports both as an
+	// ordinary "no such host" (on Linux; macOS accepts the empty zone, so this cannot be left to the
+	// resolver), which is indistinguishable from a slow record and would burn the whole budget.
+	// Hostname spelling is deliberately NOT checked here (see above); this rejects only combinations
+	// that are impossible by construction.
+	if i := strings.LastIndex(host, "%"); i >= 0 {
+		if ip := net.ParseIP(host[:i]); ip != nil {
+			switch {
+			case ip.To4() != nil:
+				return nil, fmt.Errorf("advertise address %q has a zone on an IPv4 literal; zones apply to IPv6 only", advertise)
+			case host[i+1:] == "":
+				return nil, fmt.Errorf("advertise address %q has an empty IPv6 zone; name an interface or omit the %%", advertise)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
+	defer cancel()
+
+	started := time.Now()
+	for attempt := 1; ; attempt++ {
+		// LookupIPAddr resolves an IP literal (zoned ones included) locally and instantly, so literals
+		// return on the first pass without touching DNS. It is used rather than LookupIP because only
+		// the IPAddr form carries the IPv6 zone a link-local advertise address needs to stay routable.
+		// The context bounds each lookup by the remaining budget, so a stalled resolver cannot hang
+		// past it.
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err == nil && len(ips) > 0 {
+			addr := &net.TCPAddr{IP: ips[0].IP, Port: port, Zone: ips[0].Zone}
+			if attempt > 1 {
+				logger.Info("resolved advertise address", "advertise", advertise, "addr", addr.String(), "attempts", attempt)
+			}
+			return addr, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("no addresses for host %q", host)
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
+		}
+		warn := []any{"advertise", advertise, "attempt", attempt, "err", err}
+		if time.Since(started) > advertiseTypoHint {
+			// Past the point where a StatefulSet's own DNS record would normally have appeared, so
+			// the likeliest remaining cause is a wrong address rather than a slow one.
+			warn = append(warn, "hint", "check .raft.advertise for a typo; a per-pod record normally appears within seconds")
+		}
+		logger.Warn("advertise address not resolvable yet, retrying", warn...)
+
+		select {
+		case <-time.After(advertiseResolveInterval):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
+		}
+	}
+}
+
+// NewRaftStore creates an embedded-raft StateStore. Startup waits are bounded by their own budgets
+// but are not externally cancellable; prefer NewRaftStoreContext from a signal-aware caller.
 func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
+	return NewRaftStoreContext(context.Background(), cfg, logger)
+}
+
+// NewRaftStoreContext creates an embedded-raft StateStore, using ctx for the startup waits that can
+// block — currently advertise-address resolution, which retries while the per-pod DNS record is
+// published. A terminating pod must exit on SIGTERM during that window rather than sit until its
+// grace period expires.
+func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 	if cfg.ApplyTimeout <= 0 {
 		cfg.ApplyTimeout = 10 * time.Second
 	}
@@ -66,7 +188,14 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 
 	f := newFSM()
 
-	bolt, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
+	// Bound the file-lock wait. bbolt.Open blocks indefinitely by default when another process still
+	// holds raft.db (an overlapping StatefulSet replacement), and it takes no context — so without a
+	// timeout a SIGTERM during startup could not unblock it. Failing after boltOpenTimeout lets the
+	// pod exit and be retried instead of hanging past its grace period.
+	bolt, err := raftboltdb.New(raftboltdb.Options{
+		Path:        filepath.Join(cfg.DataDir, "raft.db"),
+		BoltOptions: &bbolt.Options{Timeout: boltOpenTimeout},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("bolt store: %w", err)
 	}
@@ -76,9 +205,9 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 		return nil, fmt.Errorf("snapshot store: %w", err)
 	}
 
-	advertiseAddr, err := net.ResolveTCPAddr("tcp", cfg.Advertise)
+	advertiseAddr, err := resolveAdvertise(ctx, cfg.Advertise, logger)
 	if err != nil {
-		return nil, fmt.Errorf("resolve advertise address %q: %w", cfg.Advertise, err)
+		return nil, err
 	}
 	var transport *raft.NetworkTransport
 	if cfg.TLS.Enabled() {

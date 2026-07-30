@@ -151,6 +151,14 @@ func runStart(cfg config.Config) error {
 		logger.Info("backend preflight ok", "backend", cfg.Backend.Type)
 	}
 
+	// Intercept signals only from here on. Backend construction and preflight above take no context
+	// and do their own network I/O, so trapping signals earlier would swallow a SIGTERM that would
+	// otherwise terminate the process immediately — delaying shutdown by a backend request timeout.
+	// From this point every blocking step honours ctx: advertise-address resolution retries for up to
+	// 90s while the per-pod DNS record is published, and the serving loop runs until cancelled.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	raftCfg := state.RaftConfig{
 		NodeID:    cfg.Raft.NodeID,
 		BindAddr:  cfg.Raft.BindAddr,
@@ -166,7 +174,7 @@ func runStart(cfg config.Config) error {
 	for _, m := range cfg.Raft.Members {
 		raftCfg.Members = append(raftCfg.Members, state.Member{ID: m.ID, Address: m.Address})
 	}
-	store, err := state.NewRaftStore(raftCfg, raftLogger)
+	store, err := state.NewRaftStoreContext(ctx, raftCfg, raftLogger)
 	if err != nil {
 		return err
 	}
@@ -195,9 +203,6 @@ func runStart(cfg config.Config) error {
 		ReconcileInterval: cfg.ReconcileInterval,
 		StaleConnTimeout:  cfg.StaleConnTimeout,
 	}, nodes, pv, connKey, store, logger)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	logger.Info("cosmosigner starting",
 		"chain_id", cfg.ChainID, "nodes", nodes.Describe(), "backend", cfg.Backend.Type,
