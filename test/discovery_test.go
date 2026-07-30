@@ -98,10 +98,15 @@ func TestDiscovery_DynamicNodeSet(t *testing.T) {
 	require.NoError(t, clientB.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "B")))
 
 	// Drop node A → its connection should be torn down; B keeps working.
+	//
+	// The budget is generous on purpose: a dropped node stops being served only once cometbft's
+	// endpoint notices the closed socket, which is EOF-driven and takes ~1.3s locally (unchanged by
+	// the reconcile interval). A loaded CI runner is slower still, so a tight bound here fails for
+	// timing rather than for behaviour.
 	src.set(addrB)
 	require.Eventually(t, func() bool {
 		return clientA.SignVote(itestChain, makeVote(12, 0, time.Now().UTC(), "A")) != nil
-	}, 6*time.Second, 200*time.Millisecond, "removed node should lose its signer connection")
+	}, 20*time.Second, 200*time.Millisecond, "removed node should lose its signer connection")
 	require.NoError(t, clientB.SignVote(itestChain, makeVote(13, 0, time.Now().UTC(), "B")))
 
 	_ = slA.Stop()
