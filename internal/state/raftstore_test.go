@@ -73,6 +73,9 @@ func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {
 		{"missing port", "signer-0.signer.ns.svc", "parse advertise address"},
 		{"non-numeric port", "signer-0.signer.ns.svc:http-alt-typo", "parse advertise port"},
 		{"empty host", ":7070", "has no host"},
+		{"space in host", "bad host:7070", "invalid host"},
+		{"empty label", "foo..bar:7070", "invalid host"},
+		{"leading hyphen", "-foo.bar:7070", "invalid host"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			start := time.Now()
@@ -85,6 +88,18 @@ func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {
 				"a permanently malformed address must fail without exhausting the retry budget")
 		})
 	}
+}
+
+// TestResolveAdvertiseAllowsUnderscoreHosts documents a deliberate leniency: underscores are invalid
+// per RFC 1123 but do occur in real deployments and do resolve, so the syntax screen must not reject
+// a startup that works today. It should only reject what can never resolve.
+func TestResolveAdvertiseAllowsUnderscoreHosts(t *testing.T) {
+	restoreBudget(t, 200*time.Millisecond, 50*time.Millisecond)
+
+	_, err := resolveAdvertise(context.Background(), "foo_bar.invalid:7070", hclog.NewNullLogger())
+	require.Error(t, err, "the name still does not resolve")
+	require.NotContains(t, err.Error(), "invalid host",
+		"an underscore host must reach the resolver rather than be rejected as malformed")
 }
 
 // TestResolveAdvertiseFailsAfterBudget verifies the retry stays bounded: an unresolvable hostname

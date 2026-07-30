@@ -7,11 +7,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"go.etcd.io/bbolt"
 )
 
 // Member is a raft cluster member (id + advertise address) used to seed the
@@ -59,6 +62,27 @@ var (
 	advertiseResolveInterval = time.Second
 )
 
+// boltOpenTimeout bounds the raft.db file-lock wait, so a database still held by a previous pod
+// fails startup rather than blocking it indefinitely in a call that cannot observe cancellation.
+const boltOpenTimeout = 30 * time.Second
+
+// validAdvertiseHost matches a hostname that could plausibly resolve: dot-separated non-empty
+// labels, each starting and ending with an alphanumeric. A host that fails this can never resolve,
+// so treating its lookup failure as transient would burn the whole retry budget on a typo.
+//
+// Deliberately permissive about label contents: underscores are invalid per RFC 1123 but do appear
+// in real deployments and do resolve, so rejecting them here would fail a startup that works today.
+// This only screens out what can never resolve — empty labels, spaces, leading/trailing hyphens.
+var validAdvertiseHost = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)*\.?$`)
+
+// isIPLiteral reports whether host is an IP address literal, tolerating an IPv6 zone suffix.
+func isIPLiteral(host string) bool {
+	if i := strings.LastIndex(host, "%"); i >= 0 {
+		host = host[:i]
+	}
+	return net.ParseIP(host) != nil
+}
+
 // resolveAdvertise resolves the address peers use to reach this node, retrying until
 // advertiseResolveTimeout.
 //
@@ -90,15 +114,21 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 	if host == "" {
 		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
 	}
-	// LookupIPAddr resolves an IP literal (including a zoned one like "fe80::1%eth0") locally and
-	// instantly, so literals fall out of the loop below on the first pass without touching DNS. It
-	// is used rather than LookupIP because only the *IPAddr* form carries the IPv6 zone, which a
-	// link-local advertise address needs to stay routable.
+	// An IP literal (including a zoned one like "fe80::1%eth0") is not a hostname, so syntax-check
+	// only the names. A host that matches neither can never resolve, and retrying it would spend the
+	// whole budget on a typo.
+	if !isIPLiteral(host) && !validAdvertiseHost.MatchString(host) {
+		return nil, fmt.Errorf("advertise address %q has an invalid host %q", advertise, host)
+	}
 	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
 	defer cancel()
 
 	for attempt := 1; ; attempt++ {
-		// Bound each lookup by the remaining budget so a stalled resolver cannot hang past it.
+		// LookupIPAddr resolves an IP literal (zoned ones included) locally and instantly, so literals
+		// return on the first pass without touching DNS. It is used rather than LookupIP because only
+		// the IPAddr form carries the IPv6 zone a link-local advertise address needs to stay routable.
+		// The context bounds each lookup by the remaining budget, so a stalled resolver cannot hang
+		// past it.
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err == nil && len(ips) > 0 {
 			addr := &net.TCPAddr{IP: ips[0].IP, Port: port, Zone: ips[0].Zone}
@@ -151,7 +181,14 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 
 	f := newFSM()
 
-	bolt, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
+	// Bound the file-lock wait. bbolt.Open blocks indefinitely by default when another process still
+	// holds raft.db (an overlapping StatefulSet replacement), and it takes no context — so without a
+	// timeout a SIGTERM during startup could not unblock it. Failing after boltOpenTimeout lets the
+	// pod exit and be retried instead of hanging past its grace period.
+	bolt, err := raftboltdb.New(raftboltdb.Options{
+		Path:        filepath.Join(cfg.DataDir, "raft.db"),
+		BoltOptions: &bbolt.Options{Timeout: boltOpenTimeout},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("bolt store: %w", err)
 	}
