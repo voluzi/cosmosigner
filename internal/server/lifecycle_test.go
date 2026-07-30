@@ -6,6 +6,8 @@ import (
 
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
+	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/privval"
 	privvalproto "github.com/cometbft/cometbft/proto/tendermint/privval"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/types"
@@ -122,4 +124,66 @@ func TestNodeServerRetiredDoesNotTouchActivity(t *testing.T) {
 	_, _ = ns.handleRequest(pv, voteRequest(), testChainID)
 	require.Greater(t, ns.silentFor(), 30*time.Minute,
 		"a retired connection's refusals must not register as activity")
+}
+
+// TestNeedsFastDiscoveryAfterRetirement covers the multi-node replacement case: when a node dies and
+// DNS drops it, the dead address is retired out of the serving set entirely, leaving only healthy
+// connections. Liveness alone would then stop driving discovery — so a replacement address published
+// moments later would wait out the full ReconcileInterval.
+//
+// The post-retirement window is what keeps discovery fast across that gap.
+func TestNeedsFastDiscoveryAfterRetirement(t *testing.T) {
+	newLifecycle := func() *Lifecycle {
+		return New(Config{
+			ChainID:           testChainID,
+			ReconcileInterval: 30 * time.Second,
+			StaleConnTimeout:  30 * time.Second,
+		}, StaticNodes{}, newFakePV(), ed25519.GenPrivKey(), nil, cmtlog.NewNopLogger())
+	}
+
+	t.Run("quiet when nothing is pending", func(t *testing.T) {
+		l := newLifecycle()
+		require.False(t, l.needsFastDiscovery(), "an empty serving set needs no fast discovery")
+	})
+
+	t.Run("fast for a bounded window after a retirement", func(t *testing.T) {
+		l := newLifecycle()
+		// A real (never-started) SignerServer: retire() calls Stop() on it, which must not panic.
+		addr := "127.0.0.1:5555"
+		ep := privval.NewSignerDialerEndpoint(cmtlog.NewNopLogger(),
+			privval.DialTCPFn(addr, time.Second, ed25519.GenPrivKey()))
+		ns := &nodeServer{
+			srv:       privval.NewSignerServer(ep, testChainID, newFakePV()),
+			ep:        ep,
+			createdAt: time.Now(),
+		}
+		ns.touch()
+		l.servers[addr] = ns
+
+		l.mu.Lock()
+		l.retire(addr, ns)
+		l.mu.Unlock()
+		l.stopping.Wait()
+
+		// The dead address is gone and nothing unhealthy remains, yet the replacement may still be
+		// unpublished — discovery must stay fast.
+		require.Empty(t, l.servers, "retired address must leave the serving set")
+		require.True(t, l.needsFastDiscovery(), "discovery must stay fast while a replacement may be pending")
+
+		// Bounded: it lapses rather than polling forever.
+		l.mu.Lock()
+		l.discoveryPendingUntil = time.Now().Add(-time.Second)
+		l.mu.Unlock()
+		require.False(t, l.needsFastDiscovery(), "the window must lapse once the replacement window expires")
+	})
+
+	t.Run("window is bounded by the reconcile interval", func(t *testing.T) {
+		l := newLifecycle()
+		require.Equal(t, 30*time.Second, l.discoveryPendingWindow())
+
+		short := New(Config{ChainID: testChainID, ReconcileInterval: 2 * time.Second},
+			StaticNodes{}, newFakePV(), ed25519.GenPrivKey(), nil, cmtlog.NewNopLogger())
+		require.Equal(t, 2*time.Second, short.discoveryPendingWindow(),
+			"a short interval must not be extended by the window")
+	})
 }

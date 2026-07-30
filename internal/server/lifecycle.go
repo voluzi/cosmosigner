@@ -163,6 +163,9 @@ type Lifecycle struct {
 	wake chan struct{}
 	// stopping tracks in-flight asynchronous connection teardowns so shutdown can wait for them.
 	stopping sync.WaitGroup
+	// discoveryPendingUntil keeps discovery on the fast cadence for a bounded window after a
+	// connection is retired, even once nothing in the serving set looks unhealthy. Guarded by mu.
+	discoveryPendingUntil time.Time
 }
 
 // retire stops a node connection and drops it from the serving set.
@@ -183,6 +186,11 @@ func (l *Lifecycle) retire(addr string, ns *nodeServer) {
 	// Synchronous: disables signing on this connection before the caller releases l.mu.
 	ns.retired.Store(true)
 	delete(l.servers, addr)
+	// A retired address usually means a pod is being replaced and the replacement's DNS record is not
+	// published yet. In a multi-node target set the dead address is simply dropped, so once this entry
+	// is gone nothing looks unhealthy and liveness alone would stop driving discovery — leaving the
+	// replacement to the periodic tick. Keep discovery fast for a bounded window instead.
+	l.discoveryPendingUntil = time.Now().Add(l.discoveryPendingWindow())
 	l.stopping.Add(1)
 	go func() {
 		defer l.stopping.Done()
@@ -208,6 +216,16 @@ func (l *Lifecycle) dialBudget() time.Duration {
 	return time.Duration(l.cfg.MaxRetries)*l.cfg.RetryWait + l.cfg.ReconcileInterval
 }
 
+// discoveryPendingWindow is how long discovery stays fast after a retirement, giving a replacement
+// pod's DNS record time to appear. Bounded so a permanently-removed node settles back to the normal
+// interval rather than polling forever.
+func (l *Lifecycle) discoveryPendingWindow() time.Duration {
+	if l.cfg.ReconcileInterval > 30*time.Second {
+		return 30 * time.Second
+	}
+	return l.cfg.ReconcileInterval
+}
+
 // watchInterval is how often connection health is sampled between reconciles. Detecting a dead
 // connection is cheap; acting on it is not, so the scan only ever signals the run loop.
 func (l *Lifecycle) watchInterval() time.Duration {
@@ -224,8 +242,8 @@ func (l *Lifecycle) watchInterval() time.Duration {
 }
 
 // needsFastDiscovery reports whether discovery should keep running at the watch cadence instead of
-// falling back to ReconcileInterval. True when any connection is eligible for retirement, and also
-// while any connector is merely unconnected.
+// falling back to ReconcileInterval. True when any connection is eligible for retirement, while any
+// connector is merely unconnected, and for a bounded window after any retirement.
 //
 // The unconnected case matters because DNS lags pod churn: when a node is replaced, the first wake
 // after teardown often still resolves the dead address, so reconcile recreates a connector for it.
@@ -241,6 +259,9 @@ func (l *Lifecycle) needsFastDiscovery() bool {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if time.Now().Before(l.discoveryPendingUntil) {
+		return true
+	}
 	for _, ns := range l.servers {
 		if ns.observe(l.cfg.StaleConnTimeout, dialBudget) != retireNone {
 			return true
