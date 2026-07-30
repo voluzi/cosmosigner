@@ -7,8 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -66,22 +64,11 @@ var (
 // fails startup rather than blocking it indefinitely in a call that cannot observe cancellation.
 const boltOpenTimeout = 30 * time.Second
 
-// validAdvertiseHost matches a hostname that could plausibly resolve: dot-separated non-empty
-// labels, each starting and ending with an alphanumeric. A host that fails this can never resolve,
-// so treating its lookup failure as transient would burn the whole retry budget on a typo.
-//
-// Deliberately permissive about label contents: underscores are invalid per RFC 1123 but do appear
-// in real deployments and do resolve, so rejecting them here would fail a startup that works today.
-// This only screens out what can never resolve — empty labels, spaces, leading/trailing hyphens.
-var validAdvertiseHost = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)*\.?$`)
-
-// isIPLiteral reports whether host is an IP address literal, tolerating an IPv6 zone suffix.
-func isIPLiteral(host string) bool {
-	if i := strings.LastIndex(host, "%"); i >= 0 {
-		host = host[:i]
-	}
-	return net.ParseIP(host) != nil
-}
+// advertiseTypoHint is logged once a hostname has failed to resolve for this long, to name the
+// likely cause. Hostname syntax is not a usable resolvability test — DNS labels may contain bytes
+// that RFC 1123 forbids, and the resolver reports a typo and a not-yet-published record with the
+// same "no such host" — so a persistent failure is surfaced rather than pre-rejected.
+const advertiseTypoHint = 10 * time.Second
 
 // resolveAdvertise resolves the address peers use to reach this node, retrying until
 // advertiseResolveTimeout.
@@ -98,10 +85,13 @@ func isIPLiteral(host string) bool {
 // membership assumption. Peer addresses are not resolved here at all — raft dials those lazily and
 // retries on its own — so this waits on this node's own record only.
 //
-// Only the DNS lookup is retried. A malformed address (missing or non-numeric port, no host) fails
-// identically on every attempt, so retrying it would turn an operator typo into a 90-second hang
-// instead of the immediate error it used to be. Each lookup is bound to the remaining budget, so a
-// stalled resolver cannot hang past it either.
+// Only the DNS lookup is retried. A structurally malformed address (missing or non-numeric port, no
+// host) fails identically on every attempt, so retrying it would turn an operator typo into a
+// 90-second hang instead of the immediate error it used to be. Hostname *spelling* is deliberately
+// not pre-validated: a DNS label may legally contain bytes RFC 1123 forbids, and the resolver
+// reports a typo and a not-yet-published record identically, so a syntax screen would reject names
+// that do resolve. A persistent failure is surfaced with a hint instead. Each lookup is bound to the
+// remaining budget, so a stalled resolver cannot hang past it either.
 func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger) (*net.TCPAddr, error) {
 	host, portStr, err := net.SplitHostPort(advertise)
 	if err != nil {
@@ -114,15 +104,10 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 	if host == "" {
 		return nil, fmt.Errorf("advertise address %q has no host; peers cannot reach an unspecified address", advertise)
 	}
-	// An IP literal (including a zoned one like "fe80::1%eth0") is not a hostname, so syntax-check
-	// only the names. A host that matches neither can never resolve, and retrying it would spend the
-	// whole budget on a typo.
-	if !isIPLiteral(host) && !validAdvertiseHost.MatchString(host) {
-		return nil, fmt.Errorf("advertise address %q has an invalid host %q", advertise, host)
-	}
 	ctx, cancel := context.WithTimeout(ctx, advertiseResolveTimeout)
 	defer cancel()
 
+	started := time.Now()
 	for attempt := 1; ; attempt++ {
 		// LookupIPAddr resolves an IP literal (zoned ones included) locally and instantly, so literals
 		// return on the first pass without touching DNS. It is used rather than LookupIP because only
@@ -143,8 +128,13 @@ func resolveAdvertise(ctx context.Context, advertise string, logger hclog.Logger
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("resolve advertise address %q after %s: %w", advertise, advertiseResolveTimeout, err)
 		}
-		logger.Warn("advertise address not resolvable yet, retrying",
-			"advertise", advertise, "attempt", attempt, "err", err)
+		warn := []any{"advertise", advertise, "attempt", attempt, "err", err}
+		if time.Since(started) > advertiseTypoHint {
+			// Past the point where a StatefulSet's own DNS record would normally have appeared, so
+			// the likeliest remaining cause is a wrong address rather than a slow one.
+			warn = append(warn, "hint", "check .raft.advertise for a typo; a per-pod record normally appears within seconds")
+		}
+		logger.Warn("advertise address not resolvable yet, retrying", warn...)
 
 		select {
 		case <-time.After(advertiseResolveInterval):

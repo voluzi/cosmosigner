@@ -73,9 +73,6 @@ func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {
 		{"missing port", "signer-0.signer.ns.svc", "parse advertise address"},
 		{"non-numeric port", "signer-0.signer.ns.svc:http-alt-typo", "parse advertise port"},
 		{"empty host", ":7070", "has no host"},
-		{"space in host", "bad host:7070", "invalid host"},
-		{"empty label", "foo..bar:7070", "invalid host"},
-		{"leading hyphen", "-foo.bar:7070", "invalid host"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			start := time.Now()
@@ -90,16 +87,27 @@ func TestResolveAdvertiseRejectsMalformedImmediately(t *testing.T) {
 	}
 }
 
-// TestResolveAdvertiseAllowsUnderscoreHosts documents a deliberate leniency: underscores are invalid
-// per RFC 1123 but do occur in real deployments and do resolve, so the syntax screen must not reject
-// a startup that works today. It should only reject what can never resolve.
-func TestResolveAdvertiseAllowsUnderscoreHosts(t *testing.T) {
+// TestResolveAdvertiseDoesNotPreRejectHostnames documents a deliberate choice: hostname spelling is
+// not used as a resolvability test. A DNS label may legally contain bytes RFC 1123 forbids
+// (underscores appear in real deployments), and the Go resolver returns the same "no such host" for
+// a typo as for a record that has not been published yet. Pre-rejecting on syntax would therefore
+// fail startups that work today, so these names must reach the resolver and fail on the budget.
+func TestResolveAdvertiseDoesNotPreRejectHostnames(t *testing.T) {
 	restoreBudget(t, 200*time.Millisecond, 50*time.Millisecond)
 
-	_, err := resolveAdvertise(context.Background(), "foo_bar.invalid:7070", hclog.NewNullLogger())
-	require.Error(t, err, "the name still does not resolve")
-	require.NotContains(t, err.Error(), "invalid host",
-		"an underscore host must reach the resolver rather than be rejected as malformed")
+	for _, advertise := range []string{
+		"foo_bar.invalid:7070",  // underscore
+		"-foo.invalid:7070",     // leading hyphen
+		"foo-.invalid:7070",     // trailing hyphen
+		"foo..bar.invalid:7070", // empty label
+	} {
+		t.Run(advertise, func(t *testing.T) {
+			_, err := resolveAdvertise(context.Background(), advertise, hclog.NewNullLogger())
+			require.Error(t, err, "the name still does not resolve")
+			require.Contains(t, err.Error(), "resolve advertise address",
+				"must fail as an unresolved lookup, not be pre-rejected as malformed")
+		})
+	}
 }
 
 // TestResolveAdvertiseFailsAfterBudget verifies the retry stays bounded: an unresolvable hostname
