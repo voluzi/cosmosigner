@@ -125,12 +125,6 @@ func parseMembers(raw []string) ([]config.Member, error) {
 }
 
 func runStart(cfg config.Config) error {
-	// Established before any startup step that can wait: resolving the raft advertise address
-	// retries for up to 90s while its DNS record is published, and a pod terminating during that
-	// window must exit on SIGTERM rather than sit until its grace period expires.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	logger := newCmtLogger(cfg.LogLevel)
 	raftLogger := hclog.New(&hclog.LoggerOptions{
 		Name:   "raft",
@@ -156,6 +150,14 @@ func runStart(cfg config.Config) error {
 		}
 		logger.Info("backend preflight ok", "backend", cfg.Backend.Type)
 	}
+
+	// Intercept signals only from here on. Backend construction and preflight above take no context
+	// and do their own network I/O, so trapping signals earlier would swallow a SIGTERM that would
+	// otherwise terminate the process immediately — delaying shutdown by a backend request timeout.
+	// From this point every blocking step honours ctx: advertise-address resolution retries for up to
+	// 90s while the per-pod DNS record is published, and the serving loop runs until cancelled.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	raftCfg := state.RaftConfig{
 		NodeID:    cfg.Raft.NodeID,
