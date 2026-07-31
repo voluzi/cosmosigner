@@ -3,7 +3,7 @@ module github.com/voluzi/cosmosigner
 go 1.25.8
 
 require (
-	cloud.google.com/go/kms v1.32.0
+	cloud.google.com/go/kms v1.33.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cometbft/cometbft v0.37.4
 	github.com/cosmos/gogoproto v1.7.2
@@ -15,6 +15,7 @@ require (
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
+	go.etcd.io/bbolt v1.3.6
 	google.golang.org/api v0.290.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
@@ -74,7 +75,6 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/sasha-s/go-deadlock v0.3.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	go.etcd.io/bbolt v1.3.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.67.0 // indirect
