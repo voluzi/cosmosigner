@@ -17,11 +17,23 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: Set up Go for staticcheck
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: false
+
       - name: staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
           version: "2026.2.1"
           install-go: false
+
+      - name: Restore project Go version
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: test (race + coverage)
         run: make test-cover
