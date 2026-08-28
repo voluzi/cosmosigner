@@ -20,8 +20,8 @@ jobs:
       - name: staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
-          version: "latest"
-          install-go: false
+          version: "2026.1"
+          install-go: true
 
       - name: test (race + coverage)
         run: make test-cover
