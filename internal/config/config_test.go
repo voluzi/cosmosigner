@@ -63,7 +63,7 @@ func TestValidate_RejectsPartialRaftTLS(t *testing.T) {
 	cfg.Raft.TLSCert = "/tls/cert.pem"
 
 	err := cfg.Validate()
-	require.EqualError(t, err, "raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or raft.insecure: true for plain TCP)")
+	require.EqualError(t, err, "raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or remove all three and set raft.insecure: true for plain TCP)")
 }
 
 func TestValidate_RejectsInsecureRaftWithMTLS(t *testing.T) {

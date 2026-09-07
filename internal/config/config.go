@@ -182,7 +182,7 @@ func (c *Config) Validate() error {
 	}
 	switch {
 	case set != 0 && set != 3:
-		return fmt.Errorf("raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or raft.insecure: true for plain TCP)")
+		return fmt.Errorf("raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or remove all three and set raft.insecure: true for plain TCP)")
 	case c.Raft.Insecure && set != 0:
 		return fmt.Errorf("raft transport cannot enable both mTLS and raft.insecure")
 	case set == 0 && !c.Raft.Insecure:
