@@ -197,7 +197,8 @@ cosmosigner start --chain-id my-chain \
   --node-service sentries.my-ns.svc.cluster.local:5555 \
   --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \
   --raft-bootstrap --raft-node-id node-1 --raft-bind 0.0.0.0:7070 \
-  --raft-insecure
+  --raft-tls-cert /tls/raft-cert.pem --raft-tls-key /tls/raft-key.pem \
+  --raft-tls-ca /tls/raft-ca.pem
 ```
 
 > **The headless service MUST set `publishNotReadyAddresses: true`.** A node with

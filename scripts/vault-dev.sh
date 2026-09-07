@@ -107,7 +107,7 @@ Next steps:
   # run the signer
   cosmosigner start --chain-id my-chain --node 127.0.0.1:5555 --backend vault \\
     --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
-    --raft-bootstrap --raft-node-id n0 --raft-bind 127.0.0.1:7070
+    --raft-bootstrap --raft-node-id n0 --raft-bind 127.0.0.1:7070 --raft-insecure
 
 Tear down: scripts/vault-dev.sh down
 EOF

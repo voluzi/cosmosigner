@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -135,6 +136,7 @@ func runStart(cfg config.Config) error {
 		Level:  hclog.LevelFromString(cfg.LogLevel),
 		Output: os.Stderr,
 	})
+	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
@@ -218,6 +220,12 @@ func runStart(cfg config.Config) error {
 	}
 	logger.Info("cosmosigner stopped")
 	return nil
+}
+
+func writeInsecureRaftWarning(w io.Writer, insecure bool) {
+	if insecure {
+		fmt.Fprintln(w, "WARNING: raft transport is insecure; configure mutual TLS for production")
+	}
 }
 
 func verifyExpectedPublicKey(be backend.KeyBackend, expected string) error {

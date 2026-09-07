@@ -188,9 +188,6 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	case tlsFiles == 0 && !cfg.Insecure:
 		return nil, fmt.Errorf("raft transport requires mTLS or explicit insecure opt-out")
 	}
-	if cfg.Insecure {
-		logger.Warn("raft transport is insecure", "action", "configure mutual TLS for production")
-	}
 	if cfg.ApplyTimeout <= 0 {
 		cfg.ApplyTimeout = 10 * time.Second
 	}

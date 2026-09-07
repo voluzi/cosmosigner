@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -22,19 +21,16 @@ func TestNewRaftStoreRequiresTransportSecurity(t *testing.T) {
 	require.ErrorContains(t, err, "raft transport requires mTLS or explicit insecure opt-out")
 }
 
-func TestNewRaftStoreAllowsExplicitInsecureTransportWithWarning(t *testing.T) {
-	var logs bytes.Buffer
-	logger := hclog.New(&hclog.LoggerOptions{Output: &logs})
+func TestNewRaftStoreAllowsExplicitInsecureTransport(t *testing.T) {
 	store, err := NewRaftStore(RaftConfig{
 		NodeID:    "node-1",
 		BindAddr:  "127.0.0.1:0",
 		DataDir:   t.TempDir(),
 		Bootstrap: true,
 		Insecure:  true,
-	}, logger)
+	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.Contains(t, logs.String(), "raft transport is insecure")
 }
 
 func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {

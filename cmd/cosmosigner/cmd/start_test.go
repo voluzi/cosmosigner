@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/base64"
 	"testing"
 
@@ -92,6 +93,16 @@ func TestOverlayStartFlags_ExplicitInsecureRaft(t *testing.T) {
 	cfg := &config.Config{}
 	require.NoError(t, overlayStartFlags(cmd, cfg))
 	require.True(t, cfg.Raft.Insecure)
+}
+
+func TestWriteInsecureRaftWarning(t *testing.T) {
+	var out bytes.Buffer
+	writeInsecureRaftWarning(&out, true)
+	require.Contains(t, out.String(), "WARNING: raft transport is insecure")
+
+	out.Reset()
+	writeInsecureRaftWarning(&out, false)
+	require.Empty(t, out.String())
 }
 
 func TestVerifyExpectedPublicKey(t *testing.T) {
