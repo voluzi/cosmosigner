@@ -55,6 +55,17 @@ func TestValidate_AllowsRaftMTLS(t *testing.T) {
 	require.NoError(t, cfg.Validate())
 }
 
+func TestValidate_RejectsPartialRaftTLS(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+	cfg.Raft.TLSCert = "/tls/cert.pem"
+
+	err := cfg.Validate()
+	require.EqualError(t, err, "raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or raft.insecure: true for plain TCP)")
+}
+
 func TestValidate_RejectsInsecureRaftWithMTLS(t *testing.T) {
 	cfg := Defaults()
 	cfg.ChainID = "chain"

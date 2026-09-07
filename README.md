@@ -269,6 +269,12 @@ Local development can explicitly opt out with `--raft-insecure`, YAML
 `raft.insecure: true`, or `COSMOSIGNER_RAFT_INSECURE=true`. Insecure mode logs a
 warning on every startup and cannot be combined with TLS configuration.
 
+Existing plain-TCP deployments must choose a transport mode before upgrading:
+set the explicit insecure opt-out for isolated development, or distribute the
+certificates and switch every replica to mTLS in a coordinated maintenance
+window. Plain-TCP and mTLS replicas cannot communicate, so expect a leader
+election and a brief fail-closed signing pause during the cutover.
+
 When enabled, every replica must present a certificate signed by the configured
 CA (`RequireAndVerifyClientCert`) and dialers verify the peer's chain, so a node
 without a CA-signed cert cannot join the cluster. Each cert must list the node's
@@ -301,7 +307,9 @@ export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
-export COSMOSIGNER_RAFT_INSECURE=true # local development only
+export COSMOSIGNER_RAFT_TLS_CERT=/tls/raft-cert.pem
+export COSMOSIGNER_RAFT_TLS_KEY=/tls/raft-key.pem
+export COSMOSIGNER_RAFT_TLS_CA=/tls/raft-ca.pem
 cosmosigner start   # fully configured from the environment
 ```
 

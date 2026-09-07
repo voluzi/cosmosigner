@@ -44,5 +44,5 @@ Out of scope:
 
 - Do not use the `software` backend for production validators unless you explicitly accept in-process key custody.
 - Protect the node-to-signer network path with private networking and firewall policy.
-- Use raft mTLS (`raft.tls_cert`, `raft.tls_key`, `raft.tls_ca`) whenever signer replicas communicate over an untrusted network.
+- Keep raft mTLS (`raft.tls_cert`, `raft.tls_key`, `raft.tls_ca`) enabled for signer replicas; use `raft.insecure` only for isolated local development.
 - Keep Vault tokens, KMS credentials, imported key files, and raft data directories out of source control and backups that are not access-controlled.

@@ -58,7 +58,7 @@ func NewStartCmd() *cobra.Command {
 	f.Bool("raft-bootstrap", false, "seed a new raft cluster from --raft-member (set on one node, or all nodes identically)")
 	f.StringArray("raft-member", nil, "raft member as id=address — the full set INCLUDING self, identical on every node (repeatable)")
 	f.Bool("raft-insecure", d.Raft.Insecure, "explicitly allow unauthenticated plain TCP for the raft transport")
-	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); enables mutual TLS on the raft transport when set with --raft-tls-key and --raft-tls-ca")
+	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); required with --raft-tls-key and --raft-tls-ca unless --raft-insecure is set")
 	f.String("raft-tls-key", "", "raft mTLS private key (PEM)")
 	f.String("raft-tls-ca", "", "raft mTLS CA bundle (PEM) used to verify peer certificates")
 	registerBackendFlags(cmd)

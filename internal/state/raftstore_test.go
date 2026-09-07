@@ -35,15 +35,32 @@ func TestNewRaftStoreAllowsExplicitInsecureTransport(t *testing.T) {
 
 func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		tls  TLSConfig
+		name     string
+		insecure bool
+		tls      TLSConfig
+		want     string
 	}{
-		{name: "partial TLS", tls: TLSConfig{CertFile: "/cert.pem"}},
-		{name: "TLS with insecure opt-out", tls: TLSConfig{
-			CertFile: "/cert.pem",
-			KeyFile:  "/key.pem",
-			CAFile:   "/ca.pem",
-		}},
+		{
+			name: "partial TLS",
+			tls:  TLSConfig{CertFile: "/cert.pem"},
+			want: "raft transport configuration requires TLS certificate, key, and CA together",
+		},
+		{
+			name:     "partial TLS with insecure opt-out",
+			insecure: true,
+			tls:      TLSConfig{CertFile: "/cert.pem"},
+			want:     "raft transport configuration requires TLS certificate, key, and CA together",
+		},
+		{
+			name:     "TLS with insecure opt-out",
+			insecure: true,
+			tls: TLSConfig{
+				CertFile: "/cert.pem",
+				KeyFile:  "/key.pem",
+				CAFile:   "/ca.pem",
+			},
+			want: "raft transport configuration cannot enable both mTLS and insecure mode",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewRaftStore(RaftConfig{
@@ -51,10 +68,10 @@ func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {
 				BindAddr:  "127.0.0.1:0",
 				DataDir:   t.TempDir(),
 				Bootstrap: true,
-				Insecure:  true,
+				Insecure:  tc.insecure,
 				TLS:       tc.tls,
 			}, hclog.NewNullLogger())
-			require.ErrorContains(t, err, "raft transport configuration")
+			require.EqualError(t, err, tc.want)
 		})
 	}
 }
