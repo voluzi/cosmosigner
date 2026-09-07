@@ -58,6 +58,7 @@ func newNode(t *testing.T, id, addr, dir string, bootstrap bool, members []Membe
 		Advertise:    addr,
 		DataDir:      dir,
 		Bootstrap:    bootstrap,
+		Insecure:     true,
 		Members:      members,
 		ApplyTimeout: 5 * time.Second,
 	}, hclog.NewNullLogger())

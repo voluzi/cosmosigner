@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -10,6 +11,57 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewRaftStoreRequiresTransportSecurity(t *testing.T) {
+	_, err := NewRaftStore(RaftConfig{
+		NodeID:    "node-1",
+		BindAddr:  "127.0.0.1:0",
+		DataDir:   t.TempDir(),
+		Bootstrap: true,
+	}, hclog.NewNullLogger())
+	require.ErrorContains(t, err, "raft transport requires mTLS or explicit insecure opt-out")
+}
+
+func TestNewRaftStoreAllowsExplicitInsecureTransportWithWarning(t *testing.T) {
+	var logs bytes.Buffer
+	logger := hclog.New(&hclog.LoggerOptions{Output: &logs})
+	store, err := NewRaftStore(RaftConfig{
+		NodeID:    "node-1",
+		BindAddr:  "127.0.0.1:0",
+		DataDir:   t.TempDir(),
+		Bootstrap: true,
+		Insecure:  true,
+	}, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.Contains(t, logs.String(), "raft transport is insecure")
+}
+
+func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tls  TLSConfig
+	}{
+		{name: "partial TLS", tls: TLSConfig{CertFile: "/cert.pem"}},
+		{name: "TLS with insecure opt-out", tls: TLSConfig{
+			CertFile: "/cert.pem",
+			KeyFile:  "/key.pem",
+			CAFile:   "/ca.pem",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewRaftStore(RaftConfig{
+				NodeID:    "node-1",
+				BindAddr:  "127.0.0.1:0",
+				DataDir:   t.TempDir(),
+				Bootstrap: true,
+				Insecure:  true,
+				TLS:       tc.tls,
+			}, hclog.NewNullLogger())
+			require.ErrorContains(t, err, "raft transport configuration")
+		})
+	}
+}
 
 // TestResolveAdvertiseSucceedsImmediately verifies the common path pays no retry delay.
 func TestResolveAdvertiseSucceedsImmediately(t *testing.T) {

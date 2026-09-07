@@ -56,6 +56,7 @@ func NewStartCmd() *cobra.Command {
 	f.String("raft-data-dir", d.Raft.DataDir, "raft data directory")
 	f.Bool("raft-bootstrap", false, "seed a new raft cluster from --raft-member (set on one node, or all nodes identically)")
 	f.StringArray("raft-member", nil, "raft member as id=address — the full set INCLUDING self, identical on every node (repeatable)")
+	f.Bool("raft-insecure", d.Raft.Insecure, "explicitly allow unauthenticated plain TCP for the raft transport")
 	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); enables mutual TLS on the raft transport when set with --raft-tls-key and --raft-tls-ca")
 	f.String("raft-tls-key", "", "raft mTLS private key (PEM)")
 	f.String("raft-tls-ca", "", "raft mTLS CA bundle (PEM) used to verify peer certificates")
@@ -102,6 +103,9 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 			return err
 		}
 		c.Raft.Members = members
+	}
+	if f.Changed("raft-insecure") {
+		c.Raft.Insecure, _ = f.GetBool("raft-insecure")
 	}
 	s("raft-tls-cert", &c.Raft.TLSCert)
 	s("raft-tls-key", &c.Raft.TLSKey)
@@ -165,6 +169,7 @@ func runStart(cfg config.Config) error {
 		Advertise: cfg.Raft.Advertise,
 		DataDir:   cfg.Raft.DataDir,
 		Bootstrap: cfg.Raft.Bootstrap,
+		Insecure:  cfg.Raft.Insecure,
 		TLS: state.TLSConfig{
 			CertFile: cfg.Raft.TLSCert,
 			KeyFile:  cfg.Raft.TLSKey,

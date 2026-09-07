@@ -50,9 +50,10 @@ type RaftConfig struct {
 	DataDir   string   `yaml:"data_dir" env:"COSMOSIGNER_RAFT_DATA_DIR" default:"./data/raft"`
 	Bootstrap bool     `yaml:"bootstrap" env:"COSMOSIGNER_RAFT_BOOTSTRAP"`
 	Members   []Member `yaml:"members"`
-	// Optional mutual TLS for the inter-replica raft transport. All three must
-	// be set together to enable it; empty (the default) means plain TCP, which
-	// is only safe on a trusted/isolated network.
+	// Insecure explicitly permits unauthenticated plain TCP for local development.
+	Insecure bool `yaml:"insecure" env:"COSMOSIGNER_RAFT_INSECURE"`
+	// Mutual TLS for the inter-replica raft transport. All three files must be
+	// set together unless Insecure is explicitly enabled.
 	TLSCert string `yaml:"tls_cert" env:"COSMOSIGNER_RAFT_TLS_CERT"`
 	TLSKey  string `yaml:"tls_key" env:"COSMOSIGNER_RAFT_TLS_KEY"`
 	TLSCA   string `yaml:"tls_ca" env:"COSMOSIGNER_RAFT_TLS_CA"`
@@ -173,16 +174,19 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("raft.node_id %q is not in raft.members", c.Raft.NodeID)
 		}
 	}
-	// Raft mTLS is all-or-nothing: a partial config (e.g. cert without CA) is a
-	// mistake that would otherwise silently fall back to plain TCP.
 	set := 0
 	for _, f := range []string{c.Raft.TLSCert, c.Raft.TLSKey, c.Raft.TLSCA} {
 		if f != "" {
 			set++
 		}
 	}
-	if set != 0 && set != 3 {
+	switch {
+	case set != 0 && set != 3:
 		return fmt.Errorf("raft TLS requires raft.tls_cert, raft.tls_key and raft.tls_ca together (or none)")
+	case c.Raft.Insecure && set != 0:
+		return fmt.Errorf("raft transport cannot enable both mTLS and raft.insecure")
+	case set == 0 && !c.Raft.Insecure:
+		return fmt.Errorf("raft transport requires mTLS or explicit insecure opt-out")
 	}
 	return nil
 }

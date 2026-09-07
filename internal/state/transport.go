@@ -12,8 +12,8 @@ import (
 )
 
 // TLSConfig configures mutual TLS for the inter-replica raft transport. All
-// three files must be set to enable it; otherwise the transport is plain TCP
-// (only safe on a trusted/isolated network).
+// three files must be set to enable it. Plain TCP requires an explicit
+// RaftConfig.Insecure opt-out.
 type TLSConfig struct {
 	CertFile string
 	KeyFile  string

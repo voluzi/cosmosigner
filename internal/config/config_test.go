@@ -20,12 +20,59 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, "transit", d.Backend.Vault.Mount)
 	require.Equal(t, "node-1", d.Raft.NodeID)
 	require.Equal(t, "127.0.0.1:7070", d.Raft.BindAddr)
+	require.False(t, d.Raft.Insecure)
+}
+
+func TestValidate_RequiresRaftTransportSecurity(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+
+	err := cfg.Validate()
+	require.ErrorContains(t, err, "raft transport requires mTLS or explicit insecure opt-out")
+}
+
+func TestValidate_AllowsExplicitInsecureRaft(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+	cfg.Raft.Insecure = true
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestValidate_AllowsRaftMTLS(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+	cfg.Raft.TLSCert = "/tls/cert.pem"
+	cfg.Raft.TLSKey = "/tls/key.pem"
+	cfg.Raft.TLSCA = "/tls/ca.pem"
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestValidate_RejectsInsecureRaftWithMTLS(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+	cfg.Raft.Insecure = true
+	cfg.Raft.TLSCert = "/tls/cert.pem"
+	cfg.Raft.TLSKey = "/tls/key.pem"
+	cfg.Raft.TLSCA = "/tls/ca.pem"
+
+	err := cfg.Validate()
+	require.ErrorContains(t, err, "cannot enable both mTLS and raft.insecure")
 }
 
 func TestLoad_EnvOverridesFile(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "c.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(
-		"chain_id: from-file\nnodes:\n  - 1.2.3.4:5555\nbackend:\n  key_file: /key.json\n"), 0o600))
+		"chain_id: from-file\nnodes:\n  - 1.2.3.4:5555\nbackend:\n  key_file: /key.json\nraft:\n  insecure: true\n"), 0o600))
 
 	t.Setenv("COSMOSIGNER_CHAIN_ID", "from-env")
 	cfg, err := Load(file, nil)
@@ -41,6 +88,7 @@ func TestLoad_FlagOverlayWins(t *testing.T) {
 		c.ChainID = "from-flag"
 		c.NodeAddrs = []string{"x:1"}
 		c.Backend.SoftwareKeyFile = "/k"
+		c.Raft.Insecure = true
 		return nil
 	})
 	require.NoError(t, err)
@@ -55,6 +103,7 @@ func TestLoad_EnvBackendAndSlices(t *testing.T) {
 	t.Setenv("COSMOSIGNER_VAULT_KEY_VERSION", "7")
 	t.Setenv("COSMOSIGNER_VAULT_TOKEN_FILE", "/t")
 	t.Setenv("COSMOSIGNER_EXPECTED_PUBLIC_KEY", "cHVia2V5")
+	t.Setenv("COSMOSIGNER_RAFT_INSECURE", "true")
 	cfg, err := Load("", nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"a:5555", "b:5555"}, cfg.NodeAddrs)
@@ -62,12 +111,13 @@ func TestLoad_EnvBackendAndSlices(t *testing.T) {
 	require.Equal(t, "val", cfg.Backend.Vault.KeyName)
 	require.Equal(t, 7, cfg.Backend.Vault.KeyVersion)
 	require.Equal(t, "cHVia2V5", cfg.ExpectedPublicKey)
+	require.True(t, cfg.Raft.Insecure)
 }
 
 func TestLoad_VaultKeyVersionFromYAML(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "c.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(
-		"chain_id: c\nnodes: [a:5555]\nexpected_public_key: cHVia2V5\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_version: 4\n"), 0o600))
+		"chain_id: c\nnodes: [a:5555]\nexpected_public_key: cHVia2V5\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_version: 4\nraft:\n  insecure: true\n"), 0o600))
 
 	cfg, err := Load(file, nil)
 	require.NoError(t, err)

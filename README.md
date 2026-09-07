@@ -90,7 +90,8 @@ make build
   --node 127.0.0.1:5555 \
   --backend software \
   --key-file ./data/priv_validator_key.json \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070
+  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure
 ```
 
 ## Vault backend
@@ -117,7 +118,8 @@ make build
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
   --vault-key my-validator --vault-key-version 1 \
   --expected-public-key '<base64 pubkey from cosmosigner pubkey>' \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070
+  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure
 ```
 
 Vault import is retry-safe: if the selected key version already contains the same public key,
@@ -167,7 +169,8 @@ version that is not `ENABLED` — fails fast at boot instead of at the first vot
   --chain-id my-chain --node 127.0.0.1:5555 \
   --backend gcpkms \
   --gcp-key-version projects/.../cryptoKeyVersions/1 \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070
+  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure
 ```
 
 End-to-end sign+verify test against a real key (no node needed):
@@ -193,7 +196,8 @@ seconds — pods that appear get a signer, pods that vanish are dropped:
 cosmosigner start --chain-id my-chain \
   --node-service sentries.my-ns.svc.cluster.local:5555 \
   --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 0.0.0.0:7070
+  --raft-bootstrap --raft-node-id node-1 --raft-bind 0.0.0.0:7070 \
+  --raft-insecure
 ```
 
 > **The headless service MUST set `publishNotReadyAddresses: true`.** A node with
@@ -233,6 +237,8 @@ which catches the usual split-brain misconfiguration.)
 ```sh
 # node 0 (the one bootstrapper)
 cosmosigner start ... --raft-node-id n0 --raft-bind 0.0.0.0:7070 --raft-bootstrap \
+  --raft-tls-cert /tls/raft-cert.pem --raft-tls-key /tls/raft-key.pem \
+  --raft-tls-ca /tls/raft-ca.pem \
   --raft-member n0=cs-0.cs.ns.svc:7070 \
   --raft-member n1=cs-1.cs.ns.svc:7070 \
   --raft-member n2=cs-2.cs.ns.svc:7070
@@ -240,8 +246,8 @@ cosmosigner start ... --raft-node-id n0 --raft-bind 0.0.0.0:7070 --raft-bootstra
 ```
 
 In a StatefulSet this is one templated arg set plus a per-ordinal
-`COSMOSIGNER_RAFT_BOOTSTRAP=true` on pod 0 only. A single-node signer just uses
-`--raft-bootstrap` with no `--raft-member`.
+`COSMOSIGNER_RAFT_BOOTSTRAP=true` on pod 0 only. A single-node development
+signer uses `--raft-bootstrap --raft-insecure` with no `--raft-member`.
 
 Because raft is **CP**, a node in a minority partition cannot commit the
 high-water-mark and therefore cannot sign — it fails closed (downtime) rather
@@ -250,15 +256,17 @@ the new leader already holds the replicated high-water-mark, so no height can be
 re-signed. (All of this — formation, replication, failover — is covered by
 `internal/state/cluster_test.go`.)
 
-### Securing the raft transport (optional mTLS)
+### Securing the raft transport
 
-By default the inter-replica raft transport is **plain TCP** — fine when the
-replicas talk over a trusted/isolated network (e.g. a pod network with policies).
-To authenticate and encrypt the replica-to-replica link, point all three of
+The inter-replica raft transport requires **mutual TLS by default** because it
+protects the integrity of the double-sign gate. Point all three of
 `--raft-tls-cert` / `--raft-tls-key` / `--raft-tls-ca` (env `COSMOSIGNER_RAFT_TLS_CERT`
 / `_KEY` / `_CA`, or YAML `raft.tls_cert` / `tls_key` / `tls_ca`) at a PEM keypair
-and CA bundle. They are **all-or-nothing**: set all three to enable mutual TLS,
-or none to stay on plain TCP (a partial set is rejected at startup).
+and CA bundle. They are **all-or-nothing**; a partial set is rejected at startup.
+
+Local development can explicitly opt out with `--raft-insecure`, YAML
+`raft.insecure: true`, or `COSMOSIGNER_RAFT_INSECURE=true`. Insecure mode logs a
+warning on every startup and cannot be combined with TLS configuration.
 
 When enabled, every replica must present a certificate signed by the configured
 CA (`RequireAndVerifyClientCert`) and dialers verify the peer's chain, so a node
@@ -292,6 +300,7 @@ export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
+export COSMOSIGNER_RAFT_INSECURE=true # local development only
 cosmosigner start   # fully configured from the environment
 ```
 
@@ -324,10 +333,9 @@ raft:
     - { id: node-1, address: 10.0.1.1:7070 }
     - { id: node-2, address: 10.0.1.2:7070 }
     - { id: node-3, address: 10.0.1.3:7070 }
-  # optional mutual TLS on the raft mesh (all three or none)
-  # tls_cert: /tls/raft-cert.pem
-  # tls_key: /tls/raft-key.pem
-  # tls_ca: /tls/raft-ca.pem
+  tls_cert: /tls/raft-cert.pem
+  tls_key: /tls/raft-key.pem
+  tls_ca: /tls/raft-ca.pem
 ```
 
 ## Development
@@ -353,8 +361,8 @@ For production deployments:
 - Prefer a remote custody backend (`vault` or `gcpkms`) over `software`.
 - Use private networking and firewall policy between validators, signers, raft
   peers, Vault, and KMS endpoints.
-- Enable raft mTLS whenever signer replicas communicate over an untrusted
-  network.
+- Keep raft mTLS enabled in production; use `raft.insecure` only for isolated
+  local development.
 - Keep validator key files, Vault tokens, KMS credentials, raft data, and local
   test data out of source control and unaudited backups.
 

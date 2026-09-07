@@ -85,6 +85,15 @@ func TestOverlayStartFlags_ExpectedPublicKey(t *testing.T) {
 	require.Equal(t, 9, cfg.Backend.Vault.KeyVersion)
 }
 
+func TestOverlayStartFlags_ExplicitInsecureRaft(t *testing.T) {
+	cmd := NewStartCmd()
+	require.NoError(t, cmd.Flags().Set("raft-insecure", "true"))
+
+	cfg := &config.Config{}
+	require.NoError(t, overlayStartFlags(cmd, cfg))
+	require.True(t, cfg.Raft.Insecure)
+}
+
 func TestVerifyExpectedPublicKey(t *testing.T) {
 	priv := ed25519.GenPrivKey()
 	be := backend.NewSoftwareFromPriv(priv)

@@ -30,6 +30,8 @@ type RaftConfig struct {
 	Advertise string // address peers use to reach this node; defaults to BindAddr
 	DataDir   string
 	Bootstrap bool
+	// Insecure permits unauthenticated plain TCP instead of mutual TLS.
+	Insecure bool
 	// Members is the full initial member set INCLUDING this node, identical on
 	// every node. Empty means a single-node cluster of just this node. Only the
 	// nodes that have Bootstrap set seed the configuration; for a fresh cluster,
@@ -37,8 +39,8 @@ type RaftConfig struct {
 	// nodes with this identical Members list.
 	Members      []Member
 	ApplyTimeout time.Duration
-	// TLS, when fully set, secures the inter-replica transport with mutual TLS.
-	// Empty (the default) means plain TCP — only safe on a trusted network.
+	// TLS secures the inter-replica transport with mutual TLS. Without it,
+	// Insecure must explicitly permit unauthenticated plain TCP.
 	TLS TLSConfig
 }
 
@@ -172,6 +174,23 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 // published. A terminating pod must exit on SIGTERM during that window rather than sit until its
 // grace period expires.
 func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
+	tlsFiles := 0
+	for _, path := range []string{cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.CAFile} {
+		if path != "" {
+			tlsFiles++
+		}
+	}
+	switch {
+	case tlsFiles != 0 && tlsFiles != 3:
+		return nil, fmt.Errorf("raft transport configuration requires TLS certificate, key, and CA together")
+	case cfg.Insecure && tlsFiles != 0:
+		return nil, fmt.Errorf("raft transport configuration cannot enable both mTLS and insecure mode")
+	case tlsFiles == 0 && !cfg.Insecure:
+		return nil, fmt.Errorf("raft transport requires mTLS or explicit insecure opt-out")
+	}
+	if cfg.Insecure {
+		logger.Warn("raft transport is insecure", "action", "configure mutual TLS for production")
+	}
 	if cfg.ApplyTimeout <= 0 {
 		cfg.ApplyTimeout = 10 * time.Second
 	}
