@@ -95,6 +95,39 @@ func TestOverlayStartFlags_ExplicitInsecureRaft(t *testing.T) {
 	require.True(t, cfg.Raft.Insecure)
 }
 
+func TestOverlayStartFlags_SingleNodeBootstrap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		flag string
+		want bool
+	}{
+		{name: "no opt-in"},
+		{name: "flag enables", flag: "true", want: true},
+		{name: "unset flag preserves env", env: "true", want: true},
+		{name: "flag overrides env false", env: "false", flag: "true", want: true},
+		{name: "flag overrides env true", env: "true", flag: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("COSMOSIGNER_RAFT_SINGLE_NODE", tc.env)
+			}
+			cmd := NewStartCmd()
+			args := []string{"--chain-id", "chain", "--node", "node:5555", "--key-file", "/key.json", "--raft-bootstrap", "--raft-insecure"}
+			if tc.flag != "" {
+				args = append(args, "--raft-single-node="+tc.flag)
+			}
+			require.NoError(t, cmd.ParseFlags(args))
+			_, err := config.Load("", func(c *config.Config) error { return overlayStartFlags(cmd, c) })
+			if tc.want {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "raft.single_node")
+			}
+		})
+	}
+}
+
 func TestWriteInsecureRaftWarning(t *testing.T) {
 	var out bytes.Buffer
 	writeInsecureRaftWarning(&out, true)

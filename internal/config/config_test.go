@@ -21,6 +21,7 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, "node-1", d.Raft.NodeID)
 	require.Equal(t, "127.0.0.1:7070", d.Raft.BindAddr)
 	require.False(t, d.Raft.Insecure)
+	require.False(t, d.Raft.SingleNode)
 }
 
 func TestValidate_RequiresRaftTransportSecurity(t *testing.T) {
@@ -41,6 +42,50 @@ func TestValidate_AllowsExplicitInsecureRaft(t *testing.T) {
 	cfg.Raft.Insecure = true
 
 	require.NoError(t, cfg.Validate())
+}
+
+func TestValidate_RejectsImplicitSingleNodeBootstrap(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+	cfg.Raft.Insecure = true
+	cfg.Raft.Bootstrap = true
+
+	require.ErrorContains(t, cfg.Validate(), "raft.single_node")
+}
+
+func TestLoad_SingleNodeBootstrap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raft string
+		env  string
+		want string
+	}{
+		{name: "missing opt-in", raft: "  bootstrap: true\n", want: "raft.single_node"},
+		{name: "empty list", raft: "  bootstrap: true\n  members: []\n", want: "raft.single_node"},
+		{name: "YAML opt-in", raft: "  bootstrap: true\n  single_node: true\n"},
+		{name: "env opt-in", raft: "  bootstrap: true\n", env: "true"},
+		{name: "env overrides YAML", raft: "  bootstrap: true\n  single_node: true\n", env: "false", want: "raft.single_node"},
+		{name: "bare joiner", raft: "  bootstrap: false\n"},
+		{name: "explicit members", raft: "  bootstrap: true\n  members: [{id: node-1, address: node-1:7070}, {id: node-2, address: node-2:7070}]\n"},
+		{name: "self missing", raft: "  bootstrap: true\n  members: [{id: node-2, address: node-2:7070}]\n", want: "not in raft.members"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("COSMOSIGNER_RAFT_SINGLE_NODE", tc.env)
+			}
+			file := filepath.Join(t.TempDir(), "c.yaml")
+			require.NoError(t, os.WriteFile(file, []byte(
+				"chain_id: chain\nnode_service: sentries:5555\nbackend:\n  key_file: /key.json\nraft:\n  bind_addr: 0.0.0.0:7070\n  insecure: true\n"+tc.raft), 0o600))
+			_, err := Load(file, nil)
+			if tc.want != "" {
+				require.ErrorContains(t, err, tc.want)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestValidate_AllowsRaftMTLS(t *testing.T) {

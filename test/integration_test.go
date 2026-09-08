@@ -49,11 +49,12 @@ func newHarness(t *testing.T, nodes int) *harness {
 	be := backend.NewSoftwareFromPriv(priv)
 
 	store, err := state.NewRaftStore(state.RaftConfig{
-		NodeID:    "n1",
-		BindAddr:  freeAddr(t),
-		DataDir:   filepath.Join(dir, "raft"),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond, "raft did not elect a leader")
