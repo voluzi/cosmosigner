@@ -90,7 +90,7 @@ make build
   --node 127.0.0.1:5555 \
   --backend software \
   --key-file ./data/priv_validator_key.json \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
   --raft-insecure
 ```
 
@@ -118,7 +118,7 @@ make build
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
   --vault-key my-validator --vault-key-version 1 \
   --expected-public-key '<base64 pubkey from cosmosigner pubkey>' \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
   --raft-insecure
 ```
 
@@ -169,7 +169,7 @@ version that is not `ENABLED` — fails fast at boot instead of at the first vot
   --chain-id my-chain --node 127.0.0.1:5555 \
   --backend gcpkms \
   --gcp-key-version projects/.../cryptoKeyVersions/1 \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
   --raft-insecure
 ```
 
@@ -196,7 +196,7 @@ seconds — pods that appear get a signer, pods that vanish are dropped:
 cosmosigner start --chain-id my-chain \
   --node-service sentries.my-ns.svc.cluster.local:5555 \
   --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \
-  --raft-bootstrap --raft-node-id node-1 --raft-bind 0.0.0.0:7070 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 0.0.0.0:7070 \
   --raft-tls-cert /tls/raft-cert.pem --raft-tls-key /tls/raft-key.pem \
   --raft-tls-ca /tls/raft-ca.pem
 ```
@@ -248,7 +248,21 @@ cosmosigner start ... --raft-node-id n0 --raft-bind 0.0.0.0:7070 --raft-bootstra
 
 In a StatefulSet this is one templated arg set plus a per-ordinal
 `COSMOSIGNER_RAFT_BOOTSTRAP=true` on pod 0 only. A single-node development
-signer uses `--raft-bootstrap --raft-insecure` with no `--raft-member`.
+signer uses `--raft-bootstrap --raft-single-node --raft-insecure` with no
+`--raft-member`. Bootstrapping with an empty member list requires the explicit
+`--raft-single-node` opt-in (YAML `raft.single_node: true` or
+`COSMOSIGNER_RAFT_SINGLE_NODE=true`). It defaults to false. Existing single-node
+invocations must add this opt-in as part of the same upgrade, even when their
+Raft state already exists. The previous release rejects the new CLI flag and
+YAML key, so only the environment variable form can be added ahead of time.
+Replicated signers must provide their full initial member list;
+never enable single-node bootstrap on independent replicas sharing a signing key.
+Target-node discovery and the bind address do not determine the signer topology.
+
+At startup, the Raft log records the node ID, bind and advertise addresses,
+configured member list, single-node opt-in, bootstrap request, whether existing
+state was found, and whether bootstrap will run. Existing state is reused;
+bootstrap only runs on an empty store.
 
 Because raft is **CP**, a node in a minority partition cannot commit the
 high-water-mark and therefore cannot sign — it fails closed (downtime) rather
@@ -307,6 +321,7 @@ export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
+export COSMOSIGNER_RAFT_SINGLE_NODE=true
 export COSMOSIGNER_RAFT_TLS_CERT=/tls/raft-cert.pem
 export COSMOSIGNER_RAFT_TLS_KEY=/tls/raft-key.pem
 export COSMOSIGNER_RAFT_TLS_CA=/tls/raft-ca.pem
@@ -338,6 +353,7 @@ raft:
   bind_addr: 0.0.0.0:7070
   data_dir: /data/raft
   bootstrap: true            # on exactly one node
+  single_node: false         # set true only to bootstrap with no members
   members:                   # full set incl self, identical on every node
     - { id: node-1, address: 10.0.1.1:7070 }
     - { id: node-2, address: 10.0.1.2:7070 }

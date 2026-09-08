@@ -59,11 +59,12 @@ func TestDiscovery_DynamicNodeSet(t *testing.T) {
 	dir := t.TempDir()
 	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
 	store, err := state.NewRaftStore(state.RaftConfig{
-		NodeID:    "n1",
-		BindAddr:  freeAddr(t),
-		DataDir:   filepath.Join(dir, "raft"),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -123,11 +124,12 @@ func TestDiscovery_NodeAppearsAfterDialTimeout(t *testing.T) {
 	dir := t.TempDir()
 	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
 	store, err := state.NewRaftStore(state.RaftConfig{
-		NodeID:    "n1",
-		BindAddr:  freeAddr(t),
-		DataDir:   filepath.Join(dir, "raft"),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -181,11 +183,12 @@ func TestDiscovery_NodeReplacedAtNewAddress(t *testing.T) {
 	dir := t.TempDir()
 	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
 	store, err := state.NewRaftStore(state.RaftConfig{
-		NodeID:    "n1",
-		BindAddr:  freeAddr(t),
-		DataDir:   filepath.Join(dir, "raft"),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -239,11 +242,12 @@ func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
 	dir := t.TempDir()
 	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
 	store, err := state.NewRaftStore(state.RaftConfig{
-		NodeID:    "n1",
-		BindAddr:  freeAddr(t),
-		DataDir:   filepath.Join(dir, "raft"),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()

@@ -30,10 +30,12 @@ type RaftConfig struct {
 	Advertise string // address peers use to reach this node; defaults to BindAddr
 	DataDir   string
 	Bootstrap bool
+	// SingleNode permits bootstrapping with an empty member list.
+	SingleNode bool
 	// Insecure permits unauthenticated plain TCP instead of mutual TLS.
 	Insecure bool
 	// Members is the full initial member set INCLUDING this node, identical on
-	// every node. Empty means a single-node cluster of just this node. Only the
+	// every node. Empty requires SingleNode when bootstrapping. Only the
 	// nodes that have Bootstrap set seed the configuration; for a fresh cluster,
 	// either set Bootstrap on exactly one node (others join bare) or on all
 	// nodes with this identical Members list.
@@ -172,8 +174,11 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 // NewRaftStoreContext creates an embedded-raft StateStore, using ctx for the startup waits that can
 // block — currently advertise-address resolution, which retries while the per-pod DNS record is
 // published. A terminating pod must exit on SIGTERM during that window rather than sit until its
-// grace period expires.
+// grace period expires. A nil logger disables logging.
 func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
 	tlsFiles := 0
 	for _, path := range []string{cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.CAFile} {
 		if path != "" {
@@ -193,6 +198,11 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	}
 	if cfg.Advertise == "" {
 		cfg.Advertise = cfg.BindAddr
+	}
+	if cfg.Bootstrap {
+		if _, err := bootstrapServers(cfg, raft.ServerID(cfg.NodeID), raft.ServerAddress(cfg.Advertise)); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -215,10 +225,20 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	if err != nil {
 		return nil, fmt.Errorf("bolt store: %w", err)
 	}
+	success := false
+	defer func() {
+		if !success {
+			_ = bolt.Close()
+		}
+	}()
 
 	snaps, err := raft.NewFileSnapshotStoreWithLogger(cfg.DataDir, 2, logger)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot store: %w", err)
+	}
+	hasState, err := raft.HasExistingState(bolt, bolt, snaps)
+	if err != nil {
+		return nil, fmt.Errorf("check existing state: %w", err)
 	}
 
 	advertiseAddr, err := resolveAdvertise(ctx, cfg.Advertise, logger)
@@ -239,27 +259,39 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 		}
 	}
 
+	defer func() {
+		if !success {
+			_ = transport.Close()
+		}
+	}()
+
+	logger.Info("raft startup configuration",
+		"node_id", cfg.NodeID, "bind_addr", cfg.BindAddr, "advertise_addr", transport.LocalAddr(),
+		"configured_members", cfg.Members, "single_node", cfg.SingleNode,
+		"bootstrap_requested", cfg.Bootstrap, "existing_state", hasState,
+		"bootstrap", cfg.Bootstrap && !hasState)
+
 	r, err := raft.NewRaft(rc, f, bolt, bolt, snaps, transport)
 	if err != nil {
 		return nil, fmt.Errorf("new raft: %w", err)
 	}
-
-	if cfg.Bootstrap {
-		hasState, err := raft.HasExistingState(bolt, bolt, snaps)
-		if err != nil {
-			return nil, fmt.Errorf("check existing state: %w", err)
+	defer func() {
+		if !success {
+			_ = r.Shutdown().Error()
 		}
-		if !hasState {
-			servers, err := bootstrapServers(cfg, rc.LocalID, transport.LocalAddr())
-			if err != nil {
-				return nil, err
-			}
-			if err := r.BootstrapCluster(raft.Configuration{Servers: servers}).Error(); err != nil {
-				return nil, fmt.Errorf("bootstrap cluster: %w", err)
-			}
+	}()
+
+	if cfg.Bootstrap && !hasState {
+		servers, err := bootstrapServers(cfg, rc.LocalID, transport.LocalAddr())
+		if err != nil {
+			return nil, err
+		}
+		if err := r.BootstrapCluster(raft.Configuration{Servers: servers}).Error(); err != nil {
+			return nil, fmt.Errorf("bootstrap cluster: %w", err)
 		}
 	}
 
+	success = true
 	return &raftStore{
 		raft:         r,
 		fsm:          f,
@@ -269,11 +301,14 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	}, nil
 }
 
-// bootstrapServers builds the initial raft configuration. With no members it is
-// a single-node cluster of self; otherwise the member list is used verbatim and
+// bootstrapServers builds the initial raft configuration. Empty members require
+// an explicit SingleNode opt-in; otherwise the member list is used verbatim and
 // MUST include this node (a common misconfiguration otherwise splits brains).
 func bootstrapServers(cfg RaftConfig, localID raft.ServerID, localAddr raft.ServerAddress) ([]raft.Server, error) {
 	if len(cfg.Members) == 0 {
+		if !cfg.SingleNode {
+			return nil, fmt.Errorf("raft bootstrap with empty members requires explicit single-node opt-in")
+		}
 		return []raft.Server{{ID: localID, Address: localAddr}}, nil
 	}
 	servers := make([]raft.Server, 0, len(cfg.Members))

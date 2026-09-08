@@ -2,14 +2,183 @@ package state
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/bbolt"
 )
+
+func TestNewRaftStoreRejectsImplicitSingleNodeBootstrap(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "raft")
+	store, err := NewRaftStore(RaftConfig{
+		NodeID:    "node-1",
+		BindAddr:  "127.0.0.1:0",
+		DataDir:   dir,
+		Bootstrap: true,
+		Insecure:  true,
+	}, hclog.NewNullLogger())
+	if store != nil {
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+	require.ErrorContains(t, err, "single-node")
+	require.NoDirExists(t, dir)
+}
+
+func TestNewRaftStoreClosesResourcesOnStartupFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *RaftConfig)
+		want  string
+	}{
+		{name: "snapshot store", setup: func(t *testing.T, cfg *RaftConfig) {
+			require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, "snapshots"), []byte("not a directory"), 0o600))
+		}, want: "snapshot store"},
+		{name: "advertise resolution", setup: func(_ *testing.T, cfg *RaftConfig) {
+			cfg.Advertise = "missing-port"
+		}, want: "parse advertise address"},
+		{name: "TLS transport", setup: func(_ *testing.T, cfg *RaftConfig) {
+			cfg.Insecure = false
+			cfg.TLS = TLSConfig{CertFile: "missing-cert", KeyFile: "missing-key", CAFile: "missing-ca"}
+		}, want: "load raft TLS keypair"},
+		{name: "TCP transport", setup: func(_ *testing.T, cfg *RaftConfig) {
+			cfg.Advertise = cfg.BindAddr
+			cfg.BindAddr = "missing-port"
+		}, want: "tcp transport"},
+		{name: "raft construction", setup: func(_ *testing.T, cfg *RaftConfig) {
+			cfg.NodeID = ""
+		}, want: "new raft"},
+		{name: "bootstrap", setup: func(_ *testing.T, cfg *RaftConfig) {
+			cfg.Bootstrap = true
+			cfg.Members = []Member{{ID: cfg.NodeID, Address: cfg.BindAddr}, {ID: cfg.NodeID, Address: cfg.BindAddr}}
+		}, want: "bootstrap cluster"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := freeAddrs(t, 1)[0]
+			cfg := RaftConfig{NodeID: "node-1", BindAddr: addr, DataDir: t.TempDir(), Insecure: true}
+			tc.setup(t, &cfg)
+			store, err := NewRaftStore(cfg, hclog.NewNullLogger())
+			if store != nil {
+				t.Cleanup(func() { require.NoError(t, store.Close()) })
+			}
+			require.ErrorContains(t, err, tc.want)
+			db, err := bbolt.Open(filepath.Join(cfg.DataDir, "raft.db"), 0o600, &bbolt.Options{Timeout: 100 * time.Millisecond})
+			require.NoError(t, err, "failed startup must release the database lock")
+			require.NoError(t, db.Close())
+			ln, err := net.Listen("tcp", addr)
+			require.NoError(t, err, "failed startup must release the listening socket")
+			require.NoError(t, ln.Close())
+		})
+	}
+}
+
+func TestNewRaftStoreNilLoggerDuringAdvertiseRetry(t *testing.T) {
+	restoreBudget(t, 200*time.Millisecond, 10*time.Millisecond)
+	cfg := RaftConfig{
+		NodeID: "node-1", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(), Insecure: true,
+		Advertise: "no-such-raft-host.invalid:7070",
+	}
+	require.NotPanics(t, func() {
+		_, err := NewRaftStoreContext(t.Context(), cfg, nil)
+		require.ErrorContains(t, err, "resolve advertise address")
+	})
+}
+
+func TestBootstrapServersRejectsImplicitSingleNode(t *testing.T) {
+	_, err := bootstrapServers(RaftConfig{}, "node-1", "127.0.0.1:7070")
+	require.ErrorContains(t, err, "single-node")
+}
+
+func TestNewRaftStoreRejectsImplicitSingleNodeRestart(t *testing.T) {
+	cfg := RaftConfig{
+		NodeID:     "node-1",
+		BindAddr:   "127.0.0.1:0",
+		DataDir:    t.TempDir(),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
+	}
+	store, err := NewRaftStore(cfg, hclog.NewNullLogger())
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	dbPath := filepath.Join(cfg.DataDir, "raft.db")
+	before, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+
+	cfg.SingleNode = false
+	store, err = NewRaftStore(cfg, hclog.NewNullLogger())
+	if store != nil {
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+	require.ErrorContains(t, err, "single-node")
+	after, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "rejected startup must leave existing raft state unchanged")
+}
+
+func TestBootstrapServersAllowsExplicitSingleNode(t *testing.T) {
+	servers, err := bootstrapServers(RaftConfig{SingleNode: true}, "node-1", "127.0.0.1:7070")
+	require.NoError(t, err)
+	require.Equal(t, []raft.Server{{ID: "node-1", Address: "127.0.0.1:7070", Suffrage: raft.Voter}}, servers)
+}
+
+func TestNewRaftStoreLogsBootstrapDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		bootstrap bool
+		existing  bool
+	}{
+		{name: "fresh bootstrap", bootstrap: true},
+		{name: "fresh joiner"},
+		{name: "restart bootstrapper", bootstrap: true, existing: true},
+		{name: "restart without bootstrap", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := freeAddrs(t, 1)[0]
+			cfg := RaftConfig{
+				NodeID: "node-1", BindAddr: addr, DataDir: t.TempDir(),
+				Bootstrap: true, Insecure: true,
+				Members: []Member{{ID: "node-1", Address: addr}},
+			}
+			if tc.existing {
+				store, err := NewRaftStore(cfg, hclog.NewNullLogger())
+				require.NoError(t, err)
+				require.NoError(t, store.Close())
+			}
+			cfg.Bootstrap = tc.bootstrap
+			out, err := os.CreateTemp(t.TempDir(), "raft-log")
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, out.Close()) })
+			store, err := NewRaftStore(cfg, hclog.New(&hclog.LoggerOptions{Output: out, JSONFormat: true, Level: hclog.Info}))
+			require.NoError(t, err)
+			require.NoError(t, store.Close())
+			logs, err := os.ReadFile(out.Name())
+			require.NoError(t, err)
+			for _, line := range strings.Split(strings.TrimSpace(string(logs)), "\n") {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+				if entry["@message"] != "raft startup configuration" {
+					continue
+				}
+				require.Equal(t, "node-1", entry["node_id"])
+				require.Equal(t, tc.existing, entry["existing_state"])
+				require.Equal(t, tc.bootstrap, entry["bootstrap_requested"])
+				require.Equal(t, tc.bootstrap && !tc.existing, entry["bootstrap"])
+				require.NotEmpty(t, entry["configured_members"])
+				return
+			}
+			t.Fatal("missing raft startup configuration log")
+		})
+	}
+}
 
 func TestNewRaftStoreRequiresTransportSecurity(t *testing.T) {
 	_, err := NewRaftStore(RaftConfig{
@@ -23,11 +192,12 @@ func TestNewRaftStoreRequiresTransportSecurity(t *testing.T) {
 
 func TestNewRaftStoreAllowsExplicitInsecureTransport(t *testing.T) {
 	store, err := NewRaftStore(RaftConfig{
-		NodeID:    "node-1",
-		BindAddr:  "127.0.0.1:0",
-		DataDir:   t.TempDir(),
-		Bootstrap: true,
-		Insecure:  true,
+		NodeID:     "node-1",
+		BindAddr:   "127.0.0.1:0",
+		DataDir:    t.TempDir(),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })

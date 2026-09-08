@@ -44,12 +44,14 @@ type Config struct {
 
 // RaftConfig configures the embedded raft node.
 type RaftConfig struct {
-	NodeID    string   `yaml:"node_id" env:"COSMOSIGNER_RAFT_NODE_ID" default:"node-1"`
-	BindAddr  string   `yaml:"bind_addr" env:"COSMOSIGNER_RAFT_BIND" default:"127.0.0.1:7070"`
-	Advertise string   `yaml:"advertise" env:"COSMOSIGNER_RAFT_ADVERTISE"`
-	DataDir   string   `yaml:"data_dir" env:"COSMOSIGNER_RAFT_DATA_DIR" default:"./data/raft"`
-	Bootstrap bool     `yaml:"bootstrap" env:"COSMOSIGNER_RAFT_BOOTSTRAP"`
-	Members   []Member `yaml:"members"`
+	NodeID    string `yaml:"node_id" env:"COSMOSIGNER_RAFT_NODE_ID" default:"node-1"`
+	BindAddr  string `yaml:"bind_addr" env:"COSMOSIGNER_RAFT_BIND" default:"127.0.0.1:7070"`
+	Advertise string `yaml:"advertise" env:"COSMOSIGNER_RAFT_ADVERTISE"`
+	DataDir   string `yaml:"data_dir" env:"COSMOSIGNER_RAFT_DATA_DIR" default:"./data/raft"`
+	Bootstrap bool   `yaml:"bootstrap" env:"COSMOSIGNER_RAFT_BOOTSTRAP"`
+	// SingleNode permits an empty member list; an explicit Members list takes precedence.
+	SingleNode bool     `yaml:"single_node" env:"COSMOSIGNER_RAFT_SINGLE_NODE"`
+	Members    []Member `yaml:"members"`
 	// Insecure explicitly permits unauthenticated plain TCP for local development.
 	Insecure bool `yaml:"insecure" env:"COSMOSIGNER_RAFT_INSECURE"`
 	// Mutual TLS for the inter-replica raft transport. All three files must be
@@ -158,8 +160,10 @@ func (c *Config) Validate() error {
 	if c.Raft.DataDir == "" {
 		return fmt.Errorf("raft.data_dir is required")
 	}
-	// Mirror the raft store's bootstrap self-check at config level so a
-	// misconfigured member list fails before any raft state is created.
+	// Reject unsafe bootstrap intent before any raft state is created.
+	if c.Raft.Bootstrap && len(c.Raft.Members) == 0 && !c.Raft.SingleNode {
+		return fmt.Errorf("raft.bootstrap with empty raft.members requires explicit raft.single_node: true (--raft-single-node)")
+	}
 	if c.Raft.Bootstrap && len(c.Raft.Members) > 0 {
 		found := false
 		for _, m := range c.Raft.Members {

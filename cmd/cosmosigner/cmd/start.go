@@ -56,6 +56,7 @@ func NewStartCmd() *cobra.Command {
 	f.String("raft-advertise", "", "raft advertise address (defaults to bind)")
 	f.String("raft-data-dir", d.Raft.DataDir, "raft data directory")
 	f.Bool("raft-bootstrap", false, "seed a new raft cluster from --raft-member (set on one node, or all nodes identically)")
+	f.Bool("raft-single-node", d.Raft.SingleNode, "explicitly allow bootstrapping a single-node raft cluster with no --raft-member")
 	f.StringArray("raft-member", nil, "raft member as id=address — the full set INCLUDING self, identical on every node (repeatable)")
 	f.Bool("raft-insecure", d.Raft.Insecure, "explicitly allow unauthenticated plain TCP for the raft transport")
 	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); required with --raft-tls-key and --raft-tls-ca unless --raft-insecure is set")
@@ -96,6 +97,9 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 	s("raft-data-dir", &c.Raft.DataDir)
 	if f.Changed("raft-bootstrap") {
 		c.Raft.Bootstrap, _ = f.GetBool("raft-bootstrap")
+	}
+	if f.Changed("raft-single-node") {
+		c.Raft.SingleNode, _ = f.GetBool("raft-single-node")
 	}
 	if f.Changed("raft-member") {
 		raw, _ := f.GetStringArray("raft-member")
@@ -166,12 +170,13 @@ func runStart(cfg config.Config) error {
 	defer stop()
 
 	raftCfg := state.RaftConfig{
-		NodeID:    cfg.Raft.NodeID,
-		BindAddr:  cfg.Raft.BindAddr,
-		Advertise: cfg.Raft.Advertise,
-		DataDir:   cfg.Raft.DataDir,
-		Bootstrap: cfg.Raft.Bootstrap,
-		Insecure:  cfg.Raft.Insecure,
+		NodeID:     cfg.Raft.NodeID,
+		BindAddr:   cfg.Raft.BindAddr,
+		Advertise:  cfg.Raft.Advertise,
+		DataDir:    cfg.Raft.DataDir,
+		Bootstrap:  cfg.Raft.Bootstrap,
+		SingleNode: cfg.Raft.SingleNode,
+		Insecure:   cfg.Raft.Insecure,
 		TLS: state.TLSConfig{
 			CertFile: cfg.Raft.TLSCert,
 			KeyFile:  cfg.Raft.TLSKey,
