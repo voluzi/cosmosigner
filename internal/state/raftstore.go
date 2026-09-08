@@ -174,8 +174,11 @@ func NewRaftStore(cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
 // NewRaftStoreContext creates an embedded-raft StateStore, using ctx for the startup waits that can
 // block — currently advertise-address resolution, which retries while the per-pod DNS record is
 // published. A terminating pod must exit on SIGTERM during that window rather than sit until its
-// grace period expires.
+// grace period expires. A nil logger disables logging.
 func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logger) (StateStore, error) {
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
 	tlsFiles := 0
 	for _, path := range []string{cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.CAFile} {
 		if path != "" {
@@ -222,6 +225,12 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	if err != nil {
 		return nil, fmt.Errorf("bolt store: %w", err)
 	}
+	success := false
+	defer func() {
+		if !success {
+			_ = bolt.Close()
+		}
+	}()
 
 	snaps, err := raft.NewFileSnapshotStoreWithLogger(cfg.DataDir, 2, logger)
 	if err != nil {
@@ -229,7 +238,6 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	}
 	hasState, err := raft.HasExistingState(bolt, bolt, snaps)
 	if err != nil {
-		_ = bolt.Close()
 		return nil, fmt.Errorf("check existing state: %w", err)
 	}
 
@@ -251,18 +259,27 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 		}
 	}
 
-	if logger != nil {
-		logger.Info("raft startup configuration",
-			"node_id", cfg.NodeID, "bind_addr", cfg.BindAddr, "advertise_addr", transport.LocalAddr(),
-			"configured_members", cfg.Members, "single_node", cfg.SingleNode,
-			"bootstrap_requested", cfg.Bootstrap, "existing_state", hasState,
-			"bootstrap", cfg.Bootstrap && !hasState)
-	}
+	defer func() {
+		if !success {
+			_ = transport.Close()
+		}
+	}()
+
+	logger.Info("raft startup configuration",
+		"node_id", cfg.NodeID, "bind_addr", cfg.BindAddr, "advertise_addr", transport.LocalAddr(),
+		"configured_members", cfg.Members, "single_node", cfg.SingleNode,
+		"bootstrap_requested", cfg.Bootstrap, "existing_state", hasState,
+		"bootstrap", cfg.Bootstrap && !hasState)
 
 	r, err := raft.NewRaft(rc, f, bolt, bolt, snaps, transport)
 	if err != nil {
 		return nil, fmt.Errorf("new raft: %w", err)
 	}
+	defer func() {
+		if !success {
+			_ = r.Shutdown().Error()
+		}
+	}()
 
 	if cfg.Bootstrap && !hasState {
 		servers, err := bootstrapServers(cfg, rc.LocalID, transport.LocalAddr())
@@ -274,6 +291,7 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 		}
 	}
 
+	success = true
 	return &raftStore{
 		raft:         r,
 		fsm:          f,
