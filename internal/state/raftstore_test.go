@@ -37,6 +37,33 @@ func TestBootstrapServersRejectsImplicitSingleNode(t *testing.T) {
 	require.ErrorContains(t, err, "single-node")
 }
 
+func TestNewRaftStoreRejectsImplicitSingleNodeRestart(t *testing.T) {
+	cfg := RaftConfig{
+		NodeID:     "node-1",
+		BindAddr:   "127.0.0.1:0",
+		DataDir:    t.TempDir(),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
+	}
+	store, err := NewRaftStore(cfg, hclog.NewNullLogger())
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	dbPath := filepath.Join(cfg.DataDir, "raft.db")
+	before, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+
+	cfg.SingleNode = false
+	store, err = NewRaftStore(cfg, hclog.NewNullLogger())
+	if store != nil {
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+	require.ErrorContains(t, err, "single-node")
+	after, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "rejected startup must leave existing raft state unchanged")
+}
+
 func TestBootstrapServersAllowsExplicitSingleNode(t *testing.T) {
 	servers, err := bootstrapServers(RaftConfig{SingleNode: true}, "node-1", "127.0.0.1:7070")
 	require.NoError(t, err)
