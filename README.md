@@ -252,8 +252,10 @@ signer uses `--raft-bootstrap --raft-single-node --raft-insecure` with no
 `--raft-member`. Bootstrapping with an empty member list requires the explicit
 `--raft-single-node` opt-in (YAML `raft.single_node: true` or
 `COSMOSIGNER_RAFT_SINGLE_NODE=true`). It defaults to false. Existing single-node
-invocations must add this opt-in before upgrading, even when their Raft state
-already exists. Replicated signers must provide their full initial member list;
+invocations must add this opt-in as part of the same upgrade, even when their
+Raft state already exists. The previous release rejects the new CLI flag and
+YAML key, so only the environment variable form can be added ahead of time.
+Replicated signers must provide their full initial member list;
 never enable single-node bootstrap on independent replicas sharing a signing key.
 Target-node discovery and the bind address do not determine the signer topology.
 

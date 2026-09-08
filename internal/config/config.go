@@ -44,11 +44,12 @@ type Config struct {
 
 // RaftConfig configures the embedded raft node.
 type RaftConfig struct {
-	NodeID     string   `yaml:"node_id" env:"COSMOSIGNER_RAFT_NODE_ID" default:"node-1"`
-	BindAddr   string   `yaml:"bind_addr" env:"COSMOSIGNER_RAFT_BIND" default:"127.0.0.1:7070"`
-	Advertise  string   `yaml:"advertise" env:"COSMOSIGNER_RAFT_ADVERTISE"`
-	DataDir    string   `yaml:"data_dir" env:"COSMOSIGNER_RAFT_DATA_DIR" default:"./data/raft"`
-	Bootstrap  bool     `yaml:"bootstrap" env:"COSMOSIGNER_RAFT_BOOTSTRAP"`
+	NodeID    string `yaml:"node_id" env:"COSMOSIGNER_RAFT_NODE_ID" default:"node-1"`
+	BindAddr  string `yaml:"bind_addr" env:"COSMOSIGNER_RAFT_BIND" default:"127.0.0.1:7070"`
+	Advertise string `yaml:"advertise" env:"COSMOSIGNER_RAFT_ADVERTISE"`
+	DataDir   string `yaml:"data_dir" env:"COSMOSIGNER_RAFT_DATA_DIR" default:"./data/raft"`
+	Bootstrap bool   `yaml:"bootstrap" env:"COSMOSIGNER_RAFT_BOOTSTRAP"`
+	// SingleNode permits an empty member list; an explicit Members list takes precedence.
 	SingleNode bool     `yaml:"single_node" env:"COSMOSIGNER_RAFT_SINGLE_NODE"`
 	Members    []Member `yaml:"members"`
 	// Insecure explicitly permits unauthenticated plain TCP for local development.
