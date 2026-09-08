@@ -136,10 +136,6 @@ func parseMembers(raw []string) ([]config.Member, error) {
 	return members, nil
 }
 
-func runStart(cfg config.Config) error {
-	return runStartMode(cfg, false, os.Stdout)
-}
-
 func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
 	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
@@ -222,7 +218,7 @@ func runStartWithContext(
 	if initializeOnly {
 		membershipReader, ok := store.(state.RaftMembershipReader)
 		if !ok {
-			return fmt.Errorf("Raft store does not expose persisted membership")
+			return fmt.Errorf("raft store does not expose persisted membership")
 		}
 		membership, err := membershipReader.RaftMembership(ctx)
 		if err != nil {
