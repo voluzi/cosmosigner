@@ -168,6 +168,7 @@ func TestFSM_RestoreRejectsInvalidSnapshotWithoutChangingState(t *testing.T) {
 	}{
 		{name: "empty", data: nil},
 		{name: "null", data: []byte("null")},
+		{name: "null chain entry", data: []byte(`{"test-chain-1":null}`)},
 		{name: "truncated", data: []byte(`{"test-chain-1":`)},
 	}
 

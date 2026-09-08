@@ -34,6 +34,11 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	if state == nil {
 		return errors.New("decode snapshot: state must be a JSON object")
 	}
+	for chainID, signState := range state {
+		if signState == nil {
+			return fmt.Errorf("decode snapshot: state for chain %q must not be null", chainID)
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state = state
