@@ -3,17 +3,21 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"go.etcd.io/bbolt"
+
+	"github.com/voluzi/cosmosigner/internal/clusterid"
 )
 
 // Member is a raft cluster member (id + advertise address) used to seed the
@@ -53,6 +57,9 @@ type raftStore struct {
 	transport *raft.NetworkTransport
 
 	applyTimeout time.Duration
+	closed       chan struct{}
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 var (
@@ -68,6 +75,8 @@ var (
 // boltOpenTimeout bounds the raft.db file-lock wait, so a database still held by a previous pod
 // fails startup rather than blocking it indefinitely in a call that cannot observe cancellation.
 const boltOpenTimeout = 30 * time.Second
+
+const raftMembershipTimeout = 5 * time.Second
 
 // advertiseTypoHint is logged once a hostname has failed to resolve for this long, to name the
 // likely cause. Hostname syntax is not a usable resolvability test — DNS labels may contain bytes
@@ -298,6 +307,7 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 		bolt:         bolt,
 		transport:    transport,
 		applyTimeout: cfg.ApplyTimeout,
+		closed:       make(chan struct{}),
 	}, nil
 }
 
@@ -355,6 +365,102 @@ func (s *raftStore) Reserve(chainID string, height int64, round int32, step int8
 	}, nil
 }
 
+func (s *raftStore) EnsureClusterID(ctx context.Context) (string, error) {
+	var candidate string
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if id := s.fsm.clusterIDValue(); id != "" {
+			return id, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-s.closed:
+			return "", errors.New("raft store is closed")
+		default:
+		}
+
+		if s.raft.State() == raft.Leader {
+			if candidate == "" {
+				var err error
+				candidate, err = clusterid.New()
+				if err != nil {
+					return "", err
+				}
+			}
+			res, err := s.applyContext(ctx, command{Op: opInitCluster, ClusterID: candidate})
+			if err == nil {
+				return res.clusterID, nil
+			}
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			select {
+			case <-s.closed:
+				return "", errors.New("raft store is closed")
+			default:
+			}
+			if !errors.Is(err, raft.ErrNotLeader) &&
+				!errors.Is(err, raft.ErrLeadershipLost) &&
+				!errors.Is(err, raft.ErrLeadershipTransferInProgress) &&
+				!errors.Is(err, raft.ErrEnqueueTimeout) {
+				return "", fmt.Errorf("initialize cluster ID: %w", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-s.closed:
+			return "", errors.New("raft store is closed")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *raftStore) RaftMembership(ctx context.Context) (RaftMembership, error) {
+	ctx, cancel := context.WithTimeout(ctx, raftMembershipTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return RaftMembership{}, err
+	}
+
+	future := s.raft.GetConfiguration()
+	type result struct {
+		membership RaftMembership
+		err        error
+	}
+	results := make(chan result, 1)
+	go func() {
+		if err := future.Error(); err != nil {
+			results <- result{err: err}
+			return
+		}
+		configuration := future.Configuration()
+		membership := RaftMembership{Members: len(configuration.Servers)}
+		for _, server := range configuration.Servers {
+			if server.Suffrage == raft.Voter {
+				membership.Voters++
+			}
+		}
+		results <- result{membership: membership}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return RaftMembership{}, ctx.Err()
+	case <-s.closed:
+		return RaftMembership{}, errors.New("raft store is closed")
+	case result := <-results:
+		if result.err != nil {
+			return RaftMembership{}, fmt.Errorf("read Raft configuration: %w", result.err)
+		}
+		return result.membership, nil
+	}
+}
+
 func (s *raftStore) Commit(chainID string, height int64, round int32, step int8, signBytes, signature []byte) error {
 	if s.raft.State() != raft.Leader {
 		return ErrNotLeader
@@ -391,6 +497,26 @@ func (s *raftStore) apply(c command) (applyResult, error) {
 	return res, nil
 }
 
+func (s *raftStore) applyContext(ctx context.Context, c command) (applyResult, error) {
+	type outcome struct {
+		result applyResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := s.apply(c)
+		done <- outcome{result: result, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.result, result.err
+	case <-ctx.Done():
+		return applyResult{}, ctx.Err()
+	case <-s.closed:
+		return applyResult{}, errors.New("raft store is closed")
+	}
+}
+
 func (s *raftStore) Get(chainID string) (*SignState, error) {
 	st := s.fsm.get(chainID)
 	if st == nil {
@@ -404,11 +530,21 @@ func (s *raftStore) IsLeader() bool { return s.raft.State() == raft.Leader }
 func (s *raftStore) LeaderCh() <-chan bool { return s.raft.LeaderCh() }
 
 func (s *raftStore) Close() error {
-	if err := s.raft.Shutdown().Error(); err != nil {
-		return fmt.Errorf("raft shutdown: %w", err)
-	}
-	if s.transport != nil {
-		_ = s.transport.Close()
-	}
-	return s.bolt.Close()
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		var closeErrors []error
+		if err := s.raft.Shutdown().Error(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("raft shutdown: %w", err))
+		}
+		if s.transport != nil {
+			if err := s.transport.Close(); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close raft transport: %w", err))
+			}
+		}
+		if err := s.bolt.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close raft store: %w", err))
+		}
+		s.closeErr = errors.Join(closeErrors...)
+	})
+	return s.closeErr
 }

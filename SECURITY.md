@@ -46,3 +46,7 @@ Out of scope:
 - Protect the node-to-signer network path with private networking and firewall policy.
 - Keep raft mTLS (`raft.tls_cert`, `raft.tls_key`, `raft.tls_ca`) enabled for signer replicas; use `raft.insecure` only for isolated local development.
 - Keep Vault tokens, KMS credentials, imported key files, and raft data directories out of source control and backups that are not access-controlled.
+- Treat the key-to-Raft cluster claim as a startup guardrail, not live fencing. It does not stop an already-running old binary, distinguish complete copies of one accepted history, or detect copied key material in another resource.
+- Upgrade all replicas while stopped. Preserve the complete authoritative Raft history, initialize its immutable cluster ID, claim the key once with separate administrative credentials, and only then restart signers.
+- Never delete, overwrite, expire, or reassign a cluster claim to recover from lost Raft state. Recover the signing history or use a validator key-rotation procedure that is independently safe.
+- Externally serialize the first Google Cloud KMS claim while signers are stopped; CryptoKey label updates have no atomic compare-and-set precondition.

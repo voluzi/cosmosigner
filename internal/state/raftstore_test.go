@@ -203,6 +203,87 @@ func TestNewRaftStoreAllowsExplicitInsecureTransport(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 }
 
+func TestEnsureClusterIDPersistsAcrossRestart(t *testing.T) {
+	cfg := RaftConfig{
+		NodeID: "node-1", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		Bootstrap: true, SingleNode: true, Insecure: true,
+	}
+	store, err := NewRaftStore(cfg, hclog.NewNullLogger())
+	require.NoError(t, err)
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+	clusterID, err := store.EnsureClusterID(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	restarted, err := NewRaftStore(cfg, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
+	require.Equal(t, clusterID, mustEnsureClusterID(t, restarted))
+}
+
+func TestEnsureClusterIDHonorsCancellationWithoutQuorum(t *testing.T) {
+	store, err := NewRaftStore(RaftConfig{
+		NodeID: "node-1", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(), Insecure: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, err = store.EnsureClusterID(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestRaftMembershipReportsVotersAndHonorsCancellation(t *testing.T) {
+	store, err := NewRaftStore(RaftConfig{
+		NodeID: "node-1", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		Bootstrap: true, SingleNode: true, Insecure: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	reader, ok := store.(RaftMembershipReader)
+	require.True(t, ok)
+
+	membership, err := reader.RaftMembership(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, RaftMembership{Members: 1, Voters: 1}, membership)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = reader.RaftMembership(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestEnsureClusterIDWaiterStopsWhenStoreCloses(t *testing.T) {
+	store, err := NewRaftStore(RaftConfig{
+		NodeID: "node-1", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(), Insecure: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.EnsureClusterID(context.Background())
+		done <- err
+	}()
+	require.NoError(t, store.Close())
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("cluster identity waiter outlived store shutdown")
+	}
+}
+
+func mustEnsureClusterID(t *testing.T, store StateStore) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	id, err := store.EnsureClusterID(ctx)
+	require.NoError(t, err)
+	return id
+}
+
 func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

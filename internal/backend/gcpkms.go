@@ -13,6 +13,7 @@ import (
 
 	kms "cloud.google.com/go/kms/apiv1"
 	"cloud.google.com/go/kms/apiv1/kmspb"
+	"github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/option"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -33,10 +34,19 @@ type GCPKMSConfig struct {
 // GCPKMS signs via a Cloud KMS EC_SIGN_ED25519 key (PureEdDSA, raw input). The
 // private key never leaves KMS; the public key is fetched once and cached.
 type GCPKMS struct {
-	client     *kms.KeyManagementClient
-	keyVersion string
-	timeout    time.Duration
-	pub        crypto.PubKey
+	client      gcpKMSClient
+	keyVersion  string
+	keyResource string
+	timeout     time.Duration
+	pub         crypto.PubKey
+}
+
+type gcpKMSClient interface {
+	GetPublicKey(context.Context, *kmspb.GetPublicKeyRequest, ...gax.CallOption) (*kmspb.PublicKey, error)
+	AsymmetricSign(context.Context, *kmspb.AsymmetricSignRequest, ...gax.CallOption) (*kmspb.AsymmetricSignResponse, error)
+	GetCryptoKey(context.Context, *kmspb.GetCryptoKeyRequest, ...gax.CallOption) (*kmspb.CryptoKey, error)
+	UpdateCryptoKey(context.Context, *kmspb.UpdateCryptoKeyRequest, ...gax.CallOption) (*kmspb.CryptoKey, error)
+	Close() error
 }
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
@@ -95,6 +105,10 @@ func NewGCPKMS(cfg GCPKMSConfig) (*GCPKMS, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
 	}
+	keyResource, err := gcpCryptoKeyName(cfg.KeyVersion)
+	if err != nil {
+		return nil, err
+	}
 
 	ctx := context.Background()
 	opts, err := GCPClientOptions(cfg.CredentialsFile)
@@ -106,7 +120,7 @@ func NewGCPKMS(cfg GCPKMSConfig) (*GCPKMS, error) {
 		return nil, fmt.Errorf("new kms client: %w", err)
 	}
 
-	g := &GCPKMS{client: client, keyVersion: cfg.KeyVersion, timeout: cfg.Timeout}
+	g := &GCPKMS{client: client, keyVersion: cfg.KeyVersion, keyResource: keyResource, timeout: cfg.Timeout}
 	pub, err := g.fetchPubKey(ctx)
 	if err != nil {
 		_ = client.Close()
@@ -132,8 +146,8 @@ var gcpPreflightMessage = []byte("cosmosigner/gcpkms preflight — not a consens
 // version may not be ENABLED. This signs a non-consensus probe and verifies the
 // result against the cached public key, so a broken policy, a disabled key, or a
 // signature that does not match the advertised identity are all caught here.
-func (g *GCPKMS) VerifyCanSign() error {
-	sig, err := g.Sign(gcpPreflightMessage)
+func (g *GCPKMS) VerifyCanSign(ctx context.Context) error {
+	sig, err := g.signWithContext(ctx, gcpPreflightMessage)
 	if err != nil {
 		return fmt.Errorf("kms key %q cannot sign (needs roles/cloudkms.signerVerifier and an ENABLED version): %w", g.keyVersion, err)
 	}
@@ -144,7 +158,11 @@ func (g *GCPKMS) VerifyCanSign() error {
 }
 
 func (g *GCPKMS) Sign(signBytes []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
+	return g.signWithContext(context.Background(), signBytes)
+}
+
+func (g *GCPKMS) signWithContext(ctx context.Context, signBytes []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, g.timeout)
 	defer cancel()
 
 	dataCRC := int64(crc32.Checksum(signBytes, crc32cTable))

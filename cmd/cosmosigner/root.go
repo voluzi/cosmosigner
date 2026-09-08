@@ -35,6 +35,7 @@ func newRootCmd() *cobra.Command {
 		cmd.NewStartCmd(),
 		cmd.NewProvisionCmd(),
 		cmd.NewImportCmd(),
+		cmd.NewClaimKeyCmd(),
 		cmd.NewPubkeyCmd(),
 		cmd.NewVersionCmd(),
 	)

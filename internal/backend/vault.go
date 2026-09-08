@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -21,13 +22,14 @@ var vaultPreflightMessage = []byte("cosmosigner/vault preflight - not a consensu
 
 // VaultConfig configures the Vault Transit backend.
 type VaultConfig struct {
-	Address    string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
-	TokenFile  string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
-	Mount      string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
-	KeyName    string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"`                     // transit key name
-	KeyVersion int    `yaml:"key_version" env:"COSMOSIGNER_VAULT_KEY_VERSION"`
-	Namespace  string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
-	TLSCACert  string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
+	Address      string `yaml:"address"     env:"COSMOSIGNER_VAULT_ADDR"`
+	TokenFile    string `yaml:"token_file"  env:"COSMOSIGNER_VAULT_TOKEN_FILE"`
+	Mount        string `yaml:"mount"       env:"COSMOSIGNER_VAULT_MOUNT" default:"transit"` // transit mount path
+	BindingMount string `yaml:"binding_mount" env:"COSMOSIGNER_VAULT_BINDING_MOUNT" default:"cosmosigner"`
+	KeyName      string `yaml:"key_name"    env:"COSMOSIGNER_VAULT_KEY"` // transit key name
+	KeyVersion   int    `yaml:"key_version" env:"COSMOSIGNER_VAULT_KEY_VERSION"`
+	Namespace    string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
+	TLSCACert    string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
 }
 
 // Vault signs via the Vault Transit engine. The consensus key is created
@@ -36,6 +38,7 @@ type VaultConfig struct {
 type Vault struct {
 	client              *vaultapi.Client
 	mount               string
+	bindingMount        string
 	keyName             string
 	tokenFile           string
 	pub                 crypto.PubKey
@@ -47,9 +50,13 @@ type Vault struct {
 
 	stopRenew chan struct{}
 	stopOnce  sync.Once
+	renewMu   sync.Mutex
+	started   bool
+	closed    bool
 }
 
-// NewVault connects to Vault, caches the public key, and starts token renewal.
+// NewVault connects to Vault and caches the public key. Token renewal is activated explicitly
+// after startup verifies the key's cluster binding and signing capability.
 func NewVault(cfg VaultConfig) (*Vault, error) {
 	if cfg.Mount == "" {
 		cfg.Mount = "transit"
@@ -63,6 +70,22 @@ func NewVault(cfg VaultConfig) (*Vault, error) {
 	if cfg.KeyVersion < 0 {
 		return nil, fmt.Errorf("vault key version must be zero or greater")
 	}
+	if cfg.BindingMount == "" {
+		cfg.BindingMount = "cosmosigner"
+	}
+	var err error
+	cfg.Mount, err = normalizeVaultMount(cfg.Mount, "transit mount")
+	if err != nil {
+		return nil, err
+	}
+	cfg.BindingMount, err = normalizeVaultMount(cfg.BindingMount, "binding mount")
+	if err != nil {
+		return nil, err
+	}
+	cfg.KeyName, err = normalizeVaultKeyName(cfg.KeyName)
+	if err != nil {
+		return nil, err
+	}
 
 	client, err := NewVaultClient(cfg)
 	if err != nil {
@@ -70,7 +93,7 @@ func NewVault(cfg VaultConfig) (*Vault, error) {
 	}
 
 	v := &Vault{
-		client: client, mount: cfg.Mount, keyName: cfg.KeyName,
+		client: client, mount: cfg.Mount, bindingMount: cfg.BindingMount, keyName: cfg.KeyName,
 		tokenFile: cfg.TokenFile, requestedKeyVersion: cfg.KeyVersion,
 		stopRenew: make(chan struct{}),
 	}
@@ -80,7 +103,6 @@ func NewVault(cfg VaultConfig) (*Vault, error) {
 	}
 	v.pub = pub
 	v.keyVersion = version
-	go v.renewLoop()
 	return v, nil
 }
 
@@ -119,13 +141,13 @@ func (v *Vault) PubKey() (crypto.PubKey, error) { return v.pub, nil }
 // the `update` capability on transit/sign/<key> and that the token can be kept
 // alive (renewable, or non-expiring). Read access to the key is already proven
 // by the public-key fetch in NewVault.
-func (v *Vault) VerifyCanSign() error {
-	return v.verifyClientCanSign(v.client)
+func (v *Vault) VerifyCanSign(ctx context.Context) error {
+	return v.verifyClientCanSign(ctx, v.client)
 }
 
-func (v *Vault) verifyClientCanSign(client *vaultapi.Client) error {
+func (v *Vault) verifyClientCanSign(ctx context.Context, client *vaultapi.Client) error {
 	signPath := fmt.Sprintf("%s/sign/%s", v.mount, v.keyName)
-	caps, err := client.Sys().CapabilitiesSelf(signPath)
+	caps, err := client.Sys().CapabilitiesSelfWithContext(ctx, signPath)
 	if err != nil {
 		return fmt.Errorf("check token capabilities on %s: %w", signPath, err)
 	}
@@ -133,7 +155,7 @@ func (v *Vault) verifyClientCanSign(client *vaultapi.Client) error {
 		return fmt.Errorf("vault token lacks 'update' on %s (capabilities: %v) — it cannot sign", signPath, caps)
 	}
 
-	secret, err := client.Auth().Token().LookupSelf()
+	secret, err := client.Auth().Token().LookupSelfWithContext(ctx)
 	if err != nil {
 		return fmt.Errorf("look up vault token: %w", err)
 	}
@@ -142,7 +164,7 @@ func (v *Vault) verifyClientCanSign(client *vaultapi.Client) error {
 	if ttl > 0 && !renewable {
 		return fmt.Errorf("vault token has a finite TTL (%s) and is not renewable; cosmosigner cannot keep it alive — use a renewable or periodic token", ttl)
 	}
-	if err := v.verifySigningKeyWithClient(client); err != nil {
+	if err := v.verifySigningKeyWithClient(ctx, client); err != nil {
 		return fmt.Errorf("vault key %q version %d cannot sign: %w", v.keyName, v.keyVersion, err)
 	}
 	return nil
@@ -158,11 +180,12 @@ func hasCapability(caps []string, want string) bool {
 }
 
 func (v *Vault) Sign(signBytes []byte) ([]byte, error) {
-	return v.signWithClient(v.client, signBytes)
+	return v.signWithClient(context.Background(), v.client, signBytes)
 }
 
-func (v *Vault) signWithClient(client *vaultapi.Client, signBytes []byte) ([]byte, error) {
-	secret, err := client.Logical().Write(
+func (v *Vault) signWithClient(ctx context.Context, client *vaultapi.Client, signBytes []byte) ([]byte, error) {
+	secret, err := client.Logical().WriteWithContext(
+		ctx,
 		fmt.Sprintf("%s/sign/%s", v.mount, v.keyName),
 		map[string]any{
 			"input":       base64.StdEncoding.EncodeToString(signBytes),
@@ -183,11 +206,11 @@ func (v *Vault) signWithClient(client *vaultapi.Client, signBytes []byte) ([]byt
 }
 
 func (v *Vault) verifySigningKey() error {
-	return v.verifySigningKeyWithClient(v.client)
+	return v.verifySigningKeyWithClient(context.Background(), v.client)
 }
 
-func (v *Vault) verifySigningKeyWithClient(client *vaultapi.Client) error {
-	signature, err := v.signWithClient(client, vaultPreflightMessage)
+func (v *Vault) verifySigningKeyWithClient(ctx context.Context, client *vaultapi.Client) error {
+	signature, err := v.signWithClient(ctx, client, vaultPreflightMessage)
 	if err != nil {
 		return err
 	}
@@ -198,7 +221,25 @@ func (v *Vault) verifySigningKeyWithClient(client *vaultapi.Client) error {
 }
 
 func (v *Vault) Close() error {
+	v.renewMu.Lock()
+	v.closed = true
 	v.stopOnce.Do(func() { close(v.stopRenew) })
+	v.renewMu.Unlock()
+	return nil
+}
+
+// StartRenewal activates token renewal after startup has verified the key binding and preflight.
+func (v *Vault) StartRenewal() error {
+	v.renewMu.Lock()
+	defer v.renewMu.Unlock()
+	if v.closed {
+		return fmt.Errorf("vault backend is closed")
+	}
+	if v.started {
+		return nil
+	}
+	v.started = true
+	go v.renewLoop()
 	return nil
 }
 
@@ -320,7 +361,7 @@ func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
 				candidate, cloneErr := v.client.CloneWithHeaders()
 				if cloneErr == nil {
 					candidate.SetToken(token)
-					if verifyErr := v.verifyClientCanSign(candidate); verifyErr == nil {
+					if verifyErr := v.verifyClientCanSign(context.Background(), candidate); verifyErr == nil {
 						v.client.SetToken(token)
 						renewAt = time.Time{}
 					}

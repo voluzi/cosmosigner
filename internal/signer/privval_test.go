@@ -1,6 +1,7 @@
 package signer
 
 import (
+	"context"
 	"crypto/sha256"
 	"testing"
 	"time"
@@ -51,6 +52,9 @@ func (m *memStore) Get(chainID string) (*state.SignState, error) {
 		return nil, state.ErrNoState
 	}
 	return st, nil
+}
+func (m *memStore) EnsureClusterID(context.Context) (string, error) {
+	return "3b12f1df-5232-4804-897e-917bf397618a", nil
 }
 func (m *memStore) IsLeader() bool        { return true }
 func (m *memStore) LeaderCh() <-chan bool { return nil }

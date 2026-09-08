@@ -81,6 +81,7 @@ path "`+itMount+`/sign/*" { capabilities = ["update"] }`))
 	v, err := NewVault(VaultConfig{Address: addr, TokenFile: tokenFile, Mount: itMount, KeyName: "renewtest"})
 	require.NoError(t, err)
 	defer v.Close()
+	require.NoError(t, v.StartRenewal())
 
 	// Wait well past the original 4s TTL. Without renewal the token is dead.
 	time.Sleep(10 * time.Second)
@@ -107,7 +108,7 @@ path "`+itMount+`/keys/*" { capabilities = ["read"] }`))
 	v, err := NewVault(VaultConfig{Address: addr, TokenFile: writeToken(t, noSign.Auth.ClientToken), Mount: itMount, KeyName: "verifytest"})
 	require.NoError(t, err) // pubkey read works
 	defer v.Close()
-	err = v.VerifyCanSign()
+	err = v.VerifyCanSign(t.Context())
 	require.Error(t, err, "preflight must reject a token that cannot sign")
 	require.Contains(t, err.Error(), "sign")
 
@@ -123,5 +124,5 @@ path "`+itMount+`/sign/*" { capabilities = ["update"] }`))
 	v2, err := NewVault(VaultConfig{Address: addr, TokenFile: writeToken(t, canSign.Auth.ClientToken), Mount: itMount, KeyName: "verifytest"})
 	require.NoError(t, err)
 	defer v2.Close()
-	require.NoError(t, v2.VerifyCanSign())
+	require.NoError(t, v2.VerifyCanSign(t.Context()))
 }

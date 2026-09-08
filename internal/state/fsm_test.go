@@ -50,6 +50,11 @@ func commit(f *fsm, h int64, r int32, s int8, sb, sig []byte) applyResult {
 	return f.Apply(&raft.Log{Data: data}).(applyResult)
 }
 
+func initCluster(f *fsm, clusterID string) applyResult {
+	data, _ := json.Marshal(command{Op: opInitCluster, ClusterID: clusterID})
+	return f.Apply(&raft.Log{Data: data}).(applyResult)
+}
+
 type snapshotSink struct {
 	bytes.Buffer
 	closed   bool
@@ -161,6 +166,29 @@ func TestFSM_CommitMismatchRejected(t *testing.T) {
 	require.Error(t, res.err)
 }
 
+func TestFSM_InitClusterIsImmutable(t *testing.T) {
+	f := newFSM()
+	first := "3b12f1df-5232-4804-897e-917bf397618a"
+	second := "0f6f0173-538d-4f07-a85e-9c4af5523c4d"
+
+	res := initCluster(f, first)
+	require.NoError(t, res.err)
+	require.Equal(t, first, res.clusterID)
+	require.Equal(t, first, f.clusterIDValue())
+
+	res = initCluster(f, second)
+	require.NoError(t, res.err)
+	require.Equal(t, first, res.clusterID)
+	require.Equal(t, first, f.clusterIDValue())
+}
+
+func TestFSM_InitClusterRejectsInvalidID(t *testing.T) {
+	f := newFSM()
+	res := initCluster(f, "not-a-uuid")
+	require.Error(t, res.err)
+	require.Empty(t, f.clusterIDValue())
+}
+
 func TestFSM_RestoreRejectsInvalidSnapshotWithoutChangingState(t *testing.T) {
 	tests := []struct {
 		name string
@@ -201,6 +229,8 @@ func TestFSM_RestoreAcceptsEmptyObject(t *testing.T) {
 
 func TestFSM_SnapshotPersistRestoreRoundTrip(t *testing.T) {
 	f := newFSM()
+	clusterID := "3b12f1df-5232-4804-897e-917bf397618a"
+	require.NoError(t, initCluster(f, clusterID).err)
 	sb := voteSignBytes(100, 2, ts1, "A")
 	sig := []byte("signature")
 	require.NoError(t, reserve(f, 100, 2, StepPrecommit, sb, ts1).err)
@@ -217,7 +247,53 @@ func TestFSM_SnapshotPersistRestoreRoundTrip(t *testing.T) {
 	restored := newFSM()
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))))
 	require.Equal(t, want, restored.get(testChain))
+	require.Equal(t, clusterID, restored.clusterIDValue())
 
 	res := reserve(restored, 99, 0, StepPrecommit, voteSignBytes(99, 0, ts1, "B"), ts1)
 	require.ErrorIs(t, res.err, ErrRegression)
+}
+
+func TestFSM_RestoreLegacySnapshotPreservesMarksWithoutIdentity(t *testing.T) {
+	f := newFSM()
+	sb := voteSignBytes(100, 2, ts1, "A")
+	legacy, err := json.Marshal(map[string]*SignState{
+		testChain: {Height: 100, Round: 2, Step: StepPrecommit, SignBytes: sb, Timestamp: ts1},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(legacy))))
+	require.Empty(t, f.clusterIDValue())
+	require.Equal(t, int64(100), f.get(testChain).Height)
+}
+
+func TestFSM_RestoreRejectsInvalidVersionedSnapshotAtomically(t *testing.T) {
+	const existingID = "3b12f1df-5232-4804-897e-917bf397618a"
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "unknown version", data: []byte("cosmosigner-state-v2\n{}")},
+		{name: "missing cluster ID", data: []byte("cosmosigner-state-v1\n{\"state\":{}}")},
+		{name: "null cluster ID", data: []byte("cosmosigner-state-v1\n{\"cluster_id\":null,\"state\":{}}")},
+		{name: "invalid cluster ID", data: []byte("cosmosigner-state-v1\n{\"cluster_id\":\"bad\",\"state\":{}}")},
+		{name: "missing state", data: []byte("cosmosigner-state-v1\n{\"cluster_id\":\"\"}")},
+		{name: "null state", data: []byte("cosmosigner-state-v1\n{\"cluster_id\":\"\",\"state\":null}")},
+		{name: "null chain entry", data: []byte("cosmosigner-state-v1\n{\"cluster_id\":\"\",\"state\":{\"chain\":null}}")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFSM()
+			require.NoError(t, initCluster(f, existingID).err)
+			sb := voteSignBytes(100, 2, ts1, "A")
+			require.NoError(t, reserve(f, 100, 2, StepPrecommit, sb, ts1).err)
+			want := f.get(testChain)
+
+			err := f.Restore(io.NopCloser(bytes.NewReader(tt.data)))
+
+			require.Error(t, err)
+			require.Equal(t, existingID, f.clusterIDValue())
+			require.Equal(t, want, f.get(testChain))
+		})
+	}
 }

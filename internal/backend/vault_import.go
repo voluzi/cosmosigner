@@ -28,6 +28,15 @@ func VaultImportKey(cfg VaultConfig, pkcs8DER []byte) error {
 	if cfg.Mount == "" {
 		cfg.Mount = "transit"
 	}
+	var err error
+	cfg.Mount, err = normalizeVaultMount(cfg.Mount, "transit mount")
+	if err != nil {
+		return err
+	}
+	cfg.KeyName, err = normalizeVaultKeyName(cfg.KeyName)
+	if err != nil {
+		return err
+	}
 	client, err := NewVaultClient(cfg)
 	if err != nil {
 		return err

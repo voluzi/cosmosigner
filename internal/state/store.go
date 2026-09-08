@@ -6,6 +6,7 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -46,6 +47,9 @@ type ReserveResult struct {
 
 // StateStore is the linearizable double-sign gate.
 type StateStore interface {
+	// EnsureClusterID returns the immutable identity replicated with this signing history,
+	// initializing it through Raft when this cluster has none yet.
+	EnsureClusterID(ctx context.Context) (string, error)
 	// Reserve atomically checks (height,round,step) against the high-water-mark
 	// and advances it when valid. Returns ErrRegression / ErrConflict when the
 	// request would double-sign, and ErrNotLeader when this node can't gate.
@@ -60,6 +64,18 @@ type StateStore interface {
 	// LeaderCh signals leadership acquisition (true) and loss (false).
 	LeaderCh() <-chan bool
 	Close() error
+}
+
+// RaftMembership is a point-in-time summary of the configuration persisted by Raft.
+type RaftMembership struct {
+	Members int
+	Voters  int
+}
+
+// RaftMembershipReader is intentionally separate from StateStore so in-memory gates and signer
+// consumers do not need to implement an operational detail used only during Raft startup.
+type RaftMembershipReader interface {
+	RaftMembership(ctx context.Context) (RaftMembership, error)
 }
 
 var (

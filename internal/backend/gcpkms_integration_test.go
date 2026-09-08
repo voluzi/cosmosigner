@@ -62,5 +62,5 @@ func TestGCPKMS_VerifyCanSign(t *testing.T) {
 	require.NoError(t, err)
 	defer be.Close()
 
-	require.NoError(t, be.VerifyCanSign())
+	require.NoError(t, be.VerifyCanSign(t.Context()))
 }

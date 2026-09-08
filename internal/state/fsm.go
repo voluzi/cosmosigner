@@ -11,13 +11,16 @@ import (
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	gogoproto "github.com/cosmos/gogoproto/proto"
 	"github.com/hashicorp/raft"
+
+	"github.com/voluzi/cosmosigner/internal/clusterid"
 )
 
 type opType string
 
 const (
-	opReserve opType = "reserve"
-	opCommit  opType = "commit"
+	opReserve     opType = "reserve"
+	opCommit      opType = "commit"
+	opInitCluster opType = "init_cluster"
 )
 
 type command struct {
@@ -29,6 +32,7 @@ type command struct {
 	SignBytes []byte    `json:"sign_bytes,omitempty"`
 	Signature []byte    `json:"signature,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	ClusterID string    `json:"cluster_id,omitempty"`
 }
 
 // applyResult is returned from FSM.Apply via raft's ApplyFuture.Response().
@@ -38,13 +42,15 @@ type applyResult struct {
 	signBytes []byte
 	signature []byte
 	timestamp time.Time
+	clusterID string
 	err       error
 }
 
 // fsm is the replicated state machine holding the per-chain high-water-mark.
 type fsm struct {
-	mu    sync.RWMutex
-	state map[string]*SignState
+	mu        sync.RWMutex
+	clusterID string
+	state     map[string]*SignState
 }
 
 func newFSM() *fsm {
@@ -63,9 +69,21 @@ func (f *fsm) Apply(l *raft.Log) any {
 		return f.applyReserve(c)
 	case opCommit:
 		return f.applyCommit(c)
+	case opInitCluster:
+		return f.applyInitCluster(c)
 	default:
 		return applyResult{err: fmt.Errorf("unknown op %q", c.Op)}
 	}
+}
+
+func (f *fsm) applyInitCluster(c command) applyResult {
+	if err := clusterid.Validate(c.ClusterID); err != nil {
+		return applyResult{err: fmt.Errorf("invalid cluster ID: %w", err)}
+	}
+	if f.clusterID == "" {
+		f.clusterID = c.ClusterID
+	}
+	return applyResult{clusterID: f.clusterID}
 }
 
 // applyReserve enforces the double-sign invariant, mirroring cometbft FilePV:
@@ -135,6 +153,12 @@ func (f *fsm) get(chainID string) *SignState {
 	cp.SignBytes = append([]byte(nil), st.SignBytes...)
 	cp.Signature = append([]byte(nil), st.Signature...)
 	return &cp
+}
+
+func (f *fsm) clusterIDValue() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.clusterID
 }
 
 // compareHRS returns -1 if (h,r,s) regresses below cur, 0 if equal, +1 if it

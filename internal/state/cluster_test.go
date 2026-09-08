@@ -1,8 +1,10 @@
 package state
 
 import (
+	"context"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +27,79 @@ func freeAddrs(t *testing.T, n int) []string {
 		_ = ln.Close()
 	}
 	return addrs
+}
+
+func TestRaftCluster_ConcurrentInitializersConvergeAndSurviveFailover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-node raft test")
+	}
+	addrs := freeAddrs(t, 3)
+	ids := []string{"i0", "i1", "i2"}
+	members := []Member{{ids[0], addrs[0]}, {ids[1], addrs[1]}, {ids[2], addrs[2]}}
+	dir := t.TempDir()
+	stores := map[string]StateStore{
+		ids[0]: newNode(t, ids[0], addrs[0], filepath.Join(dir, ids[0]), true, members),
+		ids[1]: newNode(t, ids[1], addrs[1], filepath.Join(dir, ids[1]), false, nil),
+		ids[2]: newNode(t, ids[2], addrs[2], filepath.Join(dir, ids[2]), false, nil),
+	}
+	defer func() {
+		for _, store := range stores {
+			_ = store.Close()
+		}
+	}()
+	leaderID := waitLeader(t, stores)
+
+	results := make(chan string, len(stores))
+	errs := make(chan error, len(stores))
+	var wg sync.WaitGroup
+	for _, store := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			id, err := store.EnsureClusterID(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- id
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	var clusterID string
+	for id := range results {
+		if clusterID == "" {
+			clusterID = id
+		}
+		require.Equal(t, clusterID, id)
+	}
+	require.NotEmpty(t, clusterID)
+
+	require.NoError(t, stores[leaderID].Close())
+	delete(stores, leaderID)
+	newLeaderID := waitLeader(t, stores)
+	require.Equal(t, clusterID, mustEnsureClusterID(t, stores[newLeaderID]))
+}
+
+func TestRaftCluster_IndependentHistoriesReceiveDifferentIDs(t *testing.T) {
+	stores := make([]StateStore, 2)
+	for i := range stores {
+		store, err := NewRaftStore(RaftConfig{
+			NodeID: "node", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+			Bootstrap: true, SingleNode: true, Insecure: true,
+		}, hclog.NewNullLogger())
+		require.NoError(t, err)
+		stores[i] = store
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+	}
+	require.NotEqual(t, mustEnsureClusterID(t, stores[0]), mustEnsureClusterID(t, stores[1]))
 }
 
 func waitLeader(t *testing.T, stores map[string]StateStore) string {

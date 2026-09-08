@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/hashicorp/go-hclog"
@@ -25,6 +26,7 @@ import (
 
 // NewStartCmd builds the `start` command.
 func NewStartCmd() *cobra.Command {
+	var initializeOnly bool
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Run the remote signer",
@@ -37,7 +39,7 @@ func NewStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runStart(*cfg)
+			return runStartMode(*cfg, initializeOnly, cmd.OutOrStdout())
 		},
 	}
 
@@ -59,6 +61,7 @@ func NewStartCmd() *cobra.Command {
 	f.Bool("raft-single-node", d.Raft.SingleNode, "explicitly allow bootstrapping a single-node raft cluster with no --raft-member")
 	f.StringArray("raft-member", nil, "raft member as id=address — the full set INCLUDING self, identical on every node (repeatable)")
 	f.Bool("raft-insecure", d.Raft.Insecure, "explicitly allow unauthenticated plain TCP for the raft transport")
+	f.BoolVar(&initializeOnly, "initialize-only", false, "initialize or print the Raft cluster ID without signing; multi-member participants stay alive until signalled so quorum remains available")
 	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); required with --raft-tls-key and --raft-tls-ca unless --raft-insecure is set")
 	f.String("raft-tls-key", "", "raft mTLS private key (PEM)")
 	f.String("raft-tls-ca", "", "raft mTLS CA bundle (PEM) used to verify peer certificates")
@@ -134,12 +137,11 @@ func parseMembers(raw []string) ([]config.Member, error) {
 }
 
 func runStart(cfg config.Config) error {
-	logger := newCmtLogger(cfg.LogLevel)
-	raftLogger := hclog.New(&hclog.LoggerOptions{
-		Name:   "raft",
-		Level:  hclog.LevelFromString(cfg.LogLevel),
-		Output: os.Stderr,
-	})
+	return runStartMode(cfg, false, os.Stdout)
+}
+
+func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
+	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 
 	be, err := backend.New(cfg.Backend)
@@ -151,24 +153,46 @@ func runStart(cfg config.Config) error {
 		return err
 	}
 
-	// Fail fast if the backend can't actually sign (e.g. a Vault token missing
-	// the sign capability, or one that will expire and can't be renewed) rather
-	// than discovering it at the first vote.
-	if pf, ok := be.(interface{ VerifyCanSign() error }); ok {
-		if err := pf.VerifyCanSign(); err != nil {
-			return fmt.Errorf("backend preflight: %w", err)
-		}
-		logger.Info("backend preflight ok", "backend", cfg.Backend.Type)
-	}
-
-	// Intercept signals only from here on. Backend construction and preflight above take no context
-	// and do their own network I/O, so trapping signals earlier would swallow a SIGTERM that would
-	// otherwise terminate the process immediately — delaying shutdown by a backend request timeout.
-	// From this point every blocking step honours ctx: advertise-address resolution retries for up to
-	// 90s while the per-pod DNS record is published, and the serving loop runs until cancelled.
+	// Backend construction and public-key discovery above have context-free APIs. Intercepting signals
+	// only after them avoids swallowing SIGTERM while either call is blocked. All following startup
+	// operations and provider preflights receive the signal-aware context.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	return runStartWithContext(ctx, cfg, initializeOnly, out, be, logger, raftLogger)
+}
 
+func runStartModeContext(ctx context.Context, cfg config.Config, initializeOnly bool, out io.Writer) error {
+	logger, raftLogger := startLoggers(cfg.LogLevel)
+	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
+	be, err := backend.New(cfg.Backend)
+	if err != nil {
+		return err
+	}
+	defer be.Close()
+	if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
+		return err
+	}
+	return runStartWithContext(ctx, cfg, initializeOnly, out, be, logger, raftLogger)
+}
+
+func startLoggers(level string) (cmtlog.Logger, hclog.Logger) {
+	logger := newCmtLogger(level)
+	return logger, hclog.New(&hclog.LoggerOptions{
+		Name:   "raft",
+		Level:  hclog.LevelFromString(level),
+		Output: os.Stderr,
+	})
+}
+
+func runStartWithContext(
+	ctx context.Context,
+	cfg config.Config,
+	initializeOnly bool,
+	out io.Writer,
+	be backend.KeyBackend,
+	logger cmtlog.Logger,
+	raftLogger hclog.Logger,
+) error {
 	raftCfg := state.RaftConfig{
 		NodeID:     cfg.Raft.NodeID,
 		BindAddr:   cfg.Raft.BindAddr,
@@ -191,6 +215,34 @@ func runStart(cfg config.Config) error {
 		return err
 	}
 	defer store.Close()
+	clusterID, err := prepareStartup(ctx, be, store, initializeOnly)
+	if err != nil {
+		return err
+	}
+	if initializeOnly {
+		membershipReader, ok := store.(state.RaftMembershipReader)
+		if !ok {
+			return fmt.Errorf("Raft store does not expose persisted membership")
+		}
+		membership, err := membershipReader.RaftMembership(ctx)
+		if err != nil {
+			return fmt.Errorf("read persisted Raft membership: %w", err)
+		}
+		if membership.Voters == 0 {
+			return fmt.Errorf("persisted Raft membership has no voters")
+		}
+		if _, err := fmt.Fprintln(out, clusterID); err != nil {
+			return err
+		}
+		if membership.Voters > 1 {
+			<-ctx.Done()
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	logger.Info("backend preflight ok", "backend", cfg.Backend.Type, "cluster_id", clusterID)
 
 	pv, err := signer.New(be, store)
 	if err != nil {
@@ -218,13 +270,46 @@ func runStart(cfg config.Config) error {
 
 	logger.Info("cosmosigner starting",
 		"chain_id", cfg.ChainID, "nodes", nodes.Describe(), "backend", cfg.Backend.Type,
-		"raft_node", cfg.Raft.NodeID, "raft_mtls", raftCfg.TLS.Enabled())
+		"raft_node", cfg.Raft.NodeID, "raft_mtls", raftCfg.TLS.Enabled(), "cluster_id", clusterID)
 
 	if err := lc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	logger.Info("cosmosigner stopped")
 	return nil
+}
+
+const clusterIdentityTimeout = 30 * time.Second
+
+func prepareStartup(ctx context.Context, be backend.KeyBackend, store state.StateStore, initializeOnly bool) (string, error) {
+	identityCtx, cancel := context.WithTimeout(ctx, clusterIdentityTimeout)
+	defer cancel()
+	clusterID, err := store.EnsureClusterID(identityCtx)
+	if err != nil {
+		return "", fmt.Errorf("ensure Raft cluster ID: %w", err)
+	}
+	if initializeOnly {
+		return clusterID, nil
+	}
+	if err := backend.RequireClusterBinding(ctx, be, clusterID); err != nil {
+		return "", err
+	}
+	if preflight, ok := be.(interface {
+		VerifyCanSign(context.Context) error
+	}); ok {
+		if err := preflight.VerifyCanSign(ctx); err != nil {
+			return "", fmt.Errorf("backend preflight: %w", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if renewer, ok := be.(interface{ StartRenewal() error }); ok {
+		if err := renewer.StartRenewal(); err != nil {
+			return "", fmt.Errorf("start backend renewal: %w", err)
+		}
+	}
+	return clusterID, nil
 }
 
 func writeInsecureRaftWarning(w io.Writer, insecure bool) {
