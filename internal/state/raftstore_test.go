@@ -11,6 +11,71 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNewRaftStoreRequiresTransportSecurity(t *testing.T) {
+	_, err := NewRaftStore(RaftConfig{
+		NodeID:    "node-1",
+		BindAddr:  "127.0.0.1:0",
+		DataDir:   t.TempDir(),
+		Bootstrap: true,
+	}, hclog.NewNullLogger())
+	require.ErrorContains(t, err, "raft transport requires mTLS or explicit insecure opt-out")
+}
+
+func TestNewRaftStoreAllowsExplicitInsecureTransport(t *testing.T) {
+	store, err := NewRaftStore(RaftConfig{
+		NodeID:    "node-1",
+		BindAddr:  "127.0.0.1:0",
+		DataDir:   t.TempDir(),
+		Bootstrap: true,
+		Insecure:  true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+}
+
+func TestNewRaftStoreRejectsAmbiguousTransportSecurity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		insecure bool
+		tls      TLSConfig
+		want     string
+	}{
+		{
+			name: "partial TLS",
+			tls:  TLSConfig{CertFile: "/cert.pem"},
+			want: "raft transport configuration requires TLS certificate, key, and CA together",
+		},
+		{
+			name:     "partial TLS with insecure opt-out",
+			insecure: true,
+			tls:      TLSConfig{CertFile: "/cert.pem"},
+			want:     "raft transport configuration requires TLS certificate, key, and CA together",
+		},
+		{
+			name:     "TLS with insecure opt-out",
+			insecure: true,
+			tls: TLSConfig{
+				CertFile: "/cert.pem",
+				KeyFile:  "/key.pem",
+				CAFile:   "/ca.pem",
+			},
+			want: "raft transport configuration cannot enable both mTLS and insecure mode",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewRaftStore(RaftConfig{
+				NodeID:    "node-1",
+				BindAddr:  "127.0.0.1:0",
+				DataDir:   t.TempDir(),
+				Bootstrap: true,
+				Insecure:  tc.insecure,
+				TLS:       tc.tls,
+			}, hclog.NewNullLogger())
+			require.EqualError(t, err, tc.want)
+		})
+	}
+}
+
 // TestResolveAdvertiseSucceedsImmediately verifies the common path pays no retry delay.
 func TestResolveAdvertiseSucceedsImmediately(t *testing.T) {
 	start := time.Now()

@@ -53,6 +53,7 @@ func newHarness(t *testing.T, nodes int) *harness {
 		BindAddr:  freeAddr(t),
 		DataDir:   filepath.Join(dir, "raft"),
 		Bootstrap: true,
+		Insecure:  true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond, "raft did not elect a leader")

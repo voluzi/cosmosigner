@@ -63,6 +63,7 @@ func TestDiscovery_DynamicNodeSet(t *testing.T) {
 		BindAddr:  freeAddr(t),
 		DataDir:   filepath.Join(dir, "raft"),
 		Bootstrap: true,
+		Insecure:  true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -126,6 +127,7 @@ func TestDiscovery_NodeAppearsAfterDialTimeout(t *testing.T) {
 		BindAddr:  freeAddr(t),
 		DataDir:   filepath.Join(dir, "raft"),
 		Bootstrap: true,
+		Insecure:  true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -183,6 +185,7 @@ func TestDiscovery_NodeReplacedAtNewAddress(t *testing.T) {
 		BindAddr:  freeAddr(t),
 		DataDir:   filepath.Join(dir, "raft"),
 		Bootstrap: true,
+		Insecure:  true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()
@@ -240,6 +243,7 @@ func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
 		BindAddr:  freeAddr(t),
 		DataDir:   filepath.Join(dir, "raft"),
 		Bootstrap: true,
+		Insecure:  true,
 	}, hclog.NewNullLogger())
 	require.NoError(t, err)
 	defer store.Close()

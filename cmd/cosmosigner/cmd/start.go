@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -56,7 +57,8 @@ func NewStartCmd() *cobra.Command {
 	f.String("raft-data-dir", d.Raft.DataDir, "raft data directory")
 	f.Bool("raft-bootstrap", false, "seed a new raft cluster from --raft-member (set on one node, or all nodes identically)")
 	f.StringArray("raft-member", nil, "raft member as id=address — the full set INCLUDING self, identical on every node (repeatable)")
-	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); enables mutual TLS on the raft transport when set with --raft-tls-key and --raft-tls-ca")
+	f.Bool("raft-insecure", d.Raft.Insecure, "explicitly allow unauthenticated plain TCP for the raft transport")
+	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); required with --raft-tls-key and --raft-tls-ca unless --raft-insecure is set")
 	f.String("raft-tls-key", "", "raft mTLS private key (PEM)")
 	f.String("raft-tls-ca", "", "raft mTLS CA bundle (PEM) used to verify peer certificates")
 	registerBackendFlags(cmd)
@@ -103,6 +105,9 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 		}
 		c.Raft.Members = members
 	}
+	if f.Changed("raft-insecure") {
+		c.Raft.Insecure, _ = f.GetBool("raft-insecure")
+	}
 	s("raft-tls-cert", &c.Raft.TLSCert)
 	s("raft-tls-key", &c.Raft.TLSKey)
 	s("raft-tls-ca", &c.Raft.TLSCA)
@@ -131,6 +136,7 @@ func runStart(cfg config.Config) error {
 		Level:  hclog.LevelFromString(cfg.LogLevel),
 		Output: os.Stderr,
 	})
+	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
@@ -165,6 +171,7 @@ func runStart(cfg config.Config) error {
 		Advertise: cfg.Raft.Advertise,
 		DataDir:   cfg.Raft.DataDir,
 		Bootstrap: cfg.Raft.Bootstrap,
+		Insecure:  cfg.Raft.Insecure,
 		TLS: state.TLSConfig{
 			CertFile: cfg.Raft.TLSCert,
 			KeyFile:  cfg.Raft.TLSKey,
@@ -213,6 +220,12 @@ func runStart(cfg config.Config) error {
 	}
 	logger.Info("cosmosigner stopped")
 	return nil
+}
+
+func writeInsecureRaftWarning(w io.Writer, insecure bool) {
+	if insecure {
+		fmt.Fprintln(w, "WARNING: raft transport is insecure; configure mutual TLS for production")
+	}
 }
 
 func verifyExpectedPublicKey(be backend.KeyBackend, expected string) error {
