@@ -266,6 +266,63 @@ func TestFSM_RestoreLegacySnapshotPreservesMarksWithoutIdentity(t *testing.T) {
 	require.Equal(t, int64(100), f.get(testChain).Height)
 }
 
+func TestFSM_RestoreRejectsIdentityReplacementAtomically(t *testing.T) {
+	const (
+		existingID = "3b12f1df-5232-4804-897e-917bf397618a"
+		otherID    = "0f6f0173-538d-4f07-a85e-9c4af5523c4d"
+	)
+	replacement := map[string]*SignState{
+		testChain: {Height: 200, Round: 1, Step: StepPrecommit, Timestamp: ts2},
+	}
+	versioned := func(clusterID string) []byte {
+		payload, err := json.Marshal(snapshotState{ClusterID: clusterID, State: replacement})
+		require.NoError(t, err)
+		return append([]byte(snapshotMagic), payload...)
+	}
+	legacy, err := json.Marshal(replacement)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "different versioned identity", data: versioned(otherID)},
+		{name: "empty versioned identity", data: versioned("")},
+		{name: "legacy snapshot", data: legacy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFSM()
+			require.NoError(t, initCluster(f, existingID).err)
+			sb := voteSignBytes(100, 2, ts1, "A")
+			require.NoError(t, reserve(f, 100, 2, StepPrecommit, sb, ts1).err)
+			want := f.get(testChain)
+
+			err := f.Restore(io.NopCloser(bytes.NewReader(tc.data)))
+
+			require.Error(t, err)
+			require.Equal(t, existingID, f.clusterIDValue())
+			require.Equal(t, want, f.get(testChain))
+		})
+	}
+}
+
+func TestFSM_RestoreAcceptsMatchingInitializedIdentity(t *testing.T) {
+	const clusterID = "3b12f1df-5232-4804-897e-917bf397618a"
+	f := newFSM()
+	require.NoError(t, initCluster(f, clusterID).err)
+	payload, err := json.Marshal(snapshotState{
+		ClusterID: clusterID,
+		State: map[string]*SignState{
+			testChain: {Height: 200, Round: 1, Step: StepPrecommit, Timestamp: ts2},
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(append([]byte(snapshotMagic), payload...)))))
+	require.Equal(t, clusterID, f.clusterIDValue())
+	require.Equal(t, int64(200), f.get(testChain).Height)
+}
+
 func TestFSM_RestoreRejectsInvalidVersionedSnapshotAtomically(t *testing.T) {
 	const existingID = "3b12f1df-5232-4804-897e-917bf397618a"
 	tests := []struct {

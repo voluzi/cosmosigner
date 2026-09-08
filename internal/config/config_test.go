@@ -193,7 +193,7 @@ func TestValidateRejectsAmbiguousVaultAddressing(t *testing.T) {
 	cfg.Backend.Vault.TokenFile = "/token"
 	cfg.Backend.Vault.KeyName = "validator/name"
 
-	require.ErrorContains(t, cfg.Validate(), "ambiguous")
+	require.EqualError(t, cfg.Validate(), "vault key name \"validator/name\" contains an ambiguous path component")
 }
 
 func TestLoad_RejectsUnknownYAMLField(t *testing.T) {

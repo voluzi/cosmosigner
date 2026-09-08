@@ -228,7 +228,8 @@ version that is not `ENABLED` — fails fast at boot instead of at the first vot
   --gcp-key-version projects/my-project/locations/global/keyRings/validators/cryptoKeys/my-validator/cryptoKeyVersions/1
 
 # Initialize Raft while every signer is stopped, then serialize this administrative claim so only
-# one command can run. The claim identity needs cloudkms.cryptoKeys.get and .update.
+# one command can run. The claim identity needs cloudkms.cryptoKeys.get,
+# cloudkms.cryptoKeys.update, and cloudkms.cryptoKeyVersions.viewPublicKey.
 CLUSTER_ID=$(./bin/cosmosigner start \
   --chain-id my-chain --node 127.0.0.1:5555 \
   --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \

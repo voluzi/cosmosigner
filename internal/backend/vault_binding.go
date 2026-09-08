@@ -91,10 +91,18 @@ func (v *Vault) ClusterBinding(ctx context.Context) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%w: %s response has no metadata", ErrBindingCorrupt, v.bindingResource())
 	}
-	if destroyed, _ := metadata["destroyed"].(bool); destroyed {
+	destroyed, ok := metadata["destroyed"].(bool)
+	if !ok {
+		return "", fmt.Errorf("%w: %s response metadata has invalid destroyed field", ErrBindingCorrupt, v.bindingResource())
+	}
+	if destroyed {
 		return "", fmt.Errorf("%w: %s current version is destroyed", ErrBindingCorrupt, v.bindingResource())
 	}
-	if deletionTime, _ := metadata["deletion_time"].(string); deletionTime != "" {
+	deletionTime, ok := metadata["deletion_time"].(string)
+	if !ok {
+		return "", fmt.Errorf("%w: %s response metadata has invalid deletion_time field", ErrBindingCorrupt, v.bindingResource())
+	}
+	if deletionTime != "" {
 		return "", fmt.Errorf("%w: %s current version is deleted", ErrBindingCorrupt, v.bindingResource())
 	}
 	data, ok := secret.Data["data"].(map[string]any)

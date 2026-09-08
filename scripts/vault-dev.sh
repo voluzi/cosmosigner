@@ -17,6 +17,7 @@
 #   VAULT_PORT=8200
 #   VAULT_ROOT_TOKEN=root
 #   TRANSIT_MOUNT=transit
+#   BINDING_MOUNT=cosmosigner
 #   TOKEN_FILE=./vault-token
 set -euo pipefail
 
@@ -25,6 +26,7 @@ VAULT_IMAGE="${VAULT_IMAGE:-hashicorp/vault:1.15}"
 VAULT_PORT="${VAULT_PORT:-8200}"
 VAULT_ROOT_TOKEN="${VAULT_ROOT_TOKEN:-root}"
 TRANSIT_MOUNT="${TRANSIT_MOUNT:-transit}"
+BINDING_MOUNT="${BINDING_MOUNT:-cosmosigner}"
 TOKEN_FILE="${TOKEN_FILE:-./vault-token}"
 VAULT_ADDR_HOST="http://127.0.0.1:${VAULT_PORT}"
 
@@ -67,6 +69,9 @@ up() {
 
 	echo "==> enabling transit engine at '${TRANSIT_MOUNT}/'"
 	vexec secrets enable -path="${TRANSIT_MOUNT}" transit >/dev/null 2>&1 || echo "    (already enabled)"
+	echo "==> enabling KV v2 binding registry at '${BINDING_MOUNT}/'"
+	vexec secrets enable -path="${BINDING_MOUNT}" -version=2 kv >/dev/null 2>&1 || echo "    (already enabled)"
+	vexec write "${BINDING_MOUNT}/config" delete_version_after=0s >/dev/null
 
 	echo "==> writing 'cosmosigner' policy"
 	docker exec -i \
@@ -78,6 +83,9 @@ path "${TRANSIT_MOUNT}/keys/*"       { capabilities = ["create", "read", "update
 path "${TRANSIT_MOUNT}/wrapping_key" { capabilities = ["read"] }
 # sign — the only capability the running signer strictly needs
 path "${TRANSIT_MOUNT}/sign/*"       { capabilities = ["update"] }
+# DEV only: the same token is also the one-shot binding claim administrator.
+path "${BINDING_MOUNT}/data/cluster-bindings/*"     { capabilities = ["create", "read", "update"] }
+path "${BINDING_MOUNT}/metadata/cluster-bindings/*" { capabilities = ["read"] }
 POLICY
 
 	echo "==> issuing renewable token"
@@ -92,21 +100,35 @@ Vault is ready for cosmosigner (DEV — in-memory, do not use for real keys).
 
   VAULT_ADDR     ${VAULT_ADDR_HOST}
   transit mount  ${TRANSIT_MOUNT}/
+  binding mount  ${BINDING_MOUNT}/ (KV v2, automatic deletion disabled)
   token file     ${TOKEN_FILE}
 
 Next steps:
 
   # generate a NEW consensus key inside Vault
   cosmosigner provision --backend vault \\
-    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator
+    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
+    --vault-mount ${TRANSIT_MOUNT}
 
   # OR import an existing validator key (BYOK)
   cosmosigner import --backend vault --from priv_validator_key.json \\
-    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator
+    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
+    --vault-mount ${TRANSIT_MOUNT}
+
+  # initialize Raft without signing, then claim the Vault key for that history
+  CLUSTER_ID="\$(cosmosigner start --chain-id my-chain --node 127.0.0.1:5555 --backend vault \\
+    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
+    --vault-mount ${TRANSIT_MOUNT} --vault-binding-mount ${BINDING_MOUNT} \\
+    --raft-bootstrap --raft-single-node --raft-node-id n0 --raft-bind 127.0.0.1:7070 \\
+    --raft-insecure --initialize-only)"
+  cosmosigner claim-key --cluster-id "\${CLUSTER_ID}" --backend vault \\
+    --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
+    --vault-mount ${TRANSIT_MOUNT} --vault-binding-mount ${BINDING_MOUNT}
 
   # run the signer
   cosmosigner start --chain-id my-chain --node 127.0.0.1:5555 --backend vault \\
     --vault-addr ${VAULT_ADDR_HOST} --vault-token-file ${TOKEN_FILE} --vault-key my-validator \\
+    --vault-mount ${TRANSIT_MOUNT} --vault-binding-mount ${BINDING_MOUNT} \\
     --raft-bootstrap --raft-single-node --raft-node-id n0 --raft-bind 127.0.0.1:7070 --raft-insecure
 
 Tear down: scripts/vault-dev.sh down

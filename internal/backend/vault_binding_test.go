@@ -20,6 +20,7 @@ type vaultBindingServer struct {
 	lastPayload         map[string]any
 	privateKey          ed25519.PrivKey
 	failWriteAfterStore bool
+	responseMetadata    map[string]any
 }
 
 func (s *vaultBindingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +45,12 @@ func (s *vaultBindingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		metadata := map[string]any{"deletion_time": "", "destroyed": false}
+		if s.responseMetadata != nil {
+			metadata = make(map[string]any, len(s.responseMetadata))
+			for key, value := range s.responseMetadata {
+				metadata[key] = value
+			}
+		}
 		var data any = s.record
 		if s.tombstoned {
 			data = nil
@@ -178,5 +185,30 @@ func TestVaultBindingRejectsMalformedRecords(t *testing.T) {
 		v := newVaultBindingBackend(t, state)
 		_, err := v.ClusterBinding(t.Context())
 		require.ErrorIs(t, err, ErrBindingCorrupt)
+	}
+}
+
+func TestVaultBindingRejectsMissingOrWrongTypedVersionMetadata(t *testing.T) {
+	record := map[string]any{
+		"version": 1, "cluster_id": clusterA, "transit_mount": "team/transit", "key_name": "validator",
+	}
+	for _, tc := range []struct {
+		name     string
+		metadata map[string]any
+	}{
+		{name: "missing destroyed", metadata: map[string]any{"deletion_time": ""}},
+		{name: "wrong destroyed type", metadata: map[string]any{"destroyed": "false", "deletion_time": ""}},
+		{name: "missing deletion time", metadata: map[string]any{"destroyed": false}},
+		{name: "wrong deletion time type", metadata: map[string]any{"destroyed": false, "deletion_time": nil}},
+		{name: "destroyed", metadata: map[string]any{"destroyed": true, "deletion_time": ""}},
+		{name: "deleted", metadata: map[string]any{"destroyed": false, "deletion_time": "2026-09-08T00:00:00Z"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &vaultBindingServer{record: record, responseMetadata: tc.metadata}
+			v := newVaultBindingBackend(t, state)
+
+			_, err := v.ClusterBinding(t.Context())
+			require.ErrorIs(t, err, ErrBindingCorrupt)
+		})
 	}
 }

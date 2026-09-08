@@ -79,6 +79,12 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.clusterID != "" && clusterID != f.clusterID {
+		if clusterID == "" {
+			return errors.New("restore snapshot without cluster identity over initialized FSM")
+		}
+		return fmt.Errorf("restore snapshot cluster identity %q does not match initialized identity %q", clusterID, f.clusterID)
+	}
 	f.clusterID = clusterID
 	f.state = state
 	return nil
