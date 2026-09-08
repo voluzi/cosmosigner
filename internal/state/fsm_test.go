@@ -1,8 +1,10 @@
 package state
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"testing"
 	"time"
 
@@ -46,6 +48,24 @@ func reserve(f *fsm, h int64, r int32, s int8, sb []byte, ts time.Time) applyRes
 func commit(f *fsm, h int64, r int32, s int8, sb, sig []byte) applyResult {
 	data, _ := json.Marshal(command{Op: opCommit, ChainID: testChain, Height: h, Round: r, Step: s, SignBytes: sb, Signature: sig})
 	return f.Apply(&raft.Log{Data: data}).(applyResult)
+}
+
+type snapshotSink struct {
+	bytes.Buffer
+	closed   bool
+	canceled bool
+}
+
+func (s *snapshotSink) ID() string { return "test-snapshot" }
+
+func (s *snapshotSink) Close() error {
+	s.closed = true
+	return nil
+}
+
+func (s *snapshotSink) Cancel() error {
+	s.canceled = true
+	return nil
 }
 
 func TestFSM_FreshAdvanceProceeds(t *testing.T) {
@@ -141,23 +161,62 @@ func TestFSM_CommitMismatchRejected(t *testing.T) {
 	require.Error(t, res.err)
 }
 
-func TestFSM_SnapshotRestore(t *testing.T) {
+func TestFSM_RestoreRejectsInvalidSnapshotWithoutChangingState(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty", data: nil},
+		{name: "null", data: []byte("null")},
+		{name: "truncated", data: []byte(`{"test-chain-1":`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFSM()
+			sb := voteSignBytes(100, 2, ts1, "A")
+			sig := []byte("signature")
+			require.NoError(t, reserve(f, 100, 2, StepPrecommit, sb, ts1).err)
+			require.NoError(t, commit(f, 100, 2, StepPrecommit, sb, sig).err)
+			want := f.get(testChain)
+
+			err := f.Restore(io.NopCloser(bytes.NewReader(tt.data)))
+
+			require.Error(t, err)
+			require.Equal(t, want, f.get(testChain))
+		})
+	}
+}
+
+func TestFSM_RestoreAcceptsEmptyObject(t *testing.T) {
 	f := newFSM()
-	sb := voteSignBytes(100, 0, ts1, "A")
-	require.NoError(t, reserve(f, 100, 0, StepPrecommit, sb, ts1).err)
-	require.NoError(t, commit(f, 100, 0, StepPrecommit, sb, []byte("sig")).err)
+	require.NoError(t, reserve(f, 100, 0, StepPrecommit, voteSignBytes(100, 0, ts1, "A"), ts1).err)
 
-	data, err := json.Marshal(f.state)
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader([]byte("{}")))))
+
+	require.NotNil(t, f.state)
+	require.Empty(t, f.state)
+}
+
+func TestFSM_SnapshotPersistRestoreRoundTrip(t *testing.T) {
+	f := newFSM()
+	sb := voteSignBytes(100, 2, ts1, "A")
+	sig := []byte("signature")
+	require.NoError(t, reserve(f, 100, 2, StepPrecommit, sb, ts1).err)
+	require.NoError(t, commit(f, 100, 2, StepPrecommit, sb, sig).err)
+	want := f.get(testChain)
+
+	snapshot, err := f.Snapshot()
 	require.NoError(t, err)
+	sink := &snapshotSink{}
+	require.NoError(t, snapshot.Persist(sink))
+	require.True(t, sink.closed)
+	require.False(t, sink.canceled)
 
-	f2 := newFSM()
-	require.NoError(t, json.Unmarshal(data, &f2.state))
-	got := f2.get(testChain)
-	require.NotNil(t, got)
-	require.Equal(t, int64(100), got.Height)
-	require.Equal(t, sb, got.SignBytes)
+	restored := newFSM()
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))))
+	require.Equal(t, want, restored.get(testChain))
 
-	// After restore, a regression is still rejected.
-	res := reserve(f2, 99, 0, StepPrecommit, voteSignBytes(99, 0, ts1, "B"), ts1)
+	res := reserve(restored, 99, 0, StepPrecommit, voteSignBytes(99, 0, ts1, "B"), ts1)
 	require.ErrorIs(t, res.err, ErrRegression)
 }

@@ -2,6 +2,8 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 
 	"github.com/hashicorp/raft"
@@ -23,17 +25,18 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 	data, err := io.ReadAll(rc)
 	if err != nil {
-		return err
+		return fmt.Errorf("read snapshot: %w", err)
 	}
 	state := make(map[string]*SignState)
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &state); err != nil {
-			return err
-		}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("decode snapshot: %w", err)
+	}
+	if state == nil {
+		return errors.New("decode snapshot: state must be a JSON object")
 	}
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.state = state
-	f.mu.Unlock()
 	return nil
 }
 
