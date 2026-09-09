@@ -12,8 +12,6 @@ import (
 	"path/filepath"
 
 	"github.com/cometbft/cometbft/crypto"
-	cmtjson "github.com/cometbft/cometbft/libs/json"
-	"github.com/cometbft/cometbft/privval"
 
 	"github.com/voluzi/cosmosigner/internal/clusterid"
 )
@@ -21,9 +19,11 @@ import (
 // Software holds the consensus private key in process. It is the default
 // backend for local testing; production deployments should use Vault.
 type Software struct {
-	priv        crypto.PrivKey
-	bindingPath string
-	bindingOps  softwareBindingOps
+	priv           crypto.PrivKey
+	keyPath        string
+	bindingPath    string
+	bindingOps     softwareBindingOps
+	operationHooks softwareOperationHooks
 }
 
 type softwareBindingOps struct {
@@ -52,31 +52,18 @@ type softwareBindingRecord struct {
 
 // NewSoftware loads a priv_validator_key.json-compatible file.
 func NewSoftware(keyFile string) (*Software, error) {
-	if keyFile == "" {
-		return nil, fmt.Errorf("software backend requires a key file")
-	}
-	absPath, err := filepath.Abs(keyFile)
+	canonicalPath, err := resolveExistingSoftwareKeyPath(keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("resolve key file path: %w", err)
+		return nil, err
 	}
-	canonicalPath, err := filepath.EvalSymlinks(absPath)
+	priv, err := loadSoftwarePrivateKey(canonicalPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve key file %q: %w", keyFile, err)
-	}
-	data, err := os.ReadFile(canonicalPath)
-	if err != nil {
-		return nil, fmt.Errorf("read key file: %w", err)
-	}
-	var pvKey privval.FilePVKey
-	if err := cmtjson.Unmarshal(data, &pvKey); err != nil {
-		return nil, fmt.Errorf("parse key file %q: %w", keyFile, err)
-	}
-	if pvKey.PrivKey == nil {
-		return nil, fmt.Errorf("key file %q has no priv_key", keyFile)
+		return nil, err
 	}
 	return &Software{
-		priv:        pvKey.PrivKey,
-		bindingPath: canonicalPath + ".cosmosigner-cluster.json",
+		priv:        priv,
+		keyPath:     canonicalPath,
+		bindingPath: canonicalPath + softwareBindingSuffix,
 		bindingOps:  defaultSoftwareBindingOps(),
 	}, nil
 }
@@ -141,72 +128,79 @@ func (s *Software) ClaimCluster(ctx context.Context, id string) error {
 	if err := clusterid.Validate(id); err != nil {
 		return fmt.Errorf("invalid cluster ID: %w", err)
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	owner, err := s.ClusterBinding(ctx)
-	switch {
-	case err == nil:
-		return errors.Join(s.syncPublishedBinding(), requireClaimOwner(s.bindingPath, id, owner))
-	case !errors.Is(err, ErrBindingUnclaimed):
-		return err
-	}
-
-	pub, err := s.PubKey()
-	if err != nil {
-		return fmt.Errorf("read software key public key: %w", err)
-	}
-	data, err := json.Marshal(softwareBindingRecord{
-		Version: 1, ClusterID: id, PublicKey: base64.StdEncoding.EncodeToString(pub.Bytes()),
-	})
-	if err != nil {
-		return fmt.Errorf("encode software marker: %w", err)
-	}
-	data = append(data, '\n')
-
-	directory := filepath.Dir(s.bindingPath)
-	file, err := s.bindingOps.createTemp(directory, "."+filepath.Base(s.bindingPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temporary software marker in %q: %w", directory, err)
-	}
-	tempPath := file.Name()
-	fileClosed := false
-	defer func() {
-		if !fileClosed {
-			_ = file.Close()
+	return withSoftwareKeyLock(ctx, s.keyPath, s.operationHooks, func() error {
+		diskPriv, err := loadSoftwarePrivateKey(s.keyPath)
+		if err != nil {
+			return fmt.Errorf("%w: validate software key %q before claim: %v", ErrBindingCorrupt, s.keyPath, err)
 		}
-		_ = s.bindingOps.remove(tempPath)
-	}()
-	if _, err := io.Copy(file, bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("write temporary software marker %q: %w", tempPath, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := s.bindingOps.sync(file); err != nil {
-		return fmt.Errorf("sync temporary software marker %q: %w", tempPath, err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary software marker %q: %w", tempPath, err)
-	}
-	fileClosed = true
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := s.bindingOps.link(tempPath, s.bindingPath); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			cleanupErr := s.removeTemporaryBinding(tempPath)
-			owner, readErr := s.ClusterBinding(ctx)
-			if readErr != nil {
-				return errors.Join(cleanupErr, readErr)
+		if !diskPriv.Equals(s.priv) {
+			return fmt.Errorf("%w: software key %q changed after it was loaded", ErrBindingCorrupt, s.keyPath)
+		}
+
+		owner, err := s.ClusterBinding(ctx)
+		switch {
+		case err == nil:
+			return errors.Join(s.syncPublishedBinding(), requireClaimOwner(s.bindingPath, id, owner))
+		case !errors.Is(err, ErrBindingUnclaimed):
+			return err
+		}
+
+		pub, err := s.PubKey()
+		if err != nil {
+			return fmt.Errorf("read software key public key: %w", err)
+		}
+		data, err := json.Marshal(softwareBindingRecord{
+			Version: 1, ClusterID: id, PublicKey: base64.StdEncoding.EncodeToString(pub.Bytes()),
+		})
+		if err != nil {
+			return fmt.Errorf("encode software marker: %w", err)
+		}
+		data = append(data, '\n')
+
+		directory := filepath.Dir(s.bindingPath)
+		file, err := s.bindingOps.createTemp(directory, "."+filepath.Base(s.bindingPath)+".tmp-*")
+		if err != nil {
+			return fmt.Errorf("create temporary software marker in %q: %w", directory, err)
+		}
+		tempPath := file.Name()
+		fileClosed := false
+		defer func() {
+			if !fileClosed {
+				_ = file.Close()
 			}
-			return errors.Join(cleanupErr, s.syncPublishedBinding(), requireClaimOwner(s.bindingPath, id, owner))
+			_ = s.bindingOps.remove(tempPath)
+		}()
+		if _, err := io.Copy(file, bytes.NewReader(data)); err != nil {
+			return fmt.Errorf("write temporary software marker %q: %w", tempPath, err)
 		}
-		return fmt.Errorf("publish software marker %q: %w", s.bindingPath, err)
-	}
-	cleanupErr := s.removeTemporaryBinding(tempPath)
-	directoryErr := s.syncBindingDirectory()
-	return errors.Join(cleanupErr, directoryErr)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.bindingOps.sync(file); err != nil {
+			return fmt.Errorf("sync temporary software marker %q: %w", tempPath, err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("close temporary software marker %q: %w", tempPath, err)
+		}
+		fileClosed = true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.bindingOps.link(tempPath, s.bindingPath); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				cleanupErr := s.removeTemporaryBinding(tempPath)
+				owner, readErr := s.ClusterBinding(ctx)
+				if readErr != nil {
+					return errors.Join(cleanupErr, readErr)
+				}
+				return errors.Join(cleanupErr, s.syncPublishedBinding(), requireClaimOwner(s.bindingPath, id, owner))
+			}
+			return fmt.Errorf("publish software marker %q: %w", s.bindingPath, err)
+		}
+		cleanupErr := s.removeTemporaryBinding(tempPath)
+		directoryErr := s.syncBindingDirectory()
+		return errors.Join(cleanupErr, directoryErr)
+	})
 }
 
 func (s *Software) removeTemporaryBinding(path string) error {

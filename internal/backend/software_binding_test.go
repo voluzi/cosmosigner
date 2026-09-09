@@ -6,9 +6,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/privval"
@@ -52,33 +52,20 @@ func TestSoftwareBindingConcurrentClaimsChooseOneOwner(t *testing.T) {
 	keyFile := newSoftwareKeyFile(t, t.TempDir())
 	be, err := NewSoftware(keyFile)
 	require.NoError(t, err)
-	realLink := be.bindingOps.link
-	linkReady := make(chan struct{}, 2)
-	releaseLinks := make(chan struct{})
-	be.bindingOps.link = func(oldPath, newPath string) error {
-		linkReady <- struct{}{}
-		<-releaseLinks
-		return realLink(oldPath, newPath)
-	}
 
 	ids := []string{clusterA, clusterB}
 	errs := make([]error, len(ids))
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i, id := range ids {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-start
 			errs[i] = be.ClaimCluster(context.Background(), id)
 		}()
 	}
-	for range ids {
-		select {
-		case <-linkReady:
-		case <-time.After(2 * time.Second):
-			t.Fatal("claimant did not reach atomic publication")
-		}
-	}
-	close(releaseLinks)
+	close(start)
 	wg.Wait()
 
 	successes := 0
@@ -95,6 +82,37 @@ func TestSoftwareBindingConcurrentClaimsChooseOneOwner(t *testing.T) {
 	owner, err := be.ClusterBinding(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, winner, owner)
+}
+
+func TestSoftwareBindingClaimRejectsStaleLoadedKey(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := newSoftwareKeyFile(t, dir)
+	be, err := NewSoftware(keyFile)
+	require.NoError(t, err)
+
+	replacement := newSoftwareKeyFile(t, t.TempDir())
+	replacementData, err := os.ReadFile(replacement)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(keyFile, replacementData, 0o600))
+
+	err = be.ClaimCluster(t.Context(), clusterA)
+	require.ErrorContains(t, err, "changed")
+	require.NoFileExists(t, be.bindingPath)
+}
+
+func TestSoftwareBindingClaimRejectsMultiplyLinkedKey(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("software key locking and link-count checks are supported on Linux and macOS")
+	}
+	dir := t.TempDir()
+	keyFile := newSoftwareKeyFile(t, dir)
+	be, err := NewSoftware(keyFile)
+	require.NoError(t, err)
+	require.NoError(t, os.Link(keyFile, filepath.Join(dir, "key-alias.json")))
+
+	err = be.ClaimCluster(t.Context(), clusterA)
+	require.ErrorContains(t, err, "multiple hard links")
+	require.NoFileExists(t, be.bindingPath)
 }
 
 func TestSoftwareBindingRetryReestablishesDurabilityAfterDirectorySyncFailure(t *testing.T) {

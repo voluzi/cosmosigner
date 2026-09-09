@@ -3,14 +3,10 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	kms "cloud.google.com/go/kms/apiv1"
 	"cloud.google.com/go/kms/apiv1/kmspb"
-	"github.com/cometbft/cometbft/privval"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -67,7 +63,7 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 			}
 			switch be.Type {
 			case backend.TypeSoftware, "":
-				return provisionSoftware(be.SoftwareKeyFile, overwrite)
+				return provisionSoftware(cmd.Context(), be.SoftwareKeyFile, overwrite)
 			case backend.TypeVault:
 				return provisionVault(be.Vault)
 			case backend.TypeGCPKMS:
@@ -83,48 +79,13 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 	return cmd
 }
 
-func provisionSoftware(keyFile string, overwrite bool) error {
-	if keyFile == "" {
-		return fmt.Errorf("software backend requires --key-file")
-	}
-	if _, err := os.Stat(keyFile); err == nil {
-		if !overwrite {
-			return fmt.Errorf("%s already exists (use --overwrite)", keyFile)
-		}
-		if err := rejectClaimedSoftwareOverwrite(keyFile); err != nil {
-			return err
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(keyFile), 0o700); err != nil {
-		return fmt.Errorf("create key dir: %w", err)
-	}
-	pv := privval.GenFilePV(keyFile, "")
-	pv.Key.Save()
-
-	pub, err := pv.GetPubKey()
+func provisionSoftware(ctx context.Context, keyFile string, overwrite bool) error {
+	pub, err := backend.ProvisionSoftwareKey(ctx, keyFile, overwrite)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("wrote %s\n", keyFile)
 	printPubKey(pub.Address().String(), pub.Bytes())
-	return nil
-}
-
-func rejectClaimedSoftwareOverwrite(keyFile string) error {
-	absPath, err := filepath.Abs(keyFile)
-	if err != nil {
-		return fmt.Errorf("resolve software key path: %w", err)
-	}
-	canonicalPath, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		return fmt.Errorf("resolve software key %q: %w", keyFile, err)
-	}
-	markerPath := canonicalPath + ".cosmosigner-cluster.json"
-	if _, err := os.Lstat(markerPath); err == nil {
-		return fmt.Errorf("refusing to overwrite software key with binding marker %q", markerPath)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect software binding marker %q: %w", markerPath, err)
-	}
 	return nil
 }
 
