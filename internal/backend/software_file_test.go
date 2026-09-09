@@ -8,10 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cometbft/cometbft/crypto/ed25519"
+	cmtjson "github.com/cometbft/cometbft/libs/json"
+	"github.com/cometbft/cometbft/privval"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSoftwareClaimAndProvisionSerializeClaimFirst(t *testing.T) {
+	requireSoftwareFileSafetySupport(t)
 	keyFile := newSoftwareKeyFile(t, t.TempDir())
 	be, err := NewSoftware(keyFile)
 	require.NoError(t, err)
@@ -41,6 +45,7 @@ func TestSoftwareClaimAndProvisionSerializeClaimFirst(t *testing.T) {
 }
 
 func TestSoftwareClaimAndProvisionSerializeProvisionFirst(t *testing.T) {
+	requireSoftwareFileSafetySupport(t)
 	keyFile := newSoftwareKeyFile(t, t.TempDir())
 	be, err := NewSoftware(keyFile)
 	require.NoError(t, err)
@@ -69,9 +74,7 @@ func TestSoftwareClaimAndProvisionSerializeProvisionFirst(t *testing.T) {
 }
 
 func TestSoftwareLockWaitHonorsContextCancellation(t *testing.T) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skip("software key locking is supported on Linux and macOS")
-	}
+	requireSoftwareFileSafetySupport(t)
 	keyFile := newSoftwareKeyFile(t, t.TempDir())
 	be, err := NewSoftware(keyFile)
 	require.NoError(t, err)
@@ -89,9 +92,7 @@ func TestSoftwareLockWaitHonorsContextCancellation(t *testing.T) {
 }
 
 func TestNewSoftwareRejectsMultiplyLinkedKey(t *testing.T) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skip("software key link-count checks are supported on Linux and macOS")
-	}
+	requireSoftwareFileSafetySupport(t)
 	dir := t.TempDir()
 	keyFile := newSoftwareKeyFile(t, dir)
 	alias := filepath.Join(dir, "key-alias.json")
@@ -99,6 +100,22 @@ func TestNewSoftwareRejectsMultiplyLinkedKey(t *testing.T) {
 
 	_, err := NewSoftware(alias)
 	require.ErrorContains(t, err, "multiple hard links")
+}
+
+func TestNewSoftwareRejectsMismatchedDeclaredPublicKey(t *testing.T) {
+	requireSoftwareFileSafetySupport(t)
+	keyFile := newSoftwareKeyFile(t, t.TempDir())
+	data, err := os.ReadFile(keyFile)
+	require.NoError(t, err)
+	var pvKey privval.FilePVKey
+	require.NoError(t, cmtjson.Unmarshal(data, &pvKey))
+	pvKey.PubKey = ed25519.GenPrivKey().PubKey()
+	data, err = cmtjson.MarshalIndent(pvKey, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(keyFile, data, 0o600))
+
+	_, err = NewSoftware(keyFile)
+	require.ErrorContains(t, err, "pub_key does not match priv_key")
 }
 
 func TestProvisionSoftwareKeyRejectsDanglingLeafSymlink(t *testing.T) {
@@ -119,5 +136,12 @@ func requireStillWaiting(t *testing.T, result <-chan error) {
 	case err := <-result:
 		t.Fatalf("operation returned before the key lock was released: %v", err)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func requireSoftwareFileSafetySupport(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("software key locking and link-count checks are supported on Linux and macOS")
 	}
 }

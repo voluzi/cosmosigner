@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -86,6 +87,9 @@ func loadSoftwarePrivateKey(canonicalPath string) (crypto.PrivKey, error) {
 	}
 	if pvKey.PrivKey == nil {
 		return nil, fmt.Errorf("key file %q has no priv_key", canonicalPath)
+	}
+	if pvKey.PubKey != nil && !bytes.Equal(pvKey.PrivKey.PubKey().Bytes(), pvKey.PubKey.Bytes()) {
+		return nil, fmt.Errorf("key file %q is corrupt: pub_key does not match priv_key", canonicalPath)
 	}
 	return pvKey.PrivKey, nil
 }
