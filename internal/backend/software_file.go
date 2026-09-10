@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/cometbft/cometbft/crypto"
+	"github.com/cometbft/cometbft/crypto/ed25519"
+	"github.com/cometbft/cometbft/crypto/secp256k1"
 	cmtjson "github.com/cometbft/cometbft/libs/json"
 	"github.com/cometbft/cometbft/privval"
 )
@@ -88,10 +90,38 @@ func loadSoftwarePrivateKey(canonicalPath string) (crypto.PrivKey, error) {
 	if pvKey.PrivKey == nil {
 		return nil, fmt.Errorf("key file %q has no priv_key", canonicalPath)
 	}
-	if pvKey.PubKey != nil && !bytes.Equal(pvKey.PrivKey.PubKey().Bytes(), pvKey.PubKey.Bytes()) {
+	derivedPublicKey, err := deriveSoftwarePublicKey(canonicalPath, pvKey.PrivKey)
+	if err != nil {
+		return nil, err
+	}
+	if pvKey.PubKey != nil && !bytes.Equal(derivedPublicKey.Bytes(), pvKey.PubKey.Bytes()) {
 		return nil, fmt.Errorf("key file %q is corrupt: pub_key does not match priv_key", canonicalPath)
 	}
 	return pvKey.PrivKey, nil
+}
+
+func deriveSoftwarePublicKey(path string, privateKey crypto.PrivKey) (publicKey crypto.PubKey, err error) {
+	switch key := privateKey.(type) {
+	case ed25519.PrivKey:
+		if len(key) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("key file %q is corrupt: ed25519 private key size %d, want %d", path, len(key), ed25519.PrivateKeySize)
+		}
+	case secp256k1.PrivKey:
+		if len(key) != secp256k1.PrivKeySize {
+			return nil, fmt.Errorf("key file %q is corrupt: secp256k1 private key size %d, want %d", path, len(key), secp256k1.PrivKeySize)
+		}
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("key file %q is corrupt: invalid key material: %v", path, recovered)
+		}
+	}()
+	publicKey = privateKey.PubKey()
+	if publicKey == nil {
+		return nil, fmt.Errorf("key file %q is corrupt: private key returned no public key", path)
+	}
+	return publicKey, nil
 }
 
 func validateSoftwareKeyFile(file *os.File, path string) error {
