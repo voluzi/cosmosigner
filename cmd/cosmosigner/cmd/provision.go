@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	kms "cloud.google.com/go/kms/apiv1"
 	"cloud.google.com/go/kms/apiv1/kmspb"
-	"github.com/cometbft/cometbft/privval"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -66,7 +63,7 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 			}
 			switch be.Type {
 			case backend.TypeSoftware, "":
-				return provisionSoftware(be.SoftwareKeyFile, overwrite)
+				return provisionSoftware(cmd.Context(), be.SoftwareKeyFile, overwrite)
 			case backend.TypeVault:
 				return provisionVault(be.Vault)
 			case backend.TypeGCPKMS:
@@ -82,20 +79,8 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 	return cmd
 }
 
-func provisionSoftware(keyFile string, overwrite bool) error {
-	if keyFile == "" {
-		return fmt.Errorf("software backend requires --key-file")
-	}
-	if _, err := os.Stat(keyFile); err == nil && !overwrite {
-		return fmt.Errorf("%s already exists (use --overwrite)", keyFile)
-	}
-	if err := os.MkdirAll(filepath.Dir(keyFile), 0o700); err != nil {
-		return fmt.Errorf("create key dir: %w", err)
-	}
-	pv := privval.GenFilePV(keyFile, "")
-	pv.Key.Save()
-
-	pub, err := pv.GetPubKey()
+func provisionSoftware(ctx context.Context, keyFile string, overwrite bool) error {
+	pub, err := backend.ProvisionSoftwareKey(ctx, keyFile, overwrite)
 	if err != nil {
 		return err
 	}

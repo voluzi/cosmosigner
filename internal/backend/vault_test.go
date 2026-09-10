@@ -1,12 +1,14 @@
 package backend
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -134,7 +136,108 @@ func TestVaultVerifyCanSignRejectsPublicOnlyKey(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, v.Close()) }()
 
-	require.ErrorContains(t, v.VerifyCanSign(), "cannot sign")
+	require.ErrorContains(t, v.VerifyCanSign(t.Context()), "cannot sign")
+}
+
+func TestVaultVerifyCanSignStopsBlockedRequestOnCancellation(t *testing.T) {
+	publicKey := ed25519.GenPrivKey().PubKey().Bytes()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/transit/keys/validator":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"type": "ed25519", "latest_version": 1,
+				"keys": map[string]any{"1": map[string]any{"public_key": base64.StdEncoding.EncodeToString(publicKey)}},
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			close(started)
+			<-release
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	v, err := NewVault(VaultConfig{
+		Address: server.URL, TokenFile: writeVaultToken(t), Mount: "transit", KeyName: "validator", KeyVersion: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- v.VerifyCanSign(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Vault capabilities request did not start")
+	}
+	cancel()
+	var preflightErr error
+	select {
+	case err := <-result:
+		preflightErr = err
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("Vault preflight did not stop after cancellation")
+	}
+	close(release)
+	require.ErrorIs(t, preflightErr, context.Canceled)
+}
+
+func TestVaultRenewalRequiresExplicitActivation(t *testing.T) {
+	privateKey := ed25519.GenPrivKey()
+	var lookupCalls atomic.Int32
+	var signCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/transit/keys/validator":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"type": "ed25519", "latest_version": 1,
+				"keys": map[string]any{"1": map[string]any{"public_key": base64.StdEncoding.EncodeToString(privateKey.PubKey().Bytes())}},
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"capabilities": []string{"update"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
+			lookupCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 0, "renewable": false}})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/transit/sign/validator":
+			signCalls.Add(1)
+			var request map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			input, err := base64.StdEncoding.DecodeString(request["input"].(string))
+			require.NoError(t, err)
+			signature, err := privateKey.Sign(input)
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signature),
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("initial-token"), 0o600))
+	v, err := NewVault(VaultConfig{Address: server.URL, TokenFile: tokenFile, Mount: "transit", KeyName: "validator"})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+	require.NoError(t, os.WriteFile(tokenFile, []byte("replacement-token"), 0o600))
+
+	time.Sleep(50 * time.Millisecond)
+	require.Zero(t, lookupCalls.Load())
+	require.Zero(t, signCalls.Load(), "constructor and token replacement must not sign before binding")
+	require.NoError(t, v.StartRenewal())
+	require.Eventually(t, func() bool { return signCalls.Load() == 1 }, 2*time.Second, 10*time.Millisecond)
+	require.NoError(t, v.StartRenewal(), "activation must be idempotent")
+}
+
+func TestVaultRenewalCannotStartAfterClose(t *testing.T) {
+	v := &Vault{stopRenew: make(chan struct{})}
+	require.NoError(t, v.Close())
+	require.Error(t, v.StartRenewal())
 }
 
 func TestVaultRenewLoopReloadsChangedTokenFile(t *testing.T) {

@@ -44,11 +44,12 @@ docker pull ghcr.io/voluzi/cosmosigner:latest
   the Vault Transit engine or Google Cloud KMS (`EC_SIGN_ED25519`, PureEdDSA) and
   never leaves it — only signatures cross the wire. A `software` backend is
   provided for local testing.
-- **Partition-safe double-sign protection.** Every signature must pass through a
+- **Partition-safe double-sign protection within one signing history.** Every signature must pass through a
   raft-committed high-water-mark (height/round/step). A signer that loses raft
   quorum (e.g. a network partition) **cannot** advance the mark and therefore
   cannot sign — it fails closed (downtime) instead of risking a double-sign.
-  This is the lesson lease-based leader election gets wrong.
+  This is the lesson lease-based leader election gets wrong. A persistent key-resource claim also
+  prevents a newly bootstrapped, independent Raft history from starting with an already-claimed key.
 - **Point at any/many nodes, with auto-discovery.** Like horcrux, cosmosigner
   dials a set of node privval endpoints that share one consensus identity —
   either a static list (`--node`) or a Kubernetes headless service it resolves
@@ -62,15 +63,20 @@ docker pull ghcr.io/voluzi/cosmosigner:latest
 Two orthogonal, pluggable interfaces:
 
 - **`KeyBackend`** — *who signs.* `software`, `vault`, and `gcpkms` today; AWS
-  KMS / HSM later. A pure signing oracle: no ordering logic.
+  KMS / HSM later. It remains a signing oracle with no ordering logic, but also exposes the durable
+  cluster claim attached to that particular key resource.
 - **`StateStore`** — *who decides a height may be signed.* Embedded
-  hashicorp/raft today; the gate is decoupled from the key backend so adding a
-  key service (which has no consistent-counter primitive) never reopens the
-  double-sign question.
+  hashicorp/raft today. Consensus ordering stays backend-independent; the startup
+  claim prevents a different Raft history from accidentally selecting the same key resource.
 
 Only the raft **leader** holds the node connections and serves signatures. Each
 signature follows a strict **reserve → sign → commit** order: the mark is
 raft-committed *before* the key backend produces a signature.
+
+Before any startup signing probe or node connection, Cosmosigner initializes or loads an immutable
+UUID from the Raft log and requires the selected key resource to carry that exact UUID. This is a
+startup guardrail, not live fencing: it cannot stop an already-running old binary, detect a complete
+copy of the accepted Raft history, or detect the same key material copied into a different resource.
 
 The node dials nothing — it `priv_validator_laddr`-listens, and cosmosigner
 dials it over CometBFT's encrypted SecretConnection (CometBFT v0.37.x).
@@ -82,6 +88,15 @@ make build
 
 # generate a consensus key
 ./bin/cosmosigner provision --backend software --key-file ./data/priv_validator_key.json
+
+# initialize the Raft history without signing, then claim this key resource
+CLUSTER_ID=$(./bin/cosmosigner start \
+  --chain-id my-chain --node 127.0.0.1:5555 \
+  --backend software --key-file ./data/priv_validator_key.json \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure --initialize-only)
+./bin/cosmosigner claim-key --cluster-id "$CLUSTER_ID" \
+  --backend software --key-file ./data/priv_validator_key.json
 
 # run a single-node signer against a local node that has
 # priv_validator_laddr = "tcp://0.0.0.0:5555"
@@ -97,6 +112,11 @@ make build
 ## Vault backend
 
 ```sh
+# One-time administrative setup for the immutable binding registry. Keep automatic version
+# expiry disabled: deleting the only claim version would remove the startup guardrail.
+vault secrets enable -path=cosmosigner -version=2 kv
+vault write cosmosigner/config delete_version_after=0s
+
 # create a non-exportable ed25519 transit key
 ./bin/cosmosigner provision --backend vault \
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
@@ -112,10 +132,25 @@ make build
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
   --vault-key my-validator --vault-key-version 1
 
+# With the full signer cluster stopped, run start --initialize-only on the Raft history, then use an
+# administrative token to create the immutable KV v2 claim. For one replica:
+CLUSTER_ID=$(./bin/cosmosigner start \
+  --chain-id my-chain --node 127.0.0.1:5555 \
+  --backend vault --vault-addr https://vault:8200 --vault-token-file /vault/runtime-token \
+  --vault-mount transit --vault-binding-mount cosmosigner \
+  --vault-key my-validator --vault-key-version 1 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure --initialize-only)
+./bin/cosmosigner claim-key --cluster-id "$CLUSTER_ID" \
+  --backend vault --vault-addr https://vault:8200 --vault-token-file /vault/admin-token \
+  --vault-mount transit --vault-binding-mount cosmosigner \
+  --vault-key my-validator --vault-key-version 1
+
 ./bin/cosmosigner start \
   --chain-id my-chain --node 127.0.0.1:5555 \
   --backend vault \
   --vault-addr https://vault:8200 --vault-token-file /vault/token \
+  --vault-binding-mount cosmosigner \
   --vault-key my-validator --vault-key-version 1 \
   --expected-public-key '<base64 pubkey from cosmosigner pubkey>' \
   --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
@@ -131,6 +166,34 @@ renewal at half the current TTL. A separate token-renewer sidecar is not needed.
 Tokens with a finite TTL that cannot be renewed are rejected by the startup
 preflight.
 
+The binding registry must be a KV v2 mount (default `cosmosigner`) with automatic expiry disabled.
+Do not reuse a generic secret mount whose lifecycle policy can expire or prune this record. The
+running signer needs read-only claim access; do not grant it KV writes or Transit administration:
+
+```hcl
+# Runtime signer policy.
+path "transit/keys/my-validator" { capabilities = ["read"] }
+path "transit/sign/my-validator" { capabilities = ["update"] }
+path "cosmosigner/data/cluster-bindings/*" { capabilities = ["read"] }
+path "cosmosigner/metadata/cluster-bindings/*" { capabilities = ["read"] }
+```
+
+Use a separate administrative identity for the one-shot create-only claim. It needs the runtime
+reads plus `create` and `update` on the data path because Vault enforces CAS-zero during creation:
+
+```hcl
+# One-shot claim administrator policy; do not attach this to the running signer.
+path "transit/keys/my-validator" { capabilities = ["read"] }
+path "cosmosigner/data/cluster-bindings/*" { capabilities = ["create", "update", "read"] }
+path "cosmosigner/metadata/cluster-bindings/*" { capabilities = ["read"] }
+```
+
+Do not set a nonzero `delete_version_after`, configure record expiry, or automate deletion of
+binding versions/metadata after setup. The explicit `delete_version_after=0s` above keeps
+time-based expiry disabled.
+
+Changing `vault-binding-mount` selects a different registry and therefore a different trust domain.
+
 Pin `vault-key-version` for production validators. Version `0` selects Vault's
 latest version once at startup and pins signing to that version for the life of
 the process, but an explicit version also preserves the intended identity
@@ -145,8 +208,8 @@ The key never leaves KMS. Auth uses Application Default Credentials (GKE workloa
 identity, or `GOOGLE_APPLICATION_CREDENTIALS`); `--gcp-credentials-file` is an
 optional override.
 
-The identity needs `roles/cloudkms.signerVerifier` on the key (verify _and_
-sign). `start` runs a preflight that signs a non-consensus probe and verifies it
+The runtime identity needs `roles/cloudkms.signerVerifier` plus
+`cloudkms.cryptoKeys.get` on the parent key. `start` runs a preflight that signs a non-consensus probe and verifies it
 against the key's public key, so a policy granting only `viewer` — or a key
 version that is not `ENABLED` — fails fast at boot instead of at the first vote.
 
@@ -164,6 +227,18 @@ version that is not `ENABLED` — fails fast at boot instead of at the first vot
 ./bin/cosmosigner pubkey --backend gcpkms \
   --gcp-key-version projects/my-project/locations/global/keyRings/validators/cryptoKeys/my-validator/cryptoKeyVersions/1
 
+# Initialize Raft while every signer is stopped, then serialize this administrative claim so only
+# one command can run. The claim identity needs cloudkms.cryptoKeys.get,
+# cloudkms.cryptoKeys.update, and cloudkms.cryptoKeyVersions.viewPublicKey.
+CLUSTER_ID=$(./bin/cosmosigner start \
+  --chain-id my-chain --node 127.0.0.1:5555 \
+  --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \
+  --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
+  --raft-insecure --initialize-only)
+./bin/cosmosigner claim-key --cluster-id "$CLUSTER_ID" \
+  --backend gcpkms --gcp-key-version projects/.../cryptoKeyVersions/1 \
+  --gcp-credentials-file /secure/admin-credentials.json
+
 # run the signer
 ./bin/cosmosigner start \
   --chain-id my-chain --node 127.0.0.1:5555 \
@@ -172,6 +247,11 @@ version that is not `ENABLED` — fails fast at boot instead of at the first vot
   --raft-bootstrap --raft-single-node --raft-node-id node-1 --raft-bind 127.0.0.1:7070 \
   --raft-insecure
 ```
+
+Cloud KMS has no conditional update field for CryptoKey labels. Initial GCP claiming is therefore
+not atomic: stop all signers and externally serialize the claim command. Cosmosigner preserves
+unrelated labels, changes only `cosmosigner-cluster-id`, and reads it back, but concurrent initial
+claim commands can both appear successful. Normal `start` is read-only for labels and never claims.
 
 End-to-end sign+verify test against a real key (no node needed):
 
@@ -236,14 +316,17 @@ start without it and the leader pulls them in. (A node started with
 which catches the usual split-brain misconfiguration.)
 
 ```sh
-# node 0 (the one bootstrapper)
-cosmosigner start ... --raft-node-id n0 --raft-bind 0.0.0.0:7070 --raft-bootstrap \
+# Start all three in --initialize-only mode together; quorum is required. Node 0 is the bootstrapper.
+cosmosigner start ... --initialize-only --raft-node-id n0 --raft-bind 0.0.0.0:7070 --raft-bootstrap \
   --raft-tls-cert /tls/raft-cert.pem --raft-tls-key /tls/raft-key.pem \
   --raft-tls-ca /tls/raft-ca.pem \
   --raft-member n0=cs-0.cs.ns.svc:7070 \
   --raft-member n1=cs-1.cs.ns.svc:7070 \
   --raft-member n2=cs-2.cs.ns.svc:7070
-# nodes 1 and 2: same flags but WITHOUT --raft-bootstrap
+# nodes 1 and 2: same initialization command but WITHOUT --raft-bootstrap
+# All print the same cluster ID and remain alive to preserve quorum. Record that ID, then stop all
+# participants together, claim the key once, and restart all without --initialize-only. A lone
+# replica cannot initialize a three-voter cluster.
 ```
 
 In a StatefulSet this is one templated arg set plus a per-ordinal
@@ -251,8 +334,12 @@ In a StatefulSet this is one templated arg set plus a per-ordinal
 signer uses `--raft-bootstrap --raft-single-node --raft-insecure` with no
 `--raft-member`. Bootstrapping with an empty member list requires the explicit
 `--raft-single-node` opt-in (YAML `raft.single_node: true` or
-`COSMOSIGNER_RAFT_SINGLE_NODE=true`). It defaults to false. Existing single-node
-invocations must add this opt-in as part of the same upgrade, even when their
+`COSMOSIGNER_RAFT_SINGLE_NODE=true`). It defaults to false. Single-node initialization exits after
+printing, so command substitution remains suitable for that mode.
+Multi-member `--initialize-only` processes intentionally stay running after printing until they
+receive SIGINT or SIGTERM; otherwise early replicas can remove the quorum before slower members
+learn the identity. Existing single-node invocations must add this opt-in as part of the same
+upgrade, even when their
 Raft state already exists. The previous release rejects the new CLI flag and
 YAML key, so only the environment variable form can be added ahead of time.
 Replicated signers must provide their full initial member list;
@@ -263,6 +350,24 @@ At startup, the Raft log records the node ID, bind and advertise addresses,
 configured member list, single-node opt-in, bootstrap request, whether existing
 state was found, and whether bootstrap will run. Existing state is reused;
 bootstrap only runs on an empty store.
+
+The immutable cluster ID is stored in that same log and in versioned snapshots beside the signing
+high-water marks. A fresh data directory receives a different ID and refuses an already-claimed key.
+Legacy snapshots retain every mark and receive an ID through the ordered Raft initializer.
+
+### Upgrade and recovery requirement
+
+This format and claim check require a full stopped-cluster upgrade; mixed old/new replicas and
+downgrade are unsupported. Stop every old signer and disable restarts, preserve the complete
+authoritative Raft directories, revoke old remote credentials where applicable, install the new
+binary everywhere, run `start --initialize-only` with the existing directories and a quorum, claim
+the key once under administrative credentials, then grant runtime claim-read permission and restart
+normally. Verify that a fresh independent data directory refuses the claimed key.
+
+Moving a validator transfers the complete current Raft history and its identity only after the old
+deployment is operationally fenced. Never copy only the UUID, use a stale snapshot, clear the
+high-water mark, or delete/relabel a claim after losing all authoritative state. Recover the correct
+history or use an independently safe validator key-rotation/recovery procedure.
 
 Because raft is **CP**, a node in a minority partition cannot commit the
 high-water-mark and therefore cannot sign — it fails closed (downtime) rather
@@ -318,6 +423,8 @@ export COSMOSIGNER_CHAIN_ID=my-chain
 export COSMOSIGNER_NODE_SERVICE=sentries.my-ns.svc.cluster.local:5555
 export COSMOSIGNER_BACKEND=gcpkms
 export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
+# Vault deployments can select the KV v2 claim registry:
+# export COSMOSIGNER_VAULT_BINDING_MOUNT=cosmosigner
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
@@ -346,6 +453,7 @@ backend:
   vault:
     address: https://vault:8200
     token_file: /vault/token
+    binding_mount: cosmosigner
     key_name: my-validator
     key_version: 1
 raft:

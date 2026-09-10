@@ -18,6 +18,7 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, 3*time.Second, d.TimeoutReadWrite)
 	require.Equal(t, backend.TypeSoftware, d.Backend.Type)
 	require.Equal(t, "transit", d.Backend.Vault.Mount)
+	require.Equal(t, "cosmosigner", d.Backend.Vault.BindingMount)
 	require.Equal(t, "node-1", d.Raft.NodeID)
 	require.Equal(t, "127.0.0.1:7070", d.Raft.BindAddr)
 	require.False(t, d.Raft.Insecure)
@@ -173,12 +174,26 @@ func TestLoad_EnvBackendAndSlices(t *testing.T) {
 func TestLoad_VaultKeyVersionFromYAML(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "c.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(
-		"chain_id: c\nnodes: [a:5555]\nexpected_public_key: cHVia2V5\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_version: 4\nraft:\n  insecure: true\n"), 0o600))
+		"chain_id: c\nnodes: [a:5555]\nexpected_public_key: cHVia2V5\nbackend:\n  type: vault\n  vault:\n    token_file: /t\n    key_name: validator\n    key_version: 4\n    binding_mount: from-file\nraft:\n  insecure: true\n"), 0o600))
 
+	t.Setenv("COSMOSIGNER_VAULT_BINDING_MOUNT", "from-env")
 	cfg, err := Load(file, nil)
 	require.NoError(t, err)
 	require.Equal(t, 4, cfg.Backend.Vault.KeyVersion)
 	require.Equal(t, "cHVia2V5", cfg.ExpectedPublicKey)
+	require.Equal(t, "from-env", cfg.Backend.Vault.BindingMount)
+}
+
+func TestValidateRejectsAmbiguousVaultAddressing(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Raft.Insecure = true
+	cfg.Backend.Type = backend.TypeVault
+	cfg.Backend.Vault.TokenFile = "/token"
+	cfg.Backend.Vault.KeyName = "validator/name"
+
+	require.EqualError(t, cfg.Validate(), "vault key name \"validator/name\" contains an ambiguous path component")
 }
 
 func TestLoad_RejectsUnknownYAMLField(t *testing.T) {

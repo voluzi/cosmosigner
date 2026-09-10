@@ -5,6 +5,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,16 @@ type harness struct {
 	clients   []*privval.SignerClient
 	servers   []*privval.SignerServer
 	listeners []*privval.SignerListenerEndpoint
+}
+
+type countedBackend struct {
+	backend.KeyBackend
+	signs atomic.Int32
+}
+
+func (b *countedBackend) Sign(signBytes []byte) ([]byte, error) {
+	b.signs.Add(1)
+	return b.KeyBackend.Sign(signBytes)
 }
 
 func (h *harness) stop() {
@@ -204,4 +215,50 @@ func TestIntegration_MultiNodeConsistent(t *testing.T) {
 	_ = h.servers[0].Stop()
 	_ = h.listeners[0].Stop()
 	require.NoError(t, h.clients[1].SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "block-C")))
+}
+
+func TestIntegration_IndependentRaftHistoriesCannotUseSameSoftwareKey(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "priv_validator_key.json")
+	filePV := privval.GenFilePV(keyFile, filepath.Join(dir, "priv_validator_state.json"))
+	filePV.Key.Save()
+
+	newIndependentHistory := func(nodeID string) (*countedBackend, state.StateStore) {
+		be, err := backend.NewSoftware(keyFile)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, be.Close()) })
+		counted := &countedBackend{KeyBackend: be}
+
+		store, err := state.NewRaftStore(state.RaftConfig{
+			NodeID:     nodeID,
+			BindAddr:   freeAddr(t),
+			DataDir:    filepath.Join(dir, nodeID),
+			Bootstrap:  true,
+			SingleNode: true,
+			Insecure:   true,
+		}, hclog.NewNullLogger())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+		return counted, store
+	}
+
+	backendA, storeA := newIndependentHistory("cluster-a")
+	backendB, storeB := newIndependentHistory("cluster-b")
+	clusterA, err := storeA.EnsureClusterID(t.Context())
+	require.NoError(t, err)
+	clusterB, err := storeB.EnsureClusterID(t.Context())
+	require.NoError(t, err)
+	require.NotEqual(t, clusterA, clusterB)
+	require.NoError(t, backendA.ClaimCluster(t.Context(), clusterA))
+	require.NoError(t, backend.RequireClusterBinding(t.Context(), backendA, clusterA))
+	pvA, err := signer.New(backendA, storeA)
+	require.NoError(t, err)
+	ts := time.Now().UTC()
+	require.NoError(t, pvA.SignVote(itestChain, makeVote(10, 0, ts, "block-A")))
+
+	err = backend.RequireClusterBinding(t.Context(), backendB, clusterB)
+	require.ErrorIs(t, err, backend.ErrBindingMismatch)
+	require.Zero(t, backendB.signs.Load(), "independent history must be refused before any backend or preflight signature")
 }

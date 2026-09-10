@@ -144,6 +144,9 @@ func (c *Config) Validate() error {
 		if c.Backend.Vault.KeyVersion < 0 {
 			return fmt.Errorf("vault backend key version must be zero or greater")
 		}
+		if err := backend.ValidateVaultAddressing(c.Backend.Vault.Mount, c.Backend.Vault.BindingMount, c.Backend.Vault.KeyName); err != nil {
+			return err
+		}
 	case backend.TypeGCPKMS:
 		if c.Backend.GCPKMS.KeyVersion == "" {
 			return fmt.Errorf("gcpkms backend requires backend.gcp.key_version")
