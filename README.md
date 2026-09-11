@@ -408,11 +408,17 @@ Local development can explicitly opt out with `--raft-insecure`, YAML
 `raft.insecure: true`, or `COSMOSIGNER_RAFT_INSECURE=true`. Insecure mode logs a
 warning on every startup and cannot be combined with TLS configuration.
 
-Existing plain-TCP deployments must choose a transport mode before upgrading:
-set the explicit insecure opt-out for isolated development, or distribute the
-certificates and switch every replica to mTLS in a coordinated maintenance
-window. Plain-TCP and mTLS replicas cannot communicate, so expect a leader
-election and a brief fail-closed signing pause during the cutover.
+Existing plain-TCP deployments must choose a transport mode before upgrading.
+For isolated development that will remain insecure, stage
+`COSMOSIGNER_RAFT_INSECURE=true` before replacing the binary; older releases
+ignore the unknown environment variable. Do not add `--raft-insecure` or YAML
+`raft.insecure` until the new binary is installed because older releases reject
+the unknown flag or field.
+
+To enable mTLS, distribute the certificates and switch every replica in a
+coordinated maintenance window. Plain-TCP and mTLS replicas cannot communicate,
+so expect a leader election and a brief fail-closed signing pause during the
+cutover.
 
 When enabled, every replica must present a certificate signed by the configured
 CA (`RequireAndVerifyClientCert`) and dialers verify the peer's chain, so a node
