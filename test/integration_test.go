@@ -141,8 +141,11 @@ func TestIntegration_SignAndVerify(t *testing.T) {
 	require.Equal(t, h.pub.Bytes(), pub.Bytes())
 
 	vote := makeVote(10, 0, time.Now().UTC(), "block-A")
+	vote.Extension = []byte("oracle-prices:v1")
 	require.NoError(t, sc.SignVote(itestChain, vote))
+	require.Equal(t, []byte("oracle-prices:v1"), vote.Extension)
 	require.True(t, pub.VerifySignature(types.VoteSignBytes(itestChain, vote), vote.Signature))
+	require.True(t, pub.VerifySignature(types.VoteExtensionSignBytes(itestChain, vote), vote.ExtensionSignature))
 
 	proposal := &cmtproto.Proposal{Type: cmtproto.ProposalType, Height: 11, Round: 0, Timestamp: time.Now().UTC()}
 	require.NoError(t, sc.SignProposal(itestChain, proposal))
@@ -154,14 +157,20 @@ func TestIntegration_IdempotentResign(t *testing.T) {
 	defer h.stop()
 	sc := h.clients[0]
 
-	ts := time.Now().UTC()
+	ts := time.Date(2026, time.September, 11, 12, 0, 0, 123456789, time.UTC)
 	v1 := makeVote(10, 0, ts, "block-A")
+	v1.Extension = []byte("first-extension")
 	require.NoError(t, sc.SignVote(itestChain, v1))
 	sig1 := append([]byte(nil), v1.Signature...)
+	extSig1 := append([]byte(nil), v1.ExtensionSignature...)
 
-	v2 := makeVote(10, 0, ts, "block-A")
+	v2 := makeVote(10, 0, ts.Add(time.Minute), "block-A")
+	v2.Extension = []byte("second-extension")
 	require.NoError(t, sc.SignVote(itestChain, v2))
 	require.Equal(t, sig1, v2.Signature, "re-signing identical vote must return the same signature")
+	require.Equal(t, ts, v2.Timestamp, "re-signing must restore the reserved canonical timestamp")
+	require.NotEqual(t, extSig1, v2.ExtensionSignature, "the changed extension must receive a new signature")
+	require.True(t, h.pub.VerifySignature(types.VoteExtensionSignBytes(itestChain, v2), v2.ExtensionSignature))
 }
 
 func TestIntegration_RegressionRefused(t *testing.T) {
