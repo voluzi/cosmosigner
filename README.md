@@ -69,6 +69,17 @@ Two orthogonal, pluggable interfaces:
   hashicorp/raft today. Consensus ordering stays backend-independent; the startup
   claim prevents a different Raft history from accidentally selecting the same key resource.
 
+Each validator identity uses an independent Cosmosigner/Raft deployment, which may contain
+multiple signer replicas. A deployment configures one chain and one `KeyBackend`; all target node
+connections share that validator key and signing history. Do not multiplex chains or validator
+keys through one process. The chain-keyed FSM storage is headroom, not a supported multi-chain or
+multi-key mode. Separate deployments isolate key configuration, signing history, and failure
+domains.
+
+`StateStore.Get` returns a snapshot of the local FSM without a leadership, quorum, or read-index
+check, so it may be stale. It is for diagnostics only and must not be used to authorize signing; a
+future linearizable read requires a separate API.
+
 Only the raft **leader** holds the node connections and serves signatures. Each
 signature follows a strict **reserve → sign → commit** order: the mark is
 raft-committed *before* the key backend produces a signature.

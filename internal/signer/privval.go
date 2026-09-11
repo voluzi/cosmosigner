@@ -2,7 +2,9 @@
 // signature behind the StateStore (the raft high-water-mark) before invoking the
 // KeyBackend. The reserve→sign→commit ordering is the double-sign safety
 // property: the mark advances (and is raft-committed) before any signature is
-// produced.
+// produced. A Cosmosigner process constructs one GatedPrivValidator around its
+// configured KeyBackend; all target node connections for the configured chain
+// share that validator key.
 package signer
 
 import (
@@ -17,8 +19,9 @@ import (
 	"github.com/voluzi/cosmosigner/internal/state"
 )
 
-// GatedPrivValidator is safe for concurrent use: it is shared across all
-// per-node SignerServers, and the StateStore serializes reservations.
+// GatedPrivValidator represents one validator key. It is safe for concurrent
+// use: all per-node SignerServers share it, and the StateStore serializes
+// reservations.
 type GatedPrivValidator struct {
 	backend backend.KeyBackend
 	store   state.StateStore

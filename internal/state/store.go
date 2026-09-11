@@ -1,8 +1,8 @@
-// Package state provides the linearizable high-water-mark gate that prevents
-// double-signing. The single v1 implementation is backed by embedded
-// hashicorp/raft: every signature must pass through a raft-committed
-// "reserve" of its (height, round, step), so a minority-partitioned signer
-// cannot advance the mark and therefore cannot sign — it fails closed.
+// Package state provides the high-water-mark gate that prevents double-signing.
+// The single v1 implementation is backed by embedded hashicorp/raft. Every
+// signature must pass through a raft-committed "reserve" of its (height, round,
+// step), so a minority-partitioned signer cannot advance the mark and therefore
+// cannot sign — it fails closed.
 package state
 
 import (
@@ -45,7 +45,7 @@ type ReserveResult struct {
 	Timestamp time.Time
 }
 
-// StateStore is the linearizable double-sign gate.
+// StateStore is the double-sign gate for Raft-committed reservations.
 type StateStore interface {
 	// EnsureClusterID returns the immutable identity replicated with this signing history,
 	// initializing it through Raft when this cluster has none yet.
@@ -57,7 +57,9 @@ type StateStore interface {
 	// Commit records the produced signature so idempotent re-requests can reuse
 	// it without re-signing.
 	Commit(chainID string, height int64, round int32, step int8, signBytes, signature []byte) error
-	// Get returns the current high-water-mark for a chain.
+	// Get returns a snapshot of the local FSM high-water-mark for a chain. It performs no
+	// leadership, quorum, or read-index check and may be stale. It is for diagnostics only and
+	// must not authorize signing; a linearizable read requires a separate API.
 	Get(chainID string) (*SignState, error)
 	// IsLeader reports whether this node currently holds raft leadership.
 	IsLeader() bool
