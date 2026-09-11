@@ -1,14 +1,17 @@
 package signer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"testing"
 	"time"
 
 	"github.com/cometbft/cometbft/crypto/ed25519"
+	"github.com/cometbft/cometbft/libs/protoio"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/types"
+	"github.com/cosmos/gogoproto/proto"
 	"github.com/stretchr/testify/require"
 
 	"github.com/voluzi/cosmosigner/internal/backend"
@@ -31,8 +34,11 @@ func (m *memStore) Reserve(chainID string, h int64, r int32, s int8, sb []byte, 
 			return state.ReserveResult{}, state.ErrRegression
 		}
 		if h == cur.Height && r == cur.Round && s == cur.Step {
-			if string(cur.SignBytes) == string(sb) {
+			if bytes.Equal(cur.SignBytes, sb) {
 				return state.ReserveResult{Reuse: true, SignBytes: cur.SignBytes, Signature: cur.Signature, Timestamp: cur.Timestamp}, nil
+			}
+			if previousTimestamp, ok := voteSignBytesOnlyDifferByTimestamp(cur.SignBytes, sb); ok {
+				return state.ReserveResult{Reuse: true, SignBytes: cur.SignBytes, Signature: cur.Signature, Timestamp: previousTimestamp}, nil
 			}
 			return state.ReserveResult{}, state.ErrConflict
 		}
@@ -59,6 +65,17 @@ func (m *memStore) EnsureClusterID(context.Context) (string, error) {
 func (m *memStore) IsLeader() bool        { return true }
 func (m *memStore) LeaderCh() <-chan bool { return nil }
 func (m *memStore) Close() error          { return nil }
+
+func voteSignBytesOnlyDifferByTimestamp(previous, next []byte) (time.Time, bool) {
+	var previousVote, nextVote cmtproto.CanonicalVote
+	if protoio.UnmarshalDelimited(previous, &previousVote) != nil || protoio.UnmarshalDelimited(next, &nextVote) != nil {
+		return time.Time{}, false
+	}
+	previousTimestamp := previousVote.Timestamp
+	previousVote.Timestamp = time.Time{}
+	nextVote.Timestamp = time.Time{}
+	return previousTimestamp, proto.Equal(&previousVote, &nextVote)
+}
 
 func newTestPV(t *testing.T) *GatedPrivValidator {
 	t.Helper()

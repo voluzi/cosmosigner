@@ -51,12 +51,36 @@ func (g *GatedPrivValidator) SignVote(chainID string, vote *cmtproto.Vote) (err 
 	if err != nil {
 		return err
 	}
+	nonNilPrecommit := vote.Type == cmtproto.PrecommitType && !types.ProtoBlockIDIsNil(&vote.BlockID)
+	if len(vote.Extension) > 0 && !nonNilPrecommit {
+		return fmt.Errorf("unexpected vote extension: extensions are only allowed in non-nil precommits")
+	}
+
 	signBytes := types.VoteSignBytes(chainID, vote)
-	return g.gatedSign(chainID, vote.Height, vote.Round, step, signBytes, vote.Timestamp,
+	var canonicalSignature []byte
+	var canonicalTimestamp time.Time
+	if err := g.gatedSign(chainID, vote.Height, vote.Round, step, signBytes, vote.Timestamp,
 		func(sig []byte, ts time.Time) {
-			vote.Timestamp = ts
-			vote.Signature = sig
-		})
+			canonicalSignature = sig
+			canonicalTimestamp = ts
+		}); err != nil {
+		return err
+	}
+
+	var extensionSignature []byte
+	if nonNilPrecommit {
+		// Extensions are non-deterministic and excluded from canonical vote bytes, so they are
+		// neither Raft-gated nor persisted and must be re-signed on every accepted precommit.
+		extensionSignature, err = g.backend.Sign(types.VoteExtensionSignBytes(chainID, vote))
+		if err != nil {
+			return fmt.Errorf("sign vote extension: %w", err)
+		}
+	}
+
+	vote.Timestamp = canonicalTimestamp
+	vote.Signature = canonicalSignature
+	vote.ExtensionSignature = extensionSignature
+	return nil
 }
 
 func (g *GatedPrivValidator) SignProposal(chainID string, proposal *cmtproto.Proposal) (err error) {

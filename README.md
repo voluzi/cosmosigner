@@ -85,7 +85,21 @@ startup guardrail, not live fencing: it cannot stop an already-running old binar
 copy of the accepted Raft history, or detect the same key material copied into a different resource.
 
 The node dials nothing — it `priv_validator_laddr`-listens, and cosmosigner
-dials it over CometBFT's encrypted SecretConnection (CometBFT v0.37.x).
+dials it over CometBFT's encrypted SecretConnection. This release is built and
+tested against exactly CometBFT v0.38.26; CometBFT v1.x is not supported.
+
+For a non-nil precommit, Cosmosigner signs both the canonical vote and the vote
+extension. Only the canonical vote bytes pass through the Raft double-sign gate
+and are persisted. The non-deterministic extension is signed separately on every
+request, including an empty extension and same-height/round/step replay, so each
+accepted non-nil precommit makes one additional `KeyBackend.Sign` call. Prevotes
+and nil precommits reject non-empty extensions and return no extension signature.
+
+CometBFT v0.38.26's upstream `privval/signer_endpoint.go` limits each serialized
+remote-signer protobuf message, excluding its outer length prefix, to 10 KiB.
+The vote extension shares that limit with the rest of the sign-vote request or
+response and its protobuf envelope; 10 KiB is not available to the extension
+payload alone.
 
 ## Quick start (local, software backend)
 
