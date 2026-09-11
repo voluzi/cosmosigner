@@ -157,7 +157,7 @@ func TestIntegration_IdempotentResign(t *testing.T) {
 	defer h.stop()
 	sc := h.clients[0]
 
-	ts := time.Now().UTC()
+	ts := time.Date(2026, time.September, 11, 12, 0, 0, 123456789, time.UTC)
 	v1 := makeVote(10, 0, ts, "block-A")
 	v1.Extension = []byte("first-extension")
 	require.NoError(t, sc.SignVote(itestChain, v1))
