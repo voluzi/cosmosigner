@@ -126,3 +126,24 @@ path "`+itMount+`/sign/*" { capabilities = ["update"] }`))
 	defer v2.Close()
 	require.NoError(t, v2.VerifyCanSign(t.Context()))
 }
+
+func TestVaultIntegration_SignDeterminism(t *testing.T) {
+	root, addr := vaultRoot(t)
+	mustCreateKey(t, root, "determinismtest")
+
+	cfg := VaultConfig{
+		Address:   addr,
+		TokenFile: writeToken(t, root.Token()),
+		Mount:     itMount,
+		KeyName:   "determinismtest",
+	}
+	first, err := NewVault(cfg)
+	require.NoError(t, err)
+	defer first.Close()
+
+	second, err := NewVault(cfg)
+	require.NoError(t, err)
+	defer second.Close()
+
+	requireSignDeterminism(t, first, second)
+}

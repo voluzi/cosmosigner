@@ -73,6 +73,12 @@ Only the raft **leader** holds the node connections and serves signatures. Each
 signature follows a strict **reserve → sign → commit** order: the mark is
 raft-committed *before* the key backend produces a signature.
 
+An in-flight reservation can be retried by overlapping requests before its signature is committed.
+For the same consensus key and sign bytes, every `KeyBackend.Sign` call must therefore return the same
+raw Ed25519 signature, including calls through separate backend instances. Duplicate commits reject
+non-identical signatures; a backend that cannot provide deterministic signatures needs a different
+reservation design.
+
 Before any startup signing probe or node connection, Cosmosigner initializes or loads an immutable
 UUID from the Raft log and requires the selected key resource to carry that exact UUID. This is a
 startup guardrail, not live fencing: it cannot stop an already-running old binary, detect a complete
@@ -480,8 +486,26 @@ make vet
 ```
 
 `make test-cover` runs the race detector and writes `coverage.out`, matching CI.
-Integration tests for Vault and Google Cloud KMS are opt-in; see
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for setup.
+The default suite exercises the signature-determinism contract with the software backend.
+Provider conformance tests are opt-in and must use dedicated test keys, never validator keys:
+
+```sh
+# Real Vault Transit backend; starts a disposable local Vault first.
+scripts/vault-dev.sh up
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root \
+  go test -race -tags vault_integration ./internal/backend \
+  -run TestVaultIntegration_SignDeterminism -count=1 -v
+scripts/vault-dev.sh down
+
+# Real Cloud KMS backend using a designated EC_SIGN_ED25519 test key version.
+GCP_KMS_KEY_VERSION=projects/.../cryptoKeyVersions/1 \
+  go test -race -tags gcpkms_integration ./internal/backend \
+  -run TestGCPKMS_SignVerify -count=1 -v
+```
+
+The Cloud KMS result establishes conformance only for the configured key version and its protection
+level. Run it for every production-equivalent KMS configuration. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for provider setup details.
 
 ## Security and responsible disclosure
 

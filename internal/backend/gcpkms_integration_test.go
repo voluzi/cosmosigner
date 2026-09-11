@@ -3,15 +3,15 @@
 package backend
 
 import (
-	"crypto/rand"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-// TestGCPKMS_SignVerify exercises the real Cloud KMS backend end to end:
-// fetch the public key, sign random data, and verify the signature.
+// TestGCPKMS_SignVerify exercises the real Cloud KMS backend end to end and
+// verifies deterministic signing through separate clients for the configured
+// key version and protection level.
 //
 // Run with a provisioned EC_SIGN_ED25519 key:
 //
@@ -24,25 +24,19 @@ func TestGCPKMS_SignVerify(t *testing.T) {
 		t.Skip("set GCP_KMS_KEY_VERSION to run this test")
 	}
 
-	be, err := NewGCPKMS(GCPKMSConfig{
+	cfg := GCPKMSConfig{
 		KeyVersion:      keyVersion,
 		CredentialsFile: os.Getenv("GCP_CREDENTIALS_FILE"), // optional; else ADC
-	})
+	}
+	first, err := NewGCPKMS(cfg)
 	require.NoError(t, err)
-	defer be.Close()
+	defer first.Close()
 
-	pub, err := be.PubKey()
+	second, err := NewGCPKMS(cfg)
 	require.NoError(t, err)
-	require.Len(t, pub.Bytes(), 32, "ed25519 public key must be 32 bytes")
+	defer second.Close()
 
-	msg := make([]byte, 128)
-	_, err = rand.Read(msg)
-	require.NoError(t, err)
-
-	sig, err := be.Sign(msg)
-	require.NoError(t, err)
-	require.Len(t, sig, 64, "ed25519 signature must be 64 bytes")
-	require.True(t, pub.VerifySignature(msg, sig), "KMS signature must verify against the public key")
+	requireSignDeterminism(t, first, second)
 }
 
 // TestGCPKMS_VerifyCanSign proves the startup preflight passes against a
