@@ -18,7 +18,12 @@ import (
 type KeyBackend interface {
 	// PubKey returns the ed25519 consensus public key.
 	PubKey() (crypto.PubKey, error)
-	// Sign returns the raw 64-byte ed25519 signature over signBytes.
+	// Sign returns the raw 64-byte ed25519 signature over signBytes. The same
+	// consensus key and signBytes must produce byte-identical signatures across
+	// retries and overlapping calls, including calls through separate backend
+	// instances. Raft reservations can be signed more than once before commit;
+	// a backend that cannot guarantee determinism needs a different reservation
+	// design.
 	Sign(signBytes []byte) ([]byte, error)
 	// ClusterBinding reads the immutable Raft-history claim attached to this key resource.
 	ClusterBinding(ctx context.Context) (string, error)
