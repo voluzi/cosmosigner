@@ -84,3 +84,19 @@ func TestClaimConfigSubstitutesOnlyConfiguredClaimCredentials(t *testing.T) {
 
 	require.False(t, HasSeparateClaimCredentials(Config{Type: TypeSoftware}))
 }
+
+// link(2) never follows a symlink, so a symlink at the marker path would read as unclaimed yet make
+// every claim fail; refuse it up front.
+func TestSoftwareBindingFileRejectsASymlink(t *testing.T) {
+	keyFile := newSoftwareKeyFile(t, t.TempDir())
+	dir := t.TempDir()
+	dangling := filepath.Join(dir, "cluster.json")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "missing.json"), dangling))
+	_, err := NewSoftwareWithBindingFile(keyFile, dangling)
+	require.ErrorContains(t, err, "symlink")
+
+	toKey := filepath.Join(dir, "to-key.json")
+	require.NoError(t, os.Symlink(keyFile, toKey))
+	_, err = NewSoftwareWithBindingFile(keyFile, toKey)
+	require.ErrorContains(t, err, "symlink")
+}

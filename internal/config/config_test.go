@@ -271,3 +271,18 @@ raft:
 	require.True(t, cfg.ClaimIfUnclaimed)
 	require.Equal(t, "/data/cluster.json", cfg.Backend.SoftwareBindingFile)
 }
+
+func TestValidate_ClaimCredentialsMustMatchTheBackend(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Raft.Insecure = true
+	cfg.ClaimIfUnclaimed = true
+	cfg.Backend.SoftwareKeyFile = "/key.json"
+
+	cfg.Backend.Vault.ClaimTokenFile = "/vault/claim"
+	require.ErrorContains(t, cfg.Validate(), "vault backend")
+	cfg.Backend.Vault.ClaimTokenFile = ""
+	cfg.Backend.GCPKMS.ClaimCredentialsFile = "/gcp/claim.json"
+	require.ErrorContains(t, cfg.Validate(), "gcpkms backend")
+}

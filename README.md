@@ -410,10 +410,11 @@ write the missing claim itself:
 `start` then ensures the Raft cluster ID as usual, reads the claim, and, only when the key resource
 is **unclaimed**, claims it for this cluster ID, reads it back through the runtime backend, and
 continues. A claim held by another cluster is refused exactly as without the flag, and
-`--initialize-only` never claims. Every replica of one cluster may claim concurrently: they share
-the cluster ID, so the Vault create-only write and the software marker lock settle on one record,
-and the Cloud KMS label receives the same value. The flag does not make an unclaimed key safe to
-adopt: only enable it where nothing else can be signing with that key.
+`--initialize-only` never claims, and a corrupt or unreadable claim is reported, never replaced.
+Every replica of one cluster may claim concurrently: they share the cluster ID, so the Vault
+create-only write settles on one record and the Cloud KMS label receives the same value. The flag
+does not make an unclaimed key safe to adopt: only enable it where nothing else can be signing with
+that key.
 
 The claim uses the runtime identity unless dedicated claim credentials are supplied; they are used
 for the claim only and dropped immediately afterwards:
@@ -424,16 +425,33 @@ for the claim only and dropped immediately afterwards:
 | Cloud KMS | `--gcp-claim-credentials-file` / `backend.gcp.claim_credentials_file` / `COSMOSIGNER_GCP_CLAIM_CREDENTIALS_FILE` | `cloudkms.cryptoKeys.update` on the CryptoKey |
 | software | — | write access to the marker directory |
 
-Neither permission can delete or disable key material: the Vault policy only reaches the binding
-registry, and `cryptoKeys.update` changes CryptoKey metadata (labels, rotation, version template),
-while destroying or disabling versions needs `cryptoKeyVersions.destroy`/`update`. Claim credentials
-are rejected unless `claim_if_unclaimed` is enabled.
+A dedicated claim credential needs the same access as `claim-key`: the one-shot claim policy above
+for Vault (including `read` on `transit/keys/<key>` and on the binding metadata), and
+`cloudkms.cryptoKeys.get`, `cloudkms.cryptoKeys.update` and `cloudkms.cryptoKeyVersions.viewPublicKey`
+for Cloud KMS. Claim credentials are rejected unless `claim_if_unclaimed` is enabled and they match
+the configured backend.
+
+Neither permission can delete, disable or export key material: the Vault grants only reach the
+binding registry, and `cryptoKeys.update` changes CryptoKey metadata (labels, rotation, version
+template), while destroying or disabling versions needs `cryptoKeyVersions.destroy`/`update`. They
+do let their holder rewrite the claim itself (a KV v2 `update` replaces the record, and
+`cryptoKeys.update` relabels the CryptoKey). Reusing the runtime identity therefore trades that
+protection for a simpler setup; use a dedicated claim credential where the signer's identity should
+not be able to reassign the key.
 
 The software marker defaults to `<key file>.cosmosigner-cluster.json`, next to the key. When the key
-is mounted read-only (a Kubernetes Secret), place the marker, and its lock, on writable storage such
-as the Raft volume with `--binding-file` / `backend.binding_file` / `COSMOSIGNER_BINDING_FILE`. The
-marker records the key's public key, so it cannot be adopted by different key material. Keep it
-with the Raft history it names: a new data directory needs a new marker, exactly like a new claim.
+is mounted read-only (a Kubernetes Secret), place the marker, and its lock, on writable storage with
+`--binding-file` / `backend.binding_file` / `COSMOSIGNER_BINDING_FILE`. The marker records the key's
+public key, so it cannot be adopted by different key material, and it must not be a symlink.
+`provision` does not accept `--binding-file`, because its check against overwriting a claimed key
+only sees a marker next to the key.
+
+A relocated marker only protects what shares its storage. On per-replica storage, such as each
+replica's Raft volume, it no longer stops a second deployment that mounts the same key Secret with
+its own volumes: that deployment finds no marker and claims the key for its own cluster. It then
+only guards each replica against a reset Raft history. With the software backend, whoever deploys
+the signers must guarantee one deployment per key; the Vault and Cloud KMS registries are shared and
+keep protecting across deployments.
 
 Moving a validator transfers the complete current Raft history and its identity only after the old
 deployment is operationally fenced. Never copy only the UUID, use a stale snapshot, clear the

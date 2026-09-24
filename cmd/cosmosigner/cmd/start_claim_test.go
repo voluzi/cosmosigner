@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/privval"
 	"github.com/stretchr/testify/require"
 
 	"github.com/voluzi/cosmosigner/internal/backend"
@@ -23,10 +29,14 @@ type claimingBackend struct {
 	owner    string
 	claims   []string
 	claimErr error
+	readErr  error
 }
 
 func (b *claimingBackend) ClusterBinding(context.Context) (string, error) {
 	b.bindingReads++
+	if b.readErr != nil {
+		return "", b.readErr
+	}
 	if b.owner == "" {
 		return "", backend.ErrBindingUnclaimed
 	}
@@ -144,4 +154,82 @@ func TestOverlayStartFlagsSetsClaimSettings(t *testing.T) {
 	require.Equal(t, "/vault/claim", cfg.Backend.Vault.ClaimTokenFile)
 	require.Equal(t, "/gcp/claim.json", cfg.Backend.GCPKMS.ClaimCredentialsFile)
 	require.Equal(t, "/data/cluster.json", cfg.Backend.SoftwareBindingFile)
+}
+
+// Only an unclaimed key is claimed: a corrupt or unreadable claim is surfaced, never overwritten.
+func TestPrepareStartupNeverClaimsOverACorruptOrUnreadableClaim(t *testing.T) {
+	for _, readErr := range []error{backend.ErrBindingCorrupt, backend.ErrBindingUnreadable} {
+		t.Run(readErr.Error(), func(t *testing.T) {
+			be := &claimingBackend{startupTestBackend: startupTestBackend{pub: ed25519.GenPrivKey().PubKey()}, readErr: readErr}
+			store := &startupTestStore{clusterID: startTestClusterID}
+
+			_, err := prepareStartupWithClaim(t.Context(), be, store, false, testClaimer(be))
+			require.ErrorIs(t, err, readErr)
+			require.Empty(t, be.claims)
+			require.Zero(t, be.preflights)
+		})
+	}
+}
+
+// End to end through the start path: with claim_if_unclaimed a fresh software signer claims its key
+// for the Raft cluster it just initialised, and keeps running.
+func TestRunStartClaimsAnUnclaimedKeyWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "priv_validator_key.json")
+	pv := privval.GenFilePV(keyFile, filepath.Join(dir, "priv_validator_state.json"))
+	pv.Key.Save()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	raftAddr := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	bindingFile := filepath.Join(dir, "state", "cluster.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(bindingFile), 0o700))
+
+	cfg := config.Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"127.0.0.1:1"}
+	cfg.ConnKey = filepath.Join(dir, "conn_key.json")
+	cfg.Backend.SoftwareKeyFile = keyFile
+	cfg.Backend.SoftwareBindingFile = bindingFile
+	cfg.ClaimIfUnclaimed = true
+	cfg.Raft.NodeID = "node-1"
+	cfg.Raft.BindAddr = raftAddr
+	cfg.Raft.Advertise = raftAddr
+	cfg.Raft.DataDir = filepath.Join(dir, "raft")
+	cfg.Raft.Bootstrap = true
+	cfg.Raft.SingleNode = true
+	cfg.Raft.Insecure = true
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- runStartModeContext(ctx, cfg, false, &bytes.Buffer{}) }()
+	// The signer only creates its connection identity once startup, including the claim, succeeded.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(cfg.ConnKey)
+		return err == nil
+	}, 20*time.Second, 50*time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("signer did not stop")
+	}
+
+	var initialized bytes.Buffer
+	require.NoError(t, runStartModeContext(t.Context(), cfg, true, &initialized))
+	be, err := backend.NewSoftwareWithBindingFile(keyFile, bindingFile)
+	require.NoError(t, err)
+	owner, err := be.ClusterBinding(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, strings.TrimSpace(initialized.String()), owner)
+	require.NoFileExists(t, keyFile+".cosmosigner-cluster.json", "a relocated marker is not written next to the key")
+}
+
+func TestProvisionRejectsARelocatedBindingFile(t *testing.T) {
+	cmd := NewProvisionCmd()
+	cmd.SetArgs([]string{"--backend", "software", "--key-file", filepath.Join(t.TempDir(), "key.json"), "--binding-file", filepath.Join(t.TempDir(), "cluster.json")})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	require.ErrorContains(t, cmd.Execute(), "--binding-file")
 }

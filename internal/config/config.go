@@ -162,6 +162,12 @@ func (c *Config) Validate() error {
 	if !c.ClaimIfUnclaimed && (c.Backend.Vault.ClaimTokenFile != "" || c.Backend.GCPKMS.ClaimCredentialsFile != "") {
 		return fmt.Errorf("claim credentials are only used with claim_if_unclaimed: true (--claim-if-unclaimed)")
 	}
+	if c.Backend.Vault.ClaimTokenFile != "" && c.Backend.Type != backend.TypeVault {
+		return fmt.Errorf("backend.vault.claim_token_file requires the vault backend")
+	}
+	if c.Backend.GCPKMS.ClaimCredentialsFile != "" && c.Backend.Type != backend.TypeGCPKMS {
+		return fmt.Errorf("backend.gcp.claim_credentials_file requires the gcpkms backend")
+	}
 	if c.Raft.NodeID == "" {
 		return fmt.Errorf("raft.node_id is required")
 	}

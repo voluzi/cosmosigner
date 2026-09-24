@@ -99,7 +99,15 @@ func resolveSoftwareBindingPath(bindingFile string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve software binding directory %q: %w", filepath.Dir(absPath), err)
 	}
-	return filepath.Join(directory, filepath.Base(absPath)), nil
+	bindingPath := filepath.Join(directory, filepath.Base(absPath))
+	// The marker is published with link(2), which never follows a symlink: a symlink at the marker
+	// path, dangling or not, would read as unclaimed yet make every claim fail.
+	if info, err := os.Lstat(bindingPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("software binding file %q must not be a symlink", bindingFile)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect software binding file %q: %w", bindingFile, err)
+	}
+	return bindingPath, nil
 }
 
 // NewSoftwareFromPriv wraps an in-memory private key (used by tests).
@@ -162,11 +170,7 @@ func (s *Software) ClaimCluster(ctx context.Context, id string) error {
 	if err := clusterid.Validate(id); err != nil {
 		return fmt.Errorf("invalid cluster ID: %w", err)
 	}
-	lockPath := s.lockPath
-	if lockPath == "" {
-		lockPath = s.keyPath
-	}
-	return withSoftwareKeyLock(ctx, lockPath, s.operationHooks, func() error {
+	return withSoftwareKeyLock(ctx, s.lockPath, s.operationHooks, func() error {
 		diskPriv, err := loadSoftwarePrivateKey(s.keyPath)
 		if err != nil {
 			return fmt.Errorf("%w: validate software key %q before claim: %v", ErrBindingCorrupt, s.keyPath, err)
