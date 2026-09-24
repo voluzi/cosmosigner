@@ -256,8 +256,8 @@ CryptoKey needs only:
 
 `viewPublicKey` lets `import` verify the imported identity. An existing CryptoKey must be
 `ASYMMETRIC_SIGN` with an `EC_SIGN_ED25519` version template at the requested `--gcp-protection`
-level (an import-only key is fine), and an existing ImportJob must use `RSA_OAEP_3072_SHA256` at that
-level; `import` fails otherwise.
+level (an import-only key is fine), and an existing ImportJob must use `RSA_OAEP_3072_SHA256` or
+`RSA_OAEP_4096_SHA256` at that level; `import` fails otherwise.
 
 Cloud KMS checks permissions before existence, so a read of a resource that does not exist yet
 returns `PermissionDenied`, not `NotFound`, unless it is granted on a parent that does exist. When

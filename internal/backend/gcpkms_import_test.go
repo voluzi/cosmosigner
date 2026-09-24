@@ -266,7 +266,7 @@ func TestGCPImportRejectsUnusableExistingJob(t *testing.T) {
 			client := &fakeImportClient{ring: &kmspb.KeyRing{Name: testImportRing}, key: importableKey(), job: job}
 
 			_, _, err := gcpImportKey(t.Context(), client, testImportConfig(), testPKCS8)
-			require.ErrorContains(t, err, "need RSA_OAEP_3072_SHA256")
+			require.ErrorContains(t, err, "need RSA_OAEP_3072_SHA256 or RSA_OAEP_4096_SHA256")
 			require.False(t, client.called("ImportCryptoKeyVersion"), "calls: %v", client.calls)
 		})
 	}
@@ -274,6 +274,21 @@ func TestGCPImportRejectsUnusableExistingJob(t *testing.T) {
 
 // A read the identity may not perform must fail the import, never fall
 // through to the create that the same identity presumably cannot do either.
+// RSA_OAEP_4096_SHA256 is the same direct OAEP-SHA256 wrapping with a larger key.
+func TestGCPImportAcceptsExisting4096OAEPJob(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 4096)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	require.NoError(t, err)
+	job := activeJob(string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})))
+	job.ImportMethod = kmspb.ImportJob_RSA_OAEP_4096_SHA256
+	client := &fakeImportClient{ring: &kmspb.KeyRing{Name: testImportRing}, key: importableKey(), job: job}
+
+	_, _, err = gcpImportKey(t.Context(), client, testImportConfig(), testPKCS8)
+	require.NoError(t, err)
+	require.True(t, client.called("ImportCryptoKeyVersion"))
+}
+
 func TestGCPImportDoesNotCreateOnDeniedRead(t *testing.T) {
 	denied := status.Error(codes.PermissionDenied, "denied")
 	cases := map[string]struct {

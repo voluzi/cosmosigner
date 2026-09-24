@@ -245,9 +245,11 @@ func ensureImportJob(ctx context.Context, client gcpImportClient, cfg GCPImportC
 	if err != nil {
 		return nil, err
 	}
-	if job.ImportMethod != kmspb.ImportJob_RSA_OAEP_3072_SHA256 || job.ProtectionLevel != cfg.Protection {
-		return nil, fmt.Errorf("import job %s has method %s, protection %s; need %s, %s (pass a new --gcp-import-job)",
-			jobName, job.ImportMethod, job.ProtectionLevel, kmspb.ImportJob_RSA_OAEP_3072_SHA256, cfg.Protection)
+	// Only the direct RSA-OAEP-SHA256 methods match the wrapping done here.
+	directOAEP := job.ImportMethod == kmspb.ImportJob_RSA_OAEP_3072_SHA256 || job.ImportMethod == kmspb.ImportJob_RSA_OAEP_4096_SHA256
+	if !directOAEP || job.ProtectionLevel != cfg.Protection {
+		return nil, fmt.Errorf("import job %s has method %s, protection %s; need %s or %s, %s (pass a new --gcp-import-job)",
+			jobName, job.ImportMethod, job.ProtectionLevel, kmspb.ImportJob_RSA_OAEP_3072_SHA256, kmspb.ImportJob_RSA_OAEP_4096_SHA256, cfg.Protection)
 	}
 	return job, nil
 }
