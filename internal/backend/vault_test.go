@@ -437,3 +437,109 @@ func writeVaultToken(t *testing.T) string {
 	require.NoError(t, os.WriteFile(path, []byte("test-token"), 0o600))
 	return path
 }
+
+// preflightVaultServer fakes the Vault endpoints the signing preflight calls;
+// each status field is 200 for a normal answer or the error code to return.
+type preflightVaultServer struct {
+	capsStatus, lookupStatus, signStatus int
+	caps                                 []string
+	signCalls                            atomic.Int32
+}
+
+func (p *preflightVaultServer) start(t *testing.T) *Vault {
+	t.Helper()
+	privateKey := ed25519.GenPrivKey()
+	fail := func(w http.ResponseWriter, code int) {
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/transit/keys/validator":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"type": "ed25519", "latest_version": 1,
+				"keys": map[string]any{"1": map[string]any{"public_key": base64.StdEncoding.EncodeToString(privateKey.PubKey().Bytes())}},
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/sys/capabilities-self":
+			if p.capsStatus != http.StatusOK {
+				fail(w, p.capsStatus)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"capabilities": p.caps}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/token/lookup-self":
+			if p.lookupStatus != http.StatusOK {
+				fail(w, p.lookupStatus)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ttl": 864000, "renewable": true}})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/transit/sign/validator":
+			p.signCalls.Add(1)
+			if p.signStatus != http.StatusOK {
+				fail(w, p.signStatus)
+				return
+			}
+			var request map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			input, err := base64.StdEncoding.DecodeString(request["input"].(string))
+			require.NoError(t, err)
+			signature, err := privateKey.Sign(input)
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signature),
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	v, err := NewVault(VaultConfig{
+		Address: server.URL, TokenFile: writeVaultToken(t), Mount: "transit", KeyName: "validator", KeyVersion: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, v.Close()) })
+	return v
+}
+
+// Tokens created with -no-default-policy cannot call sys/capabilities-self; the
+// sign probe still proves the token can sign, so preflight must not abort.
+func TestVaultVerifyCanSignFallsBackToSignProbeWhenCapabilitiesDenied(t *testing.T) {
+	p := &preflightVaultServer{capsStatus: http.StatusForbidden, lookupStatus: http.StatusOK, signStatus: http.StatusOK}
+	v := p.start(t)
+
+	require.NoError(t, v.VerifyCanSign(t.Context()))
+	require.EqualValues(t, 1, p.signCalls.Load())
+}
+
+func TestVaultVerifyCanSignFailsWhenCapabilitiesDeniedAndSignDenied(t *testing.T) {
+	p := &preflightVaultServer{capsStatus: http.StatusForbidden, lookupStatus: http.StatusOK, signStatus: http.StatusForbidden}
+	v := p.start(t)
+
+	require.ErrorContains(t, v.VerifyCanSign(t.Context()), "cannot sign")
+}
+
+func TestVaultVerifyCanSignFailsOnOtherCapabilitiesErrors(t *testing.T) {
+	p := &preflightVaultServer{capsStatus: http.StatusBadRequest, lookupStatus: http.StatusOK, signStatus: http.StatusOK}
+	v := p.start(t)
+
+	require.ErrorContains(t, v.VerifyCanSign(t.Context()), "check token capabilities")
+	require.Zero(t, p.signCalls.Load())
+}
+
+func TestVaultVerifyCanSignFailsWhenCapabilitiesLackUpdate(t *testing.T) {
+	p := &preflightVaultServer{capsStatus: http.StatusOK, caps: []string{"read"}, lookupStatus: http.StatusOK, signStatus: http.StatusOK}
+	v := p.start(t)
+
+	require.ErrorContains(t, v.VerifyCanSign(t.Context()), "lacks 'update'")
+	require.Zero(t, p.signCalls.Load())
+}
+
+// Without lookup-self the renew loop can never renew, so a periodic token would
+// expire silently; preflight must refuse it and name the missing path.
+func TestVaultVerifyCanSignFailsWhenLookupSelfDenied(t *testing.T) {
+	p := &preflightVaultServer{capsStatus: http.StatusForbidden, lookupStatus: http.StatusForbidden, signStatus: http.StatusOK}
+	v := p.start(t)
+
+	require.ErrorContains(t, v.VerifyCanSign(t.Context()), "auth/token/lookup-self")
+	require.Zero(t, p.signCalls.Load())
+}
