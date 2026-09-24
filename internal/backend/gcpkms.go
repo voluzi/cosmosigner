@@ -27,8 +27,12 @@ type GCPKMSConfig struct {
 	// projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/V
 	KeyVersion string `yaml:"key_version" env:"COSMOSIGNER_GCP_KEY_VERSION"`
 	// CredentialsFile is optional; falls back to Application Default Credentials.
-	CredentialsFile string        `yaml:"credentials_file" env:"COSMOSIGNER_GCP_CREDENTIALS_FILE"`
-	Timeout         time.Duration `yaml:"-" env:"COSMOSIGNER_GCP_TIMEOUT" default:"10s"`
+	CredentialsFile string `yaml:"credentials_file" env:"COSMOSIGNER_GCP_CREDENTIALS_FILE"`
+	// ClaimCredentialsFile is an optional service account used only to write a missing cluster
+	// claim at startup (see Config.ClaimIfUnclaimed). Without it the runtime identity must be
+	// allowed to claim.
+	ClaimCredentialsFile string        `yaml:"claim_credentials_file" env:"COSMOSIGNER_GCP_CLAIM_CREDENTIALS_FILE"`
+	Timeout              time.Duration `yaml:"-" env:"COSMOSIGNER_GCP_TIMEOUT" default:"10s"`
 }
 
 // GCPKMS signs via a Cloud KMS EC_SIGN_ED25519 key (PureEdDSA, raw input). The

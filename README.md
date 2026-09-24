@@ -282,7 +282,8 @@ CLUSTER_ID=$(./bin/cosmosigner start \
 Cloud KMS has no conditional update field for CryptoKey labels. Initial GCP claiming is therefore
 not atomic: stop all signers and externally serialize the claim command. Cosmosigner preserves
 unrelated labels, changes only `cosmosigner-cluster-id`, and reads it back, but concurrent initial
-claim commands can both appear successful. Normal `start` is read-only for labels and never claims.
+claim commands can both appear successful. Normal `start` is read-only for labels and never claims
+unless `--claim-if-unclaimed` is set (see [Claiming at startup](#claiming-at-startup)).
 
 End-to-end sign+verify test against a real key (no node needed):
 
@@ -395,6 +396,45 @@ binary everywhere, run `start --initialize-only` with the existing directories a
 the key once under administrative credentials, then grant runtime claim-read permission and restart
 normally. Verify that a fresh independent data directory refuses the claimed key.
 
+### Claiming at startup
+
+The separate `start --initialize-only` / `claim-key` sequence suits a manually operated signer. An
+orchestrator that already guarantees one owner per key (for example a Kubernetes operator that stops
+every signer before a migration and reserves each consensus key for one deployment) can let `start`
+write the missing claim itself:
+
+```sh
+./bin/cosmosigner start --config cosmosigner.yaml --claim-if-unclaimed
+```
+
+`start` then ensures the Raft cluster ID as usual, reads the claim, and, only when the key resource
+is **unclaimed**, claims it for this cluster ID, reads it back through the runtime backend, and
+continues. A claim held by another cluster is refused exactly as without the flag, and
+`--initialize-only` never claims. Every replica of one cluster may claim concurrently: they share
+the cluster ID, so the Vault create-only write and the software marker lock settle on one record,
+and the Cloud KMS label receives the same value. The flag does not make an unclaimed key safe to
+adopt: only enable it where nothing else can be signing with that key.
+
+The claim uses the runtime identity unless dedicated claim credentials are supplied; they are used
+for the claim only and dropped immediately afterwards:
+
+| Backend | Claim credential | Runtime identity needs, without it |
+|---|---|---|
+| Vault | `--vault-claim-token-file` / `backend.vault.claim_token_file` / `COSMOSIGNER_VAULT_CLAIM_TOKEN_FILE` | `create`, `update` and `read` on `<binding_mount>/data/cluster-bindings/*` |
+| Cloud KMS | `--gcp-claim-credentials-file` / `backend.gcp.claim_credentials_file` / `COSMOSIGNER_GCP_CLAIM_CREDENTIALS_FILE` | `cloudkms.cryptoKeys.update` on the CryptoKey |
+| software | — | write access to the marker directory |
+
+Neither permission can delete or disable key material: the Vault policy only reaches the binding
+registry, and `cryptoKeys.update` changes CryptoKey metadata (labels, rotation, version template),
+while destroying or disabling versions needs `cryptoKeyVersions.destroy`/`update`. Claim credentials
+are rejected unless `claim_if_unclaimed` is enabled.
+
+The software marker defaults to `<key file>.cosmosigner-cluster.json`, next to the key. When the key
+is mounted read-only (a Kubernetes Secret), place the marker, and its lock, on writable storage such
+as the Raft volume with `--binding-file` / `backend.binding_file` / `COSMOSIGNER_BINDING_FILE`. The
+marker records the key's public key, so it cannot be adopted by different key material. Keep it
+with the Raft history it names: a new data directory needs a new marker, exactly like a new claim.
+
 Moving a validator transfers the complete current Raft history and its identity only after the old
 deployment is operationally fenced. Never copy only the UUID, use a stale snapshot, clear the
 high-water mark, or delete/relabel a claim after losing all authoritative state. Recover the correct
@@ -462,6 +502,8 @@ export COSMOSIGNER_BACKEND=gcpkms
 export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
 # Vault deployments can select the KV v2 claim registry:
 # export COSMOSIGNER_VAULT_BINDING_MOUNT=cosmosigner
+# Orchestrated deployments can claim an unclaimed key at startup (see "Claiming at startup"):
+# export COSMOSIGNER_CLAIM_IF_UNCLAIMED=true
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
@@ -485,6 +527,7 @@ nodes:                       # static list, OR use node_service (mutually exclus
   - 10.0.0.2:5555
 # node_service: sentries.my-ns.svc.cluster.local:5555
 conn_key: /data/conn_key.json
+claim_if_unclaimed: false    # true lets start claim an unclaimed key (orchestrated deployments)
 backend:
   type: vault
   vault:

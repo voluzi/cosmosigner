@@ -15,6 +15,7 @@ func registerBackendFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.String("backend", string(d.Type), "key backend: software | vault | gcpkms")
 	f.String("key-file", "", "software backend: priv_validator_key.json path")
+	f.String("binding-file", "", "software backend: cluster marker path (default: next to --key-file; set when the key is read-only)")
 	f.String("vault-addr", "", "vault address")
 	f.String("vault-token-file", "", "vault token file path")
 	f.String("vault-mount", d.Vault.Mount, "vault transit mount path")
@@ -37,6 +38,7 @@ func overlayBackendFlags(cmd *cobra.Command, c *backend.Config) {
 	}
 	s("backend", (*string)(&c.Type))
 	s("key-file", &c.SoftwareKeyFile)
+	s("binding-file", &c.SoftwareBindingFile)
 	s("vault-addr", &c.Vault.Address)
 	s("vault-token-file", &c.Vault.TokenFile)
 	s("vault-mount", &c.Vault.Mount)

@@ -229,3 +229,45 @@ func TestValidate_RequiresChainID(t *testing.T) {
 	_, err := Load("", func(c *Config) error { c.NodeAddrs = []string{"a:1"}; return nil })
 	require.ErrorContains(t, err, "chain_id")
 }
+
+func TestValidate_ClaimCredentialsRequireClaimIfUnclaimed(t *testing.T) {
+	cfg := Defaults()
+	cfg.ChainID = "chain"
+	cfg.NodeAddrs = []string{"node:5555"}
+	cfg.Raft.Insecure = true
+	cfg.Backend.Type = backend.TypeVault
+	cfg.Backend.Vault.KeyName = "validator"
+	cfg.Backend.Vault.TokenFile = "/vault/token"
+	cfg.Backend.Vault.ClaimTokenFile = "/vault/claim-token"
+
+	require.ErrorContains(t, cfg.Validate(), "claim_if_unclaimed")
+	cfg.ClaimIfUnclaimed = true
+	require.NoError(t, cfg.Validate())
+
+	cfg.Backend.Vault.ClaimTokenFile = ""
+	cfg.Backend.Type = backend.TypeGCPKMS
+	cfg.Backend.GCPKMS.KeyVersion = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+	cfg.Backend.GCPKMS.ClaimCredentialsFile = "/gcp/claim.json"
+	cfg.ClaimIfUnclaimed = false
+	require.ErrorContains(t, cfg.Validate(), "claim_if_unclaimed")
+}
+
+func TestLoad_ClaimSettingsFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`chain_id: chain
+nodes: ["node:5555"]
+claim_if_unclaimed: true
+backend:
+  type: software
+  key_file: /keys/priv_validator_key.json
+  binding_file: /data/cluster.json
+raft:
+  insecure: true
+  single_node: true
+  bootstrap: true
+`), 0o600))
+	cfg, err := Load(path, nil)
+	require.NoError(t, err)
+	require.True(t, cfg.ClaimIfUnclaimed)
+	require.Equal(t, "/data/cluster.json", cfg.Backend.SoftwareBindingFile)
+}

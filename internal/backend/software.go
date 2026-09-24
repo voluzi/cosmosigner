@@ -19,9 +19,12 @@ import (
 // Software holds the consensus private key in process. It is the default
 // backend for local testing; production deployments should use Vault.
 type Software struct {
-	priv           crypto.PrivKey
-	keyPath        string
-	bindingPath    string
+	priv        crypto.PrivKey
+	keyPath     string
+	bindingPath string
+	// lockPath is the base path of the claim lock: the key path by default, or the binding path
+	// when the marker is relocated (the key directory may be read-only).
+	lockPath       string
 	bindingOps     softwareBindingOps
 	operationHooks softwareOperationHooks
 }
@@ -52,6 +55,12 @@ type softwareBindingRecord struct {
 
 // NewSoftware loads a priv_validator_key.json-compatible file.
 func NewSoftware(keyFile string) (*Software, error) {
+	return NewSoftwareWithBindingFile(keyFile, "")
+}
+
+// NewSoftwareWithBindingFile loads a key file and keeps its cluster marker at bindingFile, or next
+// to the key when bindingFile is empty.
+func NewSoftwareWithBindingFile(keyFile, bindingFile string) (*Software, error) {
 	canonicalPath, err := resolveExistingSoftwareKeyPath(keyFile)
 	if err != nil {
 		return nil, err
@@ -60,12 +69,37 @@ func NewSoftware(keyFile string) (*Software, error) {
 	if err != nil {
 		return nil, err
 	}
+	bindingPath, lockPath := canonicalPath+softwareBindingSuffix, canonicalPath
+	if bindingFile != "" {
+		if bindingPath, err = resolveSoftwareBindingPath(bindingFile); err != nil {
+			return nil, err
+		}
+		if bindingPath == canonicalPath {
+			return nil, fmt.Errorf("software binding file %q must differ from the key file", bindingFile)
+		}
+		lockPath = bindingPath
+	}
 	return &Software{
 		priv:        priv,
 		keyPath:     canonicalPath,
-		bindingPath: canonicalPath + softwareBindingSuffix,
+		bindingPath: bindingPath,
+		lockPath:    lockPath,
 		bindingOps:  defaultSoftwareBindingOps(),
 	}, nil
+}
+
+// resolveSoftwareBindingPath canonicalises the marker's directory, which must exist, so the marker
+// is compared and locked by its real location.
+func resolveSoftwareBindingPath(bindingFile string) (string, error) {
+	absPath, err := filepath.Abs(bindingFile)
+	if err != nil {
+		return "", fmt.Errorf("resolve software binding file: %w", err)
+	}
+	directory, err := filepath.EvalSymlinks(filepath.Dir(absPath))
+	if err != nil {
+		return "", fmt.Errorf("resolve software binding directory %q: %w", filepath.Dir(absPath), err)
+	}
+	return filepath.Join(directory, filepath.Base(absPath)), nil
 }
 
 // NewSoftwareFromPriv wraps an in-memory private key (used by tests).
@@ -128,7 +162,11 @@ func (s *Software) ClaimCluster(ctx context.Context, id string) error {
 	if err := clusterid.Validate(id); err != nil {
 		return fmt.Errorf("invalid cluster ID: %w", err)
 	}
-	return withSoftwareKeyLock(ctx, s.keyPath, s.operationHooks, func() error {
+	lockPath := s.lockPath
+	if lockPath == "" {
+		lockPath = s.keyPath
+	}
+	return withSoftwareKeyLock(ctx, lockPath, s.operationHooks, func() error {
 		diskPriv, err := loadSoftwarePrivateKey(s.keyPath)
 		if err != nil {
 			return fmt.Errorf("%w: validate software key %q before claim: %v", ErrBindingCorrupt, s.keyPath, err)
