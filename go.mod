@@ -7,7 +7,7 @@ require (
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cometbft/cometbft v0.38.26
 	github.com/cosmos/gogoproto v1.7.2
-	github.com/creasty/defaults v1.10.0
+	github.com/creasty/defaults v1.11.0
 	github.com/google/tink/go v1.7.0
 	github.com/googleapis/gax-go/v2 v2.24.1
 	github.com/hashicorp/go-hclog v1.6.3
