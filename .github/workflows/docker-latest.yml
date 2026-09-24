@@ -1,4 +1,4 @@
-name: Build Cosmosigner Latest Image
+name: Build Cosmosigner Edge Image
 
 on:
   push:
@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   build:
-    name: Build and Push Cosmosigner Images
+    name: Build and Push Cosmosigner Edge Images
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
@@ -72,7 +73,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          tags: latest-${{ env.ARCH }}
+          tags: edge-${{ env.ARCH }}
 
       - name: Build and push by arch
         id: build
@@ -86,10 +87,11 @@ jobs:
             COMMIT=${{ github.sha }}
 
   merge:
-    name: Create Multi-arch Cosmosigner Latest Image
+    name: Create Multi-arch Cosmosigner Edge Image
     needs:
       - build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -107,7 +109,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=edge
 
       - name: Create manifest list and push
         run: |
@@ -115,5 +117,5 @@ jobs:
           TAGS=$(jq -r '.tags[] | "--tag " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
           docker buildx imagetools create \
             $TAGS \
-            "${image}:latest-amd64" \
-            "${image}:latest-arm64"
+            "${image}:edge-amd64" \
+            "${image}:edge-arm64"
