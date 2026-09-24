@@ -16,7 +16,10 @@ import (
 	"github.com/cometbft/cometbft/privval"
 )
 
-const softwareBindingSuffix = ".cosmosigner-cluster.json"
+const (
+	softwareBindingSuffix = ".cosmosigner-cluster.json"
+	softwareLockSuffix    = ".cosmosigner-cluster.lock"
+)
 
 type softwareOperationHooks struct {
 	afterLock func()

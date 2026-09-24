@@ -21,6 +21,10 @@ type vaultBindingServer struct {
 	privateKey          ed25519.PrivKey
 	failWriteAfterStore bool
 	responseMetadata    map[string]any
+	// orphanMetadata serves metadata while the value is absent; beforeMetadataRead runs under the
+	// lock before a metadata read, to model a claim landing between the data and metadata reads.
+	orphanMetadata     bool
+	beforeMetadataRead func(*vaultBindingServer)
 }
 
 func (s *vaultBindingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +64,10 @@ func (s *vaultBindingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/registry/metadata/cluster-bindings/"+vaultBindingAddress("team/transit", "validator"):
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.record == nil && !s.tombstoned {
+		if s.beforeMetadataRead != nil {
+			s.beforeMetadataRead(s)
+		}
+		if s.record == nil && !s.tombstoned && !s.orphanMetadata {
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"not found"}})
 			return
@@ -211,4 +218,30 @@ func TestVaultBindingRejectsMissingOrWrongTypedVersionMetadata(t *testing.T) {
 			require.ErrorIs(t, err, ErrBindingCorrupt)
 		})
 	}
+}
+
+// A claim another replica creates between the data read and the metadata read is read back, not
+// reported as corrupt.
+func TestVaultBindingRereadsAClaimCreatedBetweenReads(t *testing.T) {
+	state := &vaultBindingServer{}
+	v := newVaultBindingBackend(t, state)
+	record := map[string]any{"version": 1, "cluster_id": clusterA, "transit_mount": "team/transit", "key_name": "validator"}
+	state.beforeMetadataRead = func(s *vaultBindingServer) {
+		s.record = record
+		s.beforeMetadataRead = nil
+	}
+
+	owner, err := v.ClusterBinding(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, clusterA, owner)
+}
+
+// Metadata that stays without a readable value is still corrupt after the re-read.
+func TestVaultBindingMetadataWithoutValueIsCorrupt(t *testing.T) {
+	state := &vaultBindingServer{orphanMetadata: true}
+	v := newVaultBindingBackend(t, state)
+
+	_, err := v.ClusterBinding(t.Context())
+	require.ErrorIs(t, err, ErrBindingCorrupt)
+	require.ErrorIs(t, v.ClaimCluster(t.Context(), clusterA), ErrBindingCorrupt)
 }
