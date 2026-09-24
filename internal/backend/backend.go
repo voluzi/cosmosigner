@@ -78,17 +78,46 @@ const (
 
 // Config selects and configures a KeyBackend.
 type Config struct {
-	Type            Type         `yaml:"type"     env:"COSMOSIGNER_BACKEND"  default:"software"`
-	SoftwareKeyFile string       `yaml:"key_file" env:"COSMOSIGNER_KEY_FILE"`
-	Vault           VaultConfig  `yaml:"vault"`
-	GCPKMS          GCPKMSConfig `yaml:"gcp"`
+	Type            Type   `yaml:"type"     env:"COSMOSIGNER_BACKEND"  default:"software"`
+	SoftwareKeyFile string `yaml:"key_file" env:"COSMOSIGNER_KEY_FILE"`
+	// SoftwareBindingFile relocates the software cluster marker (and its lock) away from the key
+	// file, e.g. when the key is mounted read-only. The marker records the key's public key, so it
+	// cannot be reused for different key material. Defaults to the key path plus a suffix.
+	SoftwareBindingFile string       `yaml:"binding_file" env:"COSMOSIGNER_BINDING_FILE"`
+	Vault               VaultConfig  `yaml:"vault"`
+	GCPKMS              GCPKMSConfig `yaml:"gcp"`
+}
+
+// ClaimConfig returns the configuration used to write a missing cluster claim at startup. It is
+// cfg with the optional claim credentials substituted for the runtime ones, so an operator can keep
+// claim permissions off the running signer; without them the runtime credentials are reused.
+func ClaimConfig(cfg Config) Config {
+	if cfg.Vault.ClaimTokenFile != "" {
+		cfg.Vault.TokenFile = cfg.Vault.ClaimTokenFile
+	}
+	if cfg.GCPKMS.ClaimCredentialsFile != "" {
+		cfg.GCPKMS.CredentialsFile = cfg.GCPKMS.ClaimCredentialsFile
+	}
+	return cfg
+}
+
+// HasSeparateClaimCredentials reports whether ClaimConfig substitutes credentials for cfg's backend.
+func HasSeparateClaimCredentials(cfg Config) bool {
+	switch cfg.Type {
+	case TypeVault:
+		return cfg.Vault.ClaimTokenFile != ""
+	case TypeGCPKMS:
+		return cfg.GCPKMS.ClaimCredentialsFile != ""
+	default:
+		return false
+	}
 }
 
 // New builds the KeyBackend described by cfg.
 func New(cfg Config) (KeyBackend, error) {
 	switch cfg.Type {
 	case TypeSoftware, "":
-		return NewSoftware(cfg.SoftwareKeyFile)
+		return NewSoftwareWithBindingFile(cfg.SoftwareKeyFile, cfg.SoftwareBindingFile)
 	case TypeVault:
 		return NewVault(cfg.Vault)
 	case TypeGCPKMS:

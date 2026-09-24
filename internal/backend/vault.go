@@ -30,6 +30,9 @@ type VaultConfig struct {
 	KeyVersion   int    `yaml:"key_version" env:"COSMOSIGNER_VAULT_KEY_VERSION"`
 	Namespace    string `yaml:"namespace"   env:"COSMOSIGNER_VAULT_NAMESPACE"`
 	TLSCACert    string `yaml:"tls_ca_cert" env:"COSMOSIGNER_VAULT_CA_CERT"`
+	// ClaimTokenFile is an optional token used only to write a missing cluster claim at startup
+	// (see Config.ClaimIfUnclaimed). Without it the runtime token must be allowed to claim.
+	ClaimTokenFile string `yaml:"claim_token_file" env:"COSMOSIGNER_VAULT_CLAIM_TOKEN_FILE"`
 }
 
 // Vault signs via the Vault Transit engine. The consensus key is created

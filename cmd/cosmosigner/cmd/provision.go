@@ -63,6 +63,11 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 			}
 			switch be.Type {
 			case backend.TypeSoftware, "":
+				if be.SoftwareBindingFile != "" {
+					// Provision refuses to overwrite a claimed key by checking and locking the marker
+					// next to the key; it cannot see a relocated one.
+					return fmt.Errorf("provision does not support --binding-file; provision the key, then claim it with start or claim-key")
+				}
 				return provisionSoftware(cmd.Context(), be.SoftwareKeyFile, overwrite)
 			case backend.TypeVault:
 				return provisionVault(be.Vault)

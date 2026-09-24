@@ -81,10 +81,17 @@ func (v *Vault) ClusterBinding(ctx context.Context) (string, error) {
 		if metadataErr != nil {
 			return "", fmt.Errorf("%w: inspect %s metadata: %v", ErrBindingUnreadable, v.bindingResource(), metadataErr)
 		}
-		if metadata != nil && metadata.Data != nil {
+		if metadata == nil || metadata.Data == nil {
+			return "", fmt.Errorf("%w: %s", ErrBindingUnclaimed, v.bindingResource())
+		}
+		// Metadata without a value is either a deleted record or a claim another replica created
+		// between the two reads above. Read the value once more before calling it corrupt.
+		if secret, err = v.client.Logical().ReadWithContext(ctx, v.bindingDataPath()); err != nil {
+			return "", fmt.Errorf("%w: read %s: %v", ErrBindingUnreadable, v.bindingResource(), err)
+		}
+		if secret == nil || secret.Data == nil {
 			return "", fmt.Errorf("%w: %s has metadata but no readable current value", ErrBindingCorrupt, v.bindingResource())
 		}
-		return "", fmt.Errorf("%w: %s", ErrBindingUnclaimed, v.bindingResource())
 	}
 
 	metadata, ok := secret.Data["metadata"].(map[string]any)

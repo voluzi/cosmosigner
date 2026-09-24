@@ -65,6 +65,9 @@ func NewStartCmd() *cobra.Command {
 	f.String("raft-tls-cert", "", "raft mTLS certificate (PEM); required with --raft-tls-key and --raft-tls-ca unless --raft-insecure is set")
 	f.String("raft-tls-key", "", "raft mTLS private key (PEM)")
 	f.String("raft-tls-ca", "", "raft mTLS CA bundle (PEM) used to verify peer certificates")
+	f.Bool("claim-if-unclaimed", false, "write the key's cluster claim at startup when none exists; a claim held by another cluster is still refused")
+	f.String("vault-claim-token-file", "", "optional vault token used only for the --claim-if-unclaimed startup claim")
+	f.String("gcp-claim-credentials-file", "", "optional gcp service account JSON used only for the --claim-if-unclaimed startup claim")
 	registerBackendFlags(cmd)
 	return cmd
 }
@@ -118,6 +121,11 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 	s("raft-tls-cert", &c.Raft.TLSCert)
 	s("raft-tls-key", &c.Raft.TLSKey)
 	s("raft-tls-ca", &c.Raft.TLSCA)
+	if f.Changed("claim-if-unclaimed") {
+		c.ClaimIfUnclaimed, _ = f.GetBool("claim-if-unclaimed")
+	}
+	s("vault-claim-token-file", &c.Backend.Vault.ClaimTokenFile)
+	s("gcp-claim-credentials-file", &c.Backend.GCPKMS.ClaimCredentialsFile)
 	overlayBackendFlags(cmd, &c.Backend)
 	return nil
 }
@@ -211,7 +219,11 @@ func runStartWithContext(
 		return err
 	}
 	defer store.Close()
-	clusterID, err := prepareStartup(ctx, be, store, initializeOnly)
+	var claim startupClaimer
+	if cfg.ClaimIfUnclaimed {
+		claim = claimWithConfig(backend.ClaimConfig(cfg.Backend), be, backend.HasSeparateClaimCredentials(cfg.Backend), logger)
+	}
+	clusterID, err := prepareStartupWithClaim(ctx, be, store, initializeOnly, claim)
 	if err != nil {
 		return err
 	}
@@ -277,7 +289,40 @@ func runStartWithContext(
 
 const clusterIdentityTimeout = 30 * time.Second
 
+// startupClaimer writes a missing cluster claim for clusterID.
+type startupClaimer func(ctx context.Context, clusterID string) error
+
+// claimWithConfig claims through be, or through a separate backend built from claimCfg when the
+// operator supplied dedicated claim credentials; that backend is closed right after the claim.
+func claimWithConfig(claimCfg backend.Config, be backend.KeyBackend, separate bool, logger cmtlog.Logger) startupClaimer {
+	return func(ctx context.Context, clusterID string) error {
+		claimer := be
+		if separate {
+			claimBackend, err := backend.New(claimCfg)
+			if err != nil {
+				return fmt.Errorf("build claim backend: %w", err)
+			}
+			defer claimBackend.Close()
+			claimer = claimBackend
+		}
+		if claimCfg.Type == backend.TypeGCPKMS {
+			logger.Info("Cloud KMS label updates have no atomic compare-and-set; one owner per key must be guaranteed externally")
+		}
+		if err := claimer.ClaimCluster(ctx, clusterID); err != nil {
+			return fmt.Errorf("claim %s for cluster %s: %w", backend.BindingResource(be), clusterID, err)
+		}
+		logger.Info("claimed key resource", "resource", backend.BindingResource(be), "cluster_id", clusterID)
+		return nil
+	}
+}
+
 func prepareStartup(ctx context.Context, be backend.KeyBackend, store state.StateStore, initializeOnly bool) (string, error) {
+	return prepareStartupWithClaim(ctx, be, store, initializeOnly, nil)
+}
+
+// prepareStartupWithClaim ensures the Raft cluster ID and the key's matching claim. When claim is
+// set, an unclaimed key is claimed for this cluster first; a claim for another cluster still fails.
+func prepareStartupWithClaim(ctx context.Context, be backend.KeyBackend, store state.StateStore, initializeOnly bool, claim startupClaimer) (string, error) {
 	identityCtx, cancel := context.WithTimeout(ctx, clusterIdentityTimeout)
 	defer cancel()
 	clusterID, err := store.EnsureClusterID(identityCtx)
@@ -287,7 +332,15 @@ func prepareStartup(ctx context.Context, be backend.KeyBackend, store state.Stat
 	if initializeOnly {
 		return clusterID, nil
 	}
-	if err := backend.RequireClusterBinding(ctx, be, clusterID); err != nil {
+	err = backend.RequireClusterBinding(ctx, be, clusterID)
+	if claim != nil && errors.Is(err, backend.ErrBindingUnclaimed) {
+		if claimErr := claim(ctx, clusterID); claimErr != nil {
+			return "", claimErr
+		}
+		// Re-read through the runtime backend: it must be able to see the claim it will rely on.
+		err = backend.RequireClusterBinding(ctx, be, clusterID)
+	}
+	if err != nil {
 		return "", err
 	}
 	if preflight, ok := be.(interface {

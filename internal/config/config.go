@@ -28,6 +28,11 @@ type Config struct {
 	ConnKey     string `yaml:"conn_key" env:"COSMOSIGNER_CONN_KEY" default:"./data/conn_key.json"`
 	StateDir    string `yaml:"state_dir" env:"COSMOSIGNER_STATE_DIR" default:"./data"`
 	LogLevel    string `yaml:"log_level" env:"COSMOSIGNER_LOG_LEVEL" default:"info"`
+	// ClaimIfUnclaimed lets start write the key's cluster claim when none exists yet, instead of
+	// requiring a separate claim-key run. A claim held by another cluster is still refused. Enable
+	// it only where one owner per key is guaranteed externally (e.g. by an operator), because the
+	// claim is what stops a second signing history from adopting an unclaimed key.
+	ClaimIfUnclaimed bool `yaml:"claim_if_unclaimed" env:"COSMOSIGNER_CLAIM_IF_UNCLAIMED"`
 
 	// Connection tuning (durations are not YAML-friendly; flag/env/default only).
 	ReconcileInterval time.Duration `yaml:"-" env:"COSMOSIGNER_RECONCILE_INTERVAL" default:"5s"`
@@ -153,6 +158,15 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown backend type %q", c.Backend.Type)
+	}
+	if !c.ClaimIfUnclaimed && (c.Backend.Vault.ClaimTokenFile != "" || c.Backend.GCPKMS.ClaimCredentialsFile != "") {
+		return fmt.Errorf("claim credentials are only used with claim_if_unclaimed: true (--claim-if-unclaimed)")
+	}
+	if c.Backend.Vault.ClaimTokenFile != "" && c.Backend.Type != backend.TypeVault {
+		return fmt.Errorf("backend.vault.claim_token_file requires the vault backend")
+	}
+	if c.Backend.GCPKMS.ClaimCredentialsFile != "" && c.Backend.Type != backend.TypeGCPKMS {
+		return fmt.Errorf("backend.gcp.claim_credentials_file requires the gcpkms backend")
 	}
 	if c.Raft.NodeID == "" {
 		return fmt.Errorf("raft.node_id is required")

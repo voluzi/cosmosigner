@@ -12,8 +12,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const softwareLockSuffix = ".cosmosigner-cluster.lock"
-
 func acquireSoftwareKeyLock(ctx context.Context, canonicalPath string) (func() error, error) {
 	lockPath := canonicalPath + softwareLockSuffix
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
