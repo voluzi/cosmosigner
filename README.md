@@ -421,7 +421,7 @@ for the claim only and dropped immediately afterwards:
 
 | Backend | Claim credential | Runtime identity needs, without it |
 |---|---|---|
-| Vault | `--vault-claim-token-file` / `backend.vault.claim_token_file` / `COSMOSIGNER_VAULT_CLAIM_TOKEN_FILE` | `create`, `update` and `read` on `<binding_mount>/data/cluster-bindings/*` |
+| Vault | `--vault-claim-token-file` / `backend.vault.claim_token_file` / `COSMOSIGNER_VAULT_CLAIM_TOKEN_FILE` | `create`, `update` and `read` on `<binding_mount>/data/cluster-bindings/*`, plus `read` on `<binding_mount>/metadata/cluster-bindings/*` (already part of the runtime policy) |
 | Cloud KMS | `--gcp-claim-credentials-file` / `backend.gcp.claim_credentials_file` / `COSMOSIGNER_GCP_CLAIM_CREDENTIALS_FILE` | `cloudkms.cryptoKeys.update` on the CryptoKey |
 | software | — | write access to the marker directory |
 
