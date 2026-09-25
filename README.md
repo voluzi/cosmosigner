@@ -244,6 +244,28 @@ The runtime identity needs `roles/cloudkms.signerVerifier` plus
 against the key's public key, so a policy granting only `viewer` — or a key
 version that is not `ENABLED` — fails fast at boot instead of at the first vote.
 
+`import` reads existing resources before creating anything, so importing into an existing
+CryptoKey needs only:
+
+| Permission | Granted on |
+|---|---|
+| `cloudkms.cryptoKeys.get` | the CryptoKey |
+| `cloudkms.cryptoKeyVersions.create`, `cloudkms.cryptoKeyVersions.get`, `cloudkms.cryptoKeyVersions.viewPublicKey` | the CryptoKey |
+| `cloudkms.importJobs.get`, `cloudkms.importJobs.useToImport` | the key ring, or the ImportJob when it (default `<key>-import`) already exists |
+| `cloudkms.importJobs.create` | the key ring — unless `--gcp-import-job` names an existing job that is `ACTIVE` or still `PENDING_GENERATION` |
+
+`viewPublicKey` lets `import` verify the imported identity. An existing CryptoKey must be
+`ASYMMETRIC_SIGN` with an `EC_SIGN_ED25519` version template at the requested `--gcp-protection`
+level (an import-only key is fine), and an existing ImportJob must use `RSA_OAEP_3072_SHA256` or
+`RSA_OAEP_4096_SHA256` at that level; `import` fails otherwise.
+
+Cloud KMS checks permissions before existence, so a read of a resource that does not exist yet
+returns `PermissionDenied`, not `NotFound`, unless it is granted on a parent that does exist. When
+the CryptoKey is missing, `import` creates it, which additionally needs `cloudkms.keyRings.get` and
+`cloudkms.cryptoKeys.create`, with every CryptoKey permission above granted on the key ring. When the
+key ring is missing too, `import` also creates it with `cloudkms.keyRings.create`; there is nothing
+to bind to below the project yet, so that and every permission above must be granted on the project.
+
 ```sh
 # create a signing key
 ./bin/cosmosigner provision --backend gcpkms \
