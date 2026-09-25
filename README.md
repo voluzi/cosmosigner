@@ -252,7 +252,7 @@ CryptoKey needs only:
 | `cloudkms.cryptoKeys.get` | the CryptoKey |
 | `cloudkms.cryptoKeyVersions.create`, `cloudkms.cryptoKeyVersions.get`, `cloudkms.cryptoKeyVersions.viewPublicKey` | the CryptoKey |
 | `cloudkms.importJobs.get`, `cloudkms.importJobs.useToImport` | the key ring, or the ImportJob when it (default `<key>-import`) already exists |
-| `cloudkms.importJobs.create` | the key ring — unless `--gcp-import-job` names an existing, `ACTIVE` job |
+| `cloudkms.importJobs.create` | the key ring — unless `--gcp-import-job` names an existing job that is `ACTIVE` or still `PENDING_GENERATION` |
 
 `viewPublicKey` lets `import` verify the imported identity. An existing CryptoKey must be
 `ASYMMETRIC_SIGN` with an `EC_SIGN_ED25519` version template at the requested `--gcp-protection`
