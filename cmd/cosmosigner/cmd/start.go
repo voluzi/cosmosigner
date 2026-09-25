@@ -197,6 +197,9 @@ func runStartWithContext(
 	logger cmtlog.Logger,
 	raftLogger hclog.Logger,
 ) error {
+	if l, ok := be.(interface{ SetLogger(cmtlog.Logger) }); ok {
+		l.SetLogger(logger)
+	}
 	raftCfg := state.RaftConfig{
 		NodeID:     cfg.Raft.NodeID,
 		BindAddr:   cfg.Raft.BindAddr,

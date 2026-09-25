@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
+	cmtlog "github.com/cometbft/cometbft/libs/log"
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
@@ -56,6 +59,8 @@ type Vault struct {
 	renewMu   sync.Mutex
 	started   bool
 	closed    bool
+
+	logger cmtlog.Logger
 }
 
 // NewVault connects to Vault and caches the public key. Token renewal is activated explicitly
@@ -151,14 +156,23 @@ func (v *Vault) VerifyCanSign(ctx context.Context) error {
 func (v *Vault) verifyClientCanSign(ctx context.Context, client *vaultapi.Client) error {
 	signPath := fmt.Sprintf("%s/sign/%s", v.mount, v.keyName)
 	caps, err := client.Sys().CapabilitiesSelfWithContext(ctx, signPath)
-	if err != nil {
+	switch {
+	case isVaultPermissionDenied(err):
+		// Tokens without the default policy may not introspect themselves; the
+		// sign probe below is the authoritative check.
+		v.logDebug("vault token cannot read its capabilities; relying on the sign probe", "path", signPath)
+	case err != nil:
 		return fmt.Errorf("check token capabilities on %s: %w", signPath, err)
-	}
-	if !hasCapability(caps, "update") {
+	case !hasCapability(caps, "update"):
 		return fmt.Errorf("vault token lacks 'update' on %s (capabilities: %v) — it cannot sign", signPath, caps)
 	}
 
+	// Fatal even when denied: the renew loop needs lookup-self to schedule
+	// renewal, so a periodic token without it would expire silently.
 	secret, err := client.Auth().Token().LookupSelfWithContext(ctx)
+	if isVaultPermissionDenied(err) {
+		return fmt.Errorf("permission denied on auth/token/lookup-self, which cosmosigner needs to track and renew the token: the token is invalid or expired, or its policy lacks read on that path (grant it, or keep the default policy): %w", err)
+	}
 	if err != nil {
 		return fmt.Errorf("look up vault token: %w", err)
 	}
@@ -171,6 +185,27 @@ func (v *Vault) verifyClientCanSign(ctx context.Context, client *vaultapi.Client
 		return fmt.Errorf("vault key %q version %d cannot sign: %w", v.keyName, v.keyVersion, err)
 	}
 	return nil
+}
+
+func isVaultPermissionDenied(err error) bool {
+	var respErr *vaultapi.ResponseError
+	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusForbidden
+}
+
+// SetLogger sets the logger for non-fatal backend diagnostics (none by default).
+// Call it before StartRenewal.
+func (v *Vault) SetLogger(logger cmtlog.Logger) { v.logger = logger }
+
+func (v *Vault) logDebug(msg string, kv ...any) {
+	if v.logger != nil {
+		v.logger.Debug(msg, kv...)
+	}
+}
+
+func (v *Vault) logError(msg string, kv ...any) {
+	if v.logger != nil {
+		v.logger.Error(msg, kv...)
+	}
 }
 
 func hasCapability(caps []string, want string) bool {
@@ -367,12 +402,15 @@ func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
 					if verifyErr := v.verifyClientCanSign(context.Background(), candidate); verifyErr == nil {
 						v.client.SetToken(token)
 						renewAt = time.Time{}
+					} else {
+						v.logError("rejected replacement vault token; still using the current one", "err", verifyErr)
 					}
 				}
 			}
 		}
 		secret, err := v.client.Auth().Token().LookupSelf()
 		if err != nil {
+			v.logError("vault token lookup failed; cannot schedule renewal", "err", err)
 			if sleepOrStop(v.stopRenew, min(pollInterval, 30*time.Second)) {
 				return
 			}
@@ -397,6 +435,7 @@ func (v *Vault) renewLoopWithPollInterval(pollInterval time.Duration) {
 			continue
 		}
 		if _, err := v.client.Auth().Token().RenewSelf(0); err != nil {
+			v.logError("vault token renewal failed", "err", err)
 			if sleepOrStop(v.stopRenew, min(pollInterval, 5*time.Second)) {
 				return
 			}

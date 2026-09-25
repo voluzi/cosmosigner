@@ -207,7 +207,20 @@ path "transit/keys/my-validator" { capabilities = ["read"] }
 path "transit/sign/my-validator" { capabilities = ["update"] }
 path "cosmosigner/data/cluster-bindings/*" { capabilities = ["read"] }
 path "cosmosigner/metadata/cluster-bindings/*" { capabilities = ["read"] }
+
+# Token self-management. Vault's built-in `default` policy already grants these. A token created
+# with `-no-default-policy` (as tmKMS setups do) needs them in its own policy, alongside everything
+# above.
+path "auth/token/lookup-self" { capabilities = ["read"] }
+path "auth/token/renew-self" { capabilities = ["update"] }
+path "sys/capabilities-self" { capabilities = ["update"] }  # optional
 ```
+
+`lookup-self` is required: without it Cosmosigner cannot see the token's TTL, so it could never renew
+it, and the startup preflight rejects the token. `renew-self` is needed for renewable and periodic
+tokens. `sys/capabilities-self` is optional: when it is denied, the preflight skips the capability
+check and relies on its sign probe against `transit/sign/<key>`. A tmKMS token reused as-is also
+lacks the `cluster-bindings` reads above, so extend its policy before migrating.
 
 Use a separate administrative identity for the one-shot create-only claim. It needs the runtime
 reads plus `create` and `update` on the data path because Vault enforces CAS-zero during creation:
