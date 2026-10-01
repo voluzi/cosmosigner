@@ -428,6 +428,7 @@ func (l *Lifecycle) transferLeadership() {
 	if err := transferer.TransferLeadership(context.Background()); err != nil {
 		l.logger.Error("raft leadership handoff failed; followers will elect after the heartbeat timeout", "err", err)
 	} else if !l.store.IsLeader() {
-		l.logger.Info("handed off raft leadership")
+		// Also reached when leadership was lost on its own before the transfer was dispatched.
+		l.logger.Info("no longer raft leader; continuing shutdown")
 	}
 }

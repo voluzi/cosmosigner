@@ -244,20 +244,3 @@ func ensureImportJob(ctx context.Context, client gcpImportClient, cfg GCPImportC
 	}
 	return job, nil
 }
-
-func ensureKeyRing(ctx context.Context, client gcpProvisionClient, project, location, keyRing string) error {
-	name := fmt.Sprintf("projects/%s/locations/%s/keyRings/%s", project, location, keyRing)
-	if _, err := client.GetKeyRing(ctx, &kmspb.GetKeyRingRequest{Name: name}); err != nil {
-		if status.Code(err) != codes.NotFound {
-			return fmt.Errorf("get key ring: %w", err)
-		}
-		if _, err := client.CreateKeyRing(ctx, &kmspb.CreateKeyRingRequest{
-			Parent:    fmt.Sprintf("projects/%s/locations/%s", project, location),
-			KeyRingId: keyRing,
-			KeyRing:   &kmspb.KeyRing{},
-		}); err != nil && status.Code(err) != codes.AlreadyExists {
-			return fmt.Errorf("create key ring: %w", err)
-		}
-	}
-	return nil
-}
