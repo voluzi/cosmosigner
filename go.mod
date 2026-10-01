@@ -3,7 +3,7 @@ module github.com/voluzi/cosmosigner
 go 1.26.0
 
 require (
-	cloud.google.com/go/kms v1.33.0
+	cloud.google.com/go/kms v1.35.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cometbft/cometbft v0.38.26
 	github.com/cosmos/gogoproto v1.7.2
