@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"crypto/sha256"
 	"net"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/voluzi/cosmosigner/internal/backend"
+	"github.com/voluzi/cosmosigner/internal/server"
 	"github.com/voluzi/cosmosigner/internal/signer"
 	"github.com/voluzi/cosmosigner/internal/state"
 )
@@ -270,4 +272,122 @@ func TestIntegration_IndependentRaftHistoriesCannotUseSameSoftwareKey(t *testing
 	err = backend.RequireClusterBinding(t.Context(), backendB, clusterB)
 	require.ErrorIs(t, err, backend.ErrBindingMismatch)
 	require.Zero(t, backendB.signs.Load(), "independent history must be refused before any backend or preflight signature")
+}
+
+type clusterHarness struct {
+	pub     crypto.PubKey
+	stores  []state.StateStore
+	client  *privval.SignerClient
+	cancels []context.CancelFunc
+	done    []chan struct{}
+}
+
+func newClusterHarness(t *testing.T) *clusterHarness {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("multi-node raft test")
+	}
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	pub, err := be.PubKey()
+	require.NoError(t, err)
+	h := &clusterHarness{pub: pub}
+	members := []state.Member{
+		{ID: "n0", Address: freeAddr(t)},
+		{ID: "n1", Address: freeAddr(t)},
+		{ID: "n2", Address: freeAddr(t)},
+	}
+	for i, member := range members {
+		store, err := state.NewRaftStore(state.RaftConfig{
+			NodeID: member.ID, BindAddr: member.Address, DataDir: t.TempDir(),
+			Bootstrap: i == 0, Insecure: true, Members: members,
+		}, hclog.NewNullLogger())
+		require.NoError(t, err)
+		h.stores = append(h.stores, store)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+
+	logger := cmtlog.NewNopLogger()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	sl := privval.NewSignerListenerEndpoint(logger, privval.NewTCPListener(ln, ed25519.GenPrivKey()),
+		privval.SignerListenerEndpointTimeoutReadWrite(time.Second))
+	require.NoError(t, sl.Start())
+	t.Cleanup(func() { require.NoError(t, sl.Stop()) })
+
+	t.Cleanup(func() {
+		for _, cancel := range h.cancels {
+			cancel()
+		}
+		for _, done := range h.done {
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Error("signer lifecycle did not stop")
+			}
+		}
+	})
+	for _, store := range h.stores {
+		pv, err := signer.New(be, store)
+		require.NoError(t, err)
+		lc := server.New(server.Config{
+			ChainID: itestChain, ReconcileInterval: 200 * time.Millisecond, TimeoutReadWrite: time.Second,
+		}, server.StaticNodes{ln.Addr().String()}, pv, ed25519.GenPrivKey(), store, logger)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		h.cancels = append(h.cancels, cancel)
+		h.done = append(h.done, done)
+		go func() {
+			defer close(done)
+			_ = lc.Run(ctx)
+		}()
+	}
+	h.client, err = privval.NewSignerClient(sl, itestChain)
+	require.NoError(t, err)
+	return h
+}
+
+func TestIntegration_GracefulLeaderShutdownHandsOffSigning(t *testing.T) {
+	h := newClusterHarness(t)
+	vote := makeVote(10, 0, time.Now().UTC(), "block-A")
+	require.Eventually(t, func() bool {
+		return h.client.SignVote(itestChain, vote) == nil
+	}, 30*time.Second, 100*time.Millisecond)
+	require.True(t, h.pub.VerifySignature(types.VoteSignBytes(itestChain, vote), vote.Signature))
+
+	leader := -1
+	leaders := 0
+	for i, store := range h.stores {
+		if store.IsLeader() {
+			leader = i
+			leaders++
+		}
+	}
+	require.Equal(t, 1, leaders)
+	h.cancels[leader]()
+	select {
+	case <-h.done[leader]:
+	case <-time.After(15 * time.Second):
+		t.Fatal("leader lifecycle did not stop")
+	}
+	require.False(t, h.stores[leader].IsLeader())
+	leaders = 0
+	for i, store := range h.stores {
+		if i != leader && store.IsLeader() {
+			leaders++
+		}
+	}
+	require.Equal(t, 1, leaders)
+	require.NoError(t, h.stores[leader].Close())
+
+	// The bound is the point: the node must reach the new leader without waiting out a connection
+	// timeout, which takes seconds when the old leader retires its connections before handing off.
+	vote = makeVote(11, 0, time.Now().UTC(), "block-B")
+	require.Eventually(t, func() bool {
+		return h.client.SignVote(itestChain, vote) == nil
+	}, 2*time.Second, 20*time.Millisecond)
+	require.True(t, h.pub.VerifySignature(types.VoteSignBytes(itestChain, vote), vote.Signature))
+	conflict := makeVote(11, 0, vote.Timestamp, "block-C")
+	require.ErrorContains(t, h.client.SignVote(itestChain, conflict), state.ErrConflict.Error())
+	require.Empty(t, conflict.Signature)
 }

@@ -279,6 +279,15 @@ the CryptoKey is missing, `import` creates it, which additionally needs `cloudkm
 key ring is missing too, `import` also creates it with `cloudkms.keyRings.create`; there is nothing
 to bind to below the project yet, so that and every permission above must be granted on the project.
 
+`provision` also reads the key ring first and creates it only on `NotFound`; any other read
+error stops provisioning. It always fails if the CryptoKey already exists. Creating the key
+includes its initial version and needs these permissions:
+
+| Target | Permissions | Granted on |
+|---|---|---|
+| Existing key ring | `cloudkms.keyRings.get`, `cloudkms.cryptoKeys.create` | the key ring |
+| New key ring | `cloudkms.keyRings.get`, `cloudkms.keyRings.create`, `cloudkms.cryptoKeys.create` | the project |
+
 ```sh
 # create a signing key
 ./bin/cosmosigner provision --backend gcpkms \
@@ -412,6 +421,16 @@ YAML key, so only the environment variable form can be added ahead of time.
 Replicated signers must provide their full initial member list;
 never enable single-node bootstrap on independent replicas sharing a signing key.
 Target-node discovery and the bind address do not determine the signer topology.
+
+### Graceful shutdown
+
+On SIGINT or SIGTERM, a serving leader transfers Raft leadership to an up-to-date follower,
+waits until it observes the new leader, and only then drops its node connections and exits.
+Raft refuses new signing reservations on the old leader from the moment the transfer starts. The handoff
+is bounded at 5 seconds; on failure, shutdown continues and followers elect normally. Keep
+Kubernetes `terminationGracePeriodSeconds` at its default of 30 seconds, or at least well above
+10 seconds to allow handoff and teardown. A crash or node loss still waits for the election
+timeout. Single-node signers and `--initialize-only` processes do not hand off leadership.
 
 At startup, the Raft log records the node ID, bind and advertise addresses,
 configured member list, single-node opt-in, bootstrap request, whether existing

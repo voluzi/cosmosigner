@@ -80,6 +80,14 @@ type RaftMembershipReader interface {
 	RaftMembership(ctx context.Context) (RaftMembership, error)
 }
 
+// LeadershipTransferer is separate from StateStore so in-memory gates do not need to
+// implement the operational Raft shutdown handoff.
+type LeadershipTransferer interface {
+	// TransferLeadership hands Raft leadership to an up-to-date voter and returns once this
+	// node has seen the new leader. It is a no-op on a non-leader or with no other voter.
+	TransferLeadership(ctx context.Context) error
+}
+
 var (
 	// ErrRegression means the request's height/round/step is below the mark.
 	ErrRegression = errors.New("hrs regression")

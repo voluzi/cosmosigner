@@ -52,6 +52,7 @@ type RaftConfig struct {
 
 type raftStore struct {
 	raft      *raft.Raft
+	localID   raft.ServerID
 	fsm       *fsm
 	bolt      *raftboltdb.BoltStore
 	transport *raft.NetworkTransport
@@ -77,6 +78,8 @@ var (
 const boltOpenTimeout = 30 * time.Second
 
 const raftMembershipTimeout = 5 * time.Second
+
+const leadershipTransferTimeout = 5 * time.Second
 
 // advertiseTypoHint is logged once a hostname has failed to resolve for this long, to name the
 // likely cause. Hostname syntax is not a usable resolvability test — DNS labels may contain bytes
@@ -303,6 +306,7 @@ func NewRaftStoreContext(ctx context.Context, cfg RaftConfig, logger hclog.Logge
 	success = true
 	return &raftStore{
 		raft:         r,
+		localID:      rc.LocalID,
 		fsm:          f,
 		bolt:         bolt,
 		transport:    transport,
@@ -458,6 +462,54 @@ func (s *raftStore) RaftMembership(ctx context.Context) (RaftMembership, error) 
 			return RaftMembership{}, fmt.Errorf("read Raft configuration: %w", result.err)
 		}
 		return result.membership, nil
+	}
+}
+
+func (s *raftStore) TransferLeadership(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, leadershipTransferTimeout)
+	defer cancel()
+	if s.raft.State() != raft.Leader {
+		return nil
+	}
+	membership, err := s.RaftMembership(ctx)
+	if err != nil {
+		return fmt.Errorf("transfer raft leadership: %w", err)
+	}
+	if membership.Voters < 2 {
+		return nil
+	}
+
+	future := s.raft.LeadershipTransfer()
+	done := make(chan error, 1)
+	go func() { done <- future.Error() }()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("transfer raft leadership: %w", ctx.Err())
+	case <-s.closed:
+		return errors.New("raft store is closed")
+	case err := <-done:
+		// Leadership lost on its own still has to land on another node before the transport closes.
+		if err != nil && !errors.Is(err, raft.ErrNotLeader) {
+			return fmt.Errorf("transfer raft leadership: %w", err)
+		}
+	}
+
+	// The transfer future only confirms step-down. Keep the transport open until
+	// AppendEntries from the new leader confirms that its election completed.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, leaderID := s.raft.LeaderWithID()
+		if leaderID != "" && leaderID != s.localID {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("observe new raft leader: %w", ctx.Err())
+		case <-s.closed:
+			return errors.New("raft store is closed")
+		case <-ticker.C:
+		}
 	}
 }
 

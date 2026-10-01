@@ -247,3 +247,104 @@ func TestBootstrapServers_SelfMustBeMember(t *testing.T) {
 	}, "missing", "9.9.9.9:1")
 	require.ErrorContains(t, err, "not in the member list")
 }
+
+func newTransferCluster(t *testing.T) map[string]StateStore {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("multi-node raft test")
+	}
+	addrs := freeAddrs(t, 3)
+	ids := []string{"t0", "t1", "t2"}
+	members := []Member{{ids[0], addrs[0]}, {ids[1], addrs[1]}, {ids[2], addrs[2]}}
+	dir := t.TempDir()
+	stores := make(map[string]StateStore)
+	for i, id := range ids {
+		store := newNode(t, id, addrs[i], filepath.Join(dir, id), i == 0, members)
+		stores[id] = store
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+	return stores
+}
+
+func TestRaftCluster_TransferLeadershipHandsOffBeforeClose(t *testing.T) {
+	stores := newTransferCluster(t)
+	leaderID := waitLeader(t, stores)
+	oldLeader := stores[leaderID]
+	sb := voteSignBytes(100, 0, ts1, "A")
+	_, err := oldLeader.Reserve(testChain, 100, 0, StepPrecommit, sb, ts1)
+	require.NoError(t, err)
+	require.NoError(t, oldLeader.Commit(testChain, 100, 0, StepPrecommit, sb, sig64()))
+
+	require.NoError(t, oldLeader.(LeadershipTransferer).TransferLeadership(t.Context()))
+	require.False(t, oldLeader.IsLeader())
+	var newLeader StateStore
+	leaders := 0
+	for id, store := range stores {
+		if id != leaderID && store.IsLeader() {
+			newLeader = store
+			leaders++
+		}
+	}
+	require.Equal(t, 1, leaders)
+	_, err = oldLeader.Reserve(testChain, 101, 0, StepPrecommit, voteSignBytes(101, 0, ts1, "B"), ts1)
+	require.ErrorIs(t, err, ErrNotLeader)
+	_, err = newLeader.Reserve(testChain, 99, 0, StepPrecommit, voteSignBytes(99, 0, ts1, "B"), ts1)
+	require.ErrorIs(t, err, ErrRegression)
+	res, err := newLeader.Reserve(testChain, 101, 0, StepPrecommit, voteSignBytes(101, 0, ts1, "C"), ts1)
+	require.NoError(t, err)
+	require.False(t, res.Reuse)
+
+	require.NoError(t, oldLeader.Close())
+	_, err = newLeader.Reserve(testChain, 102, 0, StepPrecommit, voteSignBytes(102, 0, ts1, "D"), ts1)
+	require.NoError(t, err)
+}
+
+func TestRaftCluster_TransferLeadershipNoopOnFollower(t *testing.T) {
+	stores := newTransferCluster(t)
+	leaderID := waitLeader(t, stores)
+	for id, store := range stores {
+		if id != leaderID {
+			require.NoError(t, store.(LeadershipTransferer).TransferLeadership(t.Context()))
+			break
+		}
+	}
+	require.True(t, stores[leaderID].IsLeader())
+	_, err := stores[leaderID].Reserve(testChain, 100, 0, StepPrecommit, voteSignBytes(100, 0, ts1, "A"), ts1)
+	require.NoError(t, err)
+}
+
+func TestRaftStore_TransferLeadershipSingleNodeKeepsLeading(t *testing.T) {
+	store, err := NewRaftStore(RaftConfig{
+		NodeID: "node", BindAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		Bootstrap: true, SingleNode: true, Insecure: true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	require.NoError(t, store.(LeadershipTransferer).TransferLeadership(t.Context()))
+	require.True(t, store.IsLeader())
+	_, err = store.Reserve(testChain, 100, 0, StepPrecommit, voteSignBytes(100, 0, ts1, "A"), ts1)
+	require.NoError(t, err)
+}
+
+func TestRaftCluster_TransferLeadershipWithoutPeersReturns(t *testing.T) {
+	stores := newTransferCluster(t)
+	leaderID := waitLeader(t, stores)
+	for id, store := range stores {
+		if id != leaderID {
+			require.NoError(t, store.Close())
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = stores[leaderID].(LeadershipTransferer).TransferLeadership(t.Context())
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("leadership transfer did not return")
+	}
+	require.NoError(t, stores[leaderID].Close())
+}

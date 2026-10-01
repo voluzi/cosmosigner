@@ -172,17 +172,8 @@ func ensureImportCryptoKey(ctx context.Context, client gcpImportClient, cfg GCPI
 		return fmt.Errorf("get crypto key: %w", err)
 	}
 
-	if _, err := client.GetKeyRing(ctx, &kmspb.GetKeyRingRequest{Name: keyRingName}); err != nil {
-		if status.Code(err) != codes.NotFound {
-			return fmt.Errorf("get key ring: %w", err)
-		}
-		if _, err := client.CreateKeyRing(ctx, &kmspb.CreateKeyRingRequest{
-			Parent:    fmt.Sprintf("projects/%s/locations/%s", cfg.Project, cfg.Location),
-			KeyRingId: cfg.KeyRing,
-			KeyRing:   &kmspb.KeyRing{},
-		}); err != nil && status.Code(err) != codes.AlreadyExists {
-			return fmt.Errorf("create key ring: %w", err)
-		}
+	if err := ensureKeyRing(ctx, client, cfg.Project, cfg.Location, cfg.KeyRing); err != nil {
+		return err
 	}
 
 	// Target crypto key with no initial version.
