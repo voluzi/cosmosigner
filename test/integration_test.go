@@ -380,10 +380,12 @@ func TestIntegration_GracefulLeaderShutdownHandsOffSigning(t *testing.T) {
 	require.Equal(t, 1, leaders)
 	require.NoError(t, h.stores[leader].Close())
 
+	// The bound is the point: the node must reach the new leader without waiting out a connection
+	// timeout, which takes seconds when the old leader retires its connections before handing off.
 	vote = makeVote(11, 0, time.Now().UTC(), "block-B")
 	require.Eventually(t, func() bool {
 		return h.client.SignVote(itestChain, vote) == nil
-	}, 30*time.Second, 100*time.Millisecond)
+	}, 2*time.Second, 20*time.Millisecond)
 	require.True(t, h.pub.VerifySignature(types.VoteSignBytes(itestChain, vote), vote.Signature))
 	conflict := makeVote(11, 0, vote.Timestamp, "block-C")
 	require.ErrorContains(t, h.client.SignVote(itestChain, conflict), state.ErrConflict.Error())

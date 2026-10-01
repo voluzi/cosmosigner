@@ -286,7 +286,7 @@ includes its initial version and needs these permissions:
 | Target | Permissions | Granted on |
 |---|---|---|
 | Existing key ring | `cloudkms.keyRings.get`, `cloudkms.cryptoKeys.create` | the key ring |
-| New key ring | the above plus `cloudkms.keyRings.create` | the project |
+| New key ring | `cloudkms.keyRings.get`, `cloudkms.keyRings.create`, `cloudkms.cryptoKeys.create` | the project |
 
 ```sh
 # create a signing key
@@ -424,8 +424,9 @@ Target-node discovery and the bind address do not determine the signer topology.
 
 ### Graceful shutdown
 
-On SIGINT or SIGTERM, a serving leader stops accepting requests, transfers Raft leadership to
-an up-to-date follower, and waits until it observes the new leader before exiting. The handoff
+On SIGINT or SIGTERM, a serving leader transfers Raft leadership to an up-to-date follower,
+waits until it observes the new leader, and only then drops its node connections and exits.
+Raft refuses new signing reservations on the old leader from the moment the transfer starts. The handoff
 is bounded at 5 seconds; on failure, shutdown continues and followers elect normally. Keep
 Kubernetes `terminationGracePeriodSeconds` at its default of 30 seconds, or at least well above
 10 seconds to allow handoff and teardown. A crash or node loss still waits for the election

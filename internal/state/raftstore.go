@@ -488,10 +488,8 @@ func (s *raftStore) TransferLeadership(ctx context.Context) error {
 	case <-s.closed:
 		return errors.New("raft store is closed")
 	case err := <-done:
-		if errors.Is(err, raft.ErrNotLeader) {
-			return nil
-		}
-		if err != nil {
+		// Leadership lost on its own still has to land on another node before the transport closes.
+		if err != nil && !errors.Is(err, raft.ErrNotLeader) {
 			return fmt.Errorf("transfer raft leadership: %w", err)
 		}
 	}
