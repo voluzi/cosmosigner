@@ -5,11 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 
-	kms "cloud.google.com/go/kms/apiv1"
 	"cloud.google.com/go/kms/apiv1/kmspb"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/voluzi/cosmosigner/internal/backend"
 	"github.com/voluzi/cosmosigner/internal/config"
@@ -121,42 +118,19 @@ func provisionGCP(g gcpCoords, credsFile string) error {
 		return err
 	}
 
-	ctx := context.Background()
-	opts, err := backend.GCPClientOptions(credsFile)
+	created, err := backend.GCPProvisionKey(context.Background(), backend.GCPProvisionConfig{
+		Project:         g.project,
+		Location:        g.location,
+		KeyRing:         g.keyring,
+		Key:             g.key,
+		Protection:      level,
+		CredentialsFile: credsFile,
+	})
 	if err != nil {
 		return err
 	}
-	client, err := kms.NewKeyManagementClient(ctx, opts...)
-	if err != nil {
-		return fmt.Errorf("new kms client: %w", err)
-	}
-	defer client.Close()
 
-	locationName := fmt.Sprintf("projects/%s/locations/%s", g.project, g.location)
-	if _, err := client.CreateKeyRing(ctx, &kmspb.CreateKeyRingRequest{
-		Parent:    locationName,
-		KeyRingId: g.keyring,
-		KeyRing:   &kmspb.KeyRing{},
-	}); err != nil && status.Code(err) != codes.AlreadyExists {
-		return fmt.Errorf("create key ring: %w", err)
-	}
-
-	created, err := client.CreateCryptoKey(ctx, &kmspb.CreateCryptoKeyRequest{
-		Parent:      locationName + "/keyRings/" + g.keyring,
-		CryptoKeyId: g.key,
-		CryptoKey: &kmspb.CryptoKey{
-			Purpose: kmspb.CryptoKey_ASYMMETRIC_SIGN,
-			VersionTemplate: &kmspb.CryptoKeyVersionTemplate{
-				Algorithm:       kmspb.CryptoKeyVersion_EC_SIGN_ED25519,
-				ProtectionLevel: level,
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("create crypto key: %w", err)
-	}
-
-	version := created.Name + "/cryptoKeyVersions/1"
+	version := created + "/cryptoKeyVersions/1"
 	fmt.Printf("provisioned EC_SIGN_ED25519 key\n")
 	fmt.Printf("key version: %s\n", version)
 	fmt.Printf("run cosmosigner with --backend gcpkms --gcp-key-version %s\n", version)

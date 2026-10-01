@@ -146,7 +146,8 @@ func (ns *nodeServer) observe(staleTimeout, dialBudget time.Duration) retireReas
 // resolves the NodeSource and diffs it against the live connections: new nodes
 // get a connector, removed nodes are dropped, and dead/exhausted connectors are
 // recreated. On leadership loss it tears down everything; a non-leader never
-// serves signatures.
+// serves signatures. Graceful shutdown retires connections before handing off
+// leadership, so the next leader can serve while teardown completes.
 type Lifecycle struct {
 	cfg     Config
 	nodes   NodeSource
@@ -305,7 +306,8 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 // until ctx is cancelled. The periodic tick backstops a missed LeaderCh
 // transition, refreshes node discovery, and recovers dead/exhausted connectors.
 // Retiring a connection also wakes the loop directly, so a node replaced by a
-// new pod (and so a new IP) is rediscovered without waiting out the tick.
+// new pod (and so a new IP) is rediscovered without waiting out the tick. On cancellation,
+// serving stops before a bounded leadership handoff, while connection teardown proceeds.
 func (l *Lifecycle) Run(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -317,6 +319,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			l.stopAll()
+			l.transferLeadership()
 			l.stopping.Wait()
 			return ctx.Err()
 		case <-l.store.LeaderCh():
@@ -413,5 +416,18 @@ func (l *Lifecycle) stopAll() {
 	defer l.mu.Unlock()
 	for addr, ns := range l.servers {
 		l.retire(addr, ns)
+	}
+}
+
+func (l *Lifecycle) transferLeadership() {
+	transferer, ok := l.store.(state.LeadershipTransferer)
+	if !ok || !l.store.IsLeader() {
+		return
+	}
+	// Run's context is cancelled; the store bounds this shutdown operation itself.
+	if err := transferer.TransferLeadership(context.Background()); err != nil {
+		l.logger.Error("raft leadership handoff failed; followers will elect after the heartbeat timeout", "err", err)
+	} else if !l.store.IsLeader() {
+		l.logger.Info("handed off raft leadership")
 	}
 }
