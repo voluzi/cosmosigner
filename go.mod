@@ -9,7 +9,7 @@ require (
 	github.com/cosmos/gogoproto v1.7.2
 	github.com/creasty/defaults v1.11.0
 	github.com/google/tink/go v1.7.0
-	github.com/googleapis/gax-go/v2 v2.25.0
+	github.com/googleapis/gax-go/v2 v2.26.2
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
