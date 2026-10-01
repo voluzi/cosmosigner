@@ -59,3 +59,16 @@ func TestGCPProvisionRefusesExistingKey(t *testing.T) {
 	_, err := gcpProvisionKey(t.Context(), client, testProvisionConfig())
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
 }
+
+func TestGCPProvisionToleratesRingCreatedConcurrently(t *testing.T) {
+	// The ring appears between the read and the create: another writer won.
+	client := &fakeImportClient{
+		ring: &kmspb.KeyRing{Name: testImportRing},
+		errs: map[string]error{"GetKeyRing": status.Error(codes.NotFound, "no ring")},
+	}
+
+	name, err := gcpProvisionKey(t.Context(), client, testProvisionConfig())
+	require.NoError(t, err)
+	require.Equal(t, testImportKey, name)
+	require.Equal(t, []string{"GetKeyRing", "CreateKeyRing", "CreateCryptoKey"}, client.calls)
+}
