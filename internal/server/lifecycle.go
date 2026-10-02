@@ -82,20 +82,22 @@ func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
 // dead-socket detection.
 //
 // A retired connection must not serve, even before its asynchronous Stop() has landed: the
-// SignerServer service loop does not consult the serving set, so this check is what makes
-// retirement take effect immediately. Without it, a node removed from the target set could keep
-// signing until Stop() completed — long enough to race its replacement for a height/round/step
-// reservation.
+// SignerServer service loop does not consult the serving set, and a request it had already read
+// when retirement closed the socket still reaches this handler. This check is what keeps such a
+// request from signing. Without it, a node removed from the target set could race its replacement
+// for a height/round/step reservation.
 //
 // The check is not a drain: a request that has already passed it runs to completion (bounded by the
-// backend signing call) even as the replacement connection starts, because SignerServer.Stop() does
-// not wait for in-flight handlers. That residual overlap is safe rather than merely unlikely — both
+// backend signing call) even as the replacement connection starts, because neither closing the
+// socket nor SignerServer.Stop() waits for in-flight handlers. Its reply is lost with the socket, so
+// the node asks again on its next connection. That residual overlap is safe rather than merely
+// unlikely — both
 // connections share one GatedPrivValidator, so both reserve through raft, and fsm.applyReserve is
 // total over the H/R/S comparison: identical signBytes reuse the cached signature (or re-sign
 // deterministically), a timestamp-only difference signs the *reserved* bytes, and anything else at
 // the same H/R/S is refused with ErrConflict. Ordering is decided by the raft log, not by goroutine
-// scheduling. So the overlap can cost one refused-and-retried request, never a second distinct
-// signature at one H/R/S. Draining would mean blocking replacement creation on an in-flight count —
+// scheduling. So the overlap can cost one retried request, which gets the reserved bytes back,
+// never a second distinct signature at one H/R/S. Draining would mean blocking replacement creation on an in-flight count —
 // new synchronization on the signing path in exchange for a liveness blip that already fails closed.
 func (ns *nodeServer) handleRequest(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
 	if ns.retired.Load() {
@@ -123,7 +125,8 @@ const retiredChainID = "\x00 cosmosigner retired connection"
 
 // dial is the endpoint's SocketDialer. It returns a connection, or an error only once the connector
 // is retired: cometbft's service loop exits for good on a dialer error, so returning one while still
-// serving would leave the node without a signer until something recreated the connector.
+// serving would leave the node without a signer until something recreated the connector. A
+// connection is returned only while the connector is not retired, see handOver.
 func (ns *nodeServer) dial(connKey crypto.PrivKey, timeoutReadWrite, retryWait time.Duration, logger cmtlog.Logger) (net.Conn, error) {
 	for {
 		conn, err := ns.dialOnce(connKey, timeoutReadWrite)
@@ -145,10 +148,11 @@ func (ns *nodeServer) dial(connKey crypto.PrivKey, timeoutReadWrite, retryWait t
 func (ns *nodeServer) dialOnce(connKey crypto.PrivKey, timeoutReadWrite time.Duration) (net.Conn, error) {
 	proto, address := cmtnet.ProtocolAndAddress(ns.addr)
 	dialer := net.Dialer{Timeout: dialTimeout}
-	conn, err := dialer.DialContext(ns.dialCtx, proto, address)
+	raw, err := dialer.DialContext(ns.dialCtx, proto, address)
 	if err != nil {
 		return nil, err
 	}
+	conn := &onceCloseConn{Conn: raw}
 	if !ns.track(conn) {
 		_ = conn.Close()
 		return nil, errConnectorRetired
@@ -164,7 +168,24 @@ func (ns *nodeServer) dialOnce(connKey crypto.PrivKey, timeoutReadWrite time.Dur
 		_ = conn.Close()
 		return nil, err
 	}
+	if !ns.handOver() {
+		_ = conn.Close()
+		return nil, errConnectorRetired
+	}
 	return secret, nil
+}
+
+// onceCloseConn makes Close idempotent. Retirement closes the socket itself, ahead of the endpoint
+// that owns the connection, and the endpoint reports a failed Close as an error.
+type onceCloseConn struct {
+	net.Conn
+	once sync.Once
+	err  error
+}
+
+func (c *onceCloseConn) Close() error {
+	c.once.Do(func() { c.err = c.Conn.Close() })
+	return c.err
 }
 
 // track records conn for closeConn, or reports false when the connector is already retired and the
@@ -180,9 +201,19 @@ func (ns *nodeServer) track(conn net.Conn) bool {
 	return true
 }
 
-// closeConn closes the last dialed socket. The endpoint's own Close only covers a connection it has
-// already been handed; a dial that completes around retirement would otherwise leave a socket that
-// holds the node's single signer slot and never answers.
+// handOver reports whether a connection whose handshake has completed may be given to the endpoint.
+// The handshake does not observe dialCtx, so it can complete after retirement; the endpoint would
+// install that connection and answer the node's pending request with a refusal. Checking under
+// connMu orders this against closeConn: a connection handed over is one closeConn has yet to close.
+func (ns *nodeServer) handOver() bool {
+	ns.connMu.Lock()
+	defer ns.connMu.Unlock()
+	return !ns.retired.Load()
+}
+
+// closeConn closes the last dialed socket, whatever stage it reached: mid-handshake, returned by
+// dial but not yet installed in the endpoint, or serving. The endpoint's own Close only covers the
+// last of these.
 func (ns *nodeServer) closeConn() {
 	ns.connMu.Lock()
 	defer ns.connMu.Unlock()
@@ -232,8 +263,8 @@ func (ns *nodeServer) observe(staleTimeout time.Duration) retireReason {
 // get a connector, removed nodes are dropped, and dead connections are
 // recreated. On leadership loss it tears down everything; a non-leader never
 // serves signatures. Graceful shutdown hands off leadership before retiring
-// connections: a node keeps a connection that only refuses, so retiring first
-// leaves it on this signer instead of accepting the next leader's dial.
+// connections, so a node loses this signer only once another replica can dial
+// it.
 type Lifecycle struct {
 	cfg     Config
 	nodes   NodeSource
@@ -321,13 +352,21 @@ func (l *Lifecycle) publishStatus() {
 // it is set, so a removed node cannot race its replacement to reserve a height/round/step while the
 // asynchronous Stop() is still in flight.
 //
+// A refusal must not reach the node, though. The node holds one signer connection and takes a
+// refusal as that signer's answer: one that has just started listening gives up on a refused
+// public-key request instead of accepting the next signer's dial. So the socket is closed here as
+// well, before Stop(), which can spend its whole wait behind a read that would otherwise deliver
+// the node's request to the refusing handler. Closing does not block. It costs a request that was
+// already being handled its reply — see handleRequest for why that is safe.
+//
 // Stop() does not reach a connector that is still dialing either, so retirement also cancels the
-// dial and closes whatever socket it had opened: a retired connector that kept dialing could win
-// the node's single signer slot and then refuse every request on it.
+// dial, and the same close aborts a handshake in flight: a retired connector that kept dialing
+// could win the node's single signer slot and then refuse every request on it.
 func (l *Lifecycle) retire(addr string, ns *nodeServer) {
 	// Synchronous: disables signing on this connection before the caller releases l.mu.
 	ns.retired.Store(true)
 	ns.stopDial()
+	ns.closeConn()
 	delete(l.servers, addr)
 	// A retired address usually means a pod is being replaced and the replacement's DNS record is not
 	// published yet. In a multi-node target set the dead address is simply dropped, so once this entry
@@ -338,7 +377,6 @@ func (l *Lifecycle) retire(addr string, ns *nodeServer) {
 	go func() {
 		defer l.stopping.Done()
 		_ = ns.srv.Stop()
-		ns.closeConn()
 		// A retired connection usually means the node is being replaced (new pod, new IP), so the
 		// resolved node set is likely stale too. Re-resolve now rather than waiting out the tick.
 		l.requestReconcile()
