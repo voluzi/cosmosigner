@@ -37,7 +37,6 @@ type Config struct {
 	// Connection tuning (durations are not YAML-friendly; flag/env/default only).
 	ReconcileInterval time.Duration `yaml:"-" env:"COSMOSIGNER_RECONCILE_INTERVAL" default:"5s"`
 	TimeoutReadWrite  time.Duration `yaml:"-" env:"COSMOSIGNER_CONN_TIMEOUT" default:"3s"`
-	MaxRetries        int           `yaml:"-" env:"COSMOSIGNER_CONN_MAX_RETRIES" default:"6000"`
 	RetryWait         time.Duration `yaml:"-" env:"COSMOSIGNER_CONN_RETRY_WAIT" default:"100ms"`
 	// StaleConnTimeout recycles a node connection with no inbound activity for
 	// this long; must comfortably exceed the node's ping interval (~3s).

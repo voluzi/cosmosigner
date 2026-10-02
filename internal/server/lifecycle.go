@@ -2,12 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/crypto"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
+	cmtnet "github.com/cometbft/cometbft/libs/net"
+	p2pconn "github.com/cometbft/cometbft/p2p/conn"
 	"github.com/cometbft/cometbft/privval"
 	privvalproto "github.com/cometbft/cometbft/proto/tendermint/privval"
 	"github.com/cometbft/cometbft/types"
@@ -19,10 +23,9 @@ import (
 type Config struct {
 	ChainID          string
 	TimeoutReadWrite time.Duration
-	// MaxRetries × RetryWait is the dial budget for a single connector: how long
-	// it keeps trying to reach a node before the connector is recreated. It is
-	// deliberately long so a (re)starting node always finds cosmosigner dialing.
-	MaxRetries        int
+	// RetryWait is the pause between failed dials. A connector dials until it is
+	// retired, so a (re)starting node always finds cosmosigner dialing, and this
+	// plus dialTimeout bounds how long a node that just started listening waits.
 	RetryWait         time.Duration
 	ReconcileInterval time.Duration // how often to re-resolve nodes / re-check leadership
 	// StaleConnTimeout recycles a node connection with no inbound activity for
@@ -32,29 +35,44 @@ type Config struct {
 	StaleConnTimeout time.Duration
 }
 
-// nodeServer is one node's signer connection with activity/creation timestamps.
+// dialTimeout bounds one TCP connect attempt. Without it a dial to an address whose SYNs are
+// dropped (a pod whose network is not programmed yet) follows the kernel's retransmit backoff, and
+// a node that starts listening in the meantime waits that out instead of RetryWait.
+const dialTimeout = time.Second
+
+var errConnectorRetired = errors.New("connector retired")
+
+// nodeServer is one node's signer connection with its activity timestamp.
 //
-// Two recovery mechanisms are needed on top of cometbft's SignerServer:
+// Two things are needed on top of cometbft's SignerServer:
 //
 //   - Dead-but-"connected" socket: cometbft's signerEndpoint only drops its
 //     connection on read/write TIMEOUTS. If the node closes the TCP connection
 //     (restart/crash), reads return EOF, the endpoint still reports IsConnected,
 //     and the service loop spins on EOF without re-dialing. Detected as a
-//     *connected* socket that has gone silent past StaleConnTimeout.
-//   - Exhausted connector: the service loop exits once the dialer's retry budget
-//     is exhausted (node down longer than MaxRetries×RetryWait). Detected as a
-//     *disconnected* server older than the dial budget.
-//
-// Either triggers a recreate on the reconcile tick.
+//     *connected* socket that has gone silent past StaleConnTimeout, which
+//     triggers a recreate on the reconcile tick.
+//   - Dialing: cometbft's dial loop gives up after a fixed number of attempts and
+//     never looks at whether the server was stopped. The retry loop therefore
+//     lives in dial, which keeps going until the connector is retired and stops
+//     as soon as it is.
 type nodeServer struct {
 	srv          *privval.SignerServer
 	ep           *privval.SignerDialerEndpoint
-	createdAt    time.Time
+	addr         string
 	connected    bool         // last observed connection state (reconcile-only)
 	lastActivity atomic.Int64 // unix nanos of the last handled request (pings included)
 	// retired marks this connection as no longer serving. It is set synchronously when the
 	// connection is dropped from the serving set, before the (blocking) Stop() runs — see retire.
 	retired atomic.Bool
+	// dialCtx is cancelled by retire, which aborts an in-flight connect and the wait between dials.
+	dialCtx  context.Context
+	stopDial context.CancelFunc
+
+	connMu sync.Mutex
+	// conn is the socket most recently opened by dial, kept so retirement can close it whatever
+	// stage it reached. Guarded by connMu.
+	conn net.Conn
 }
 
 func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
@@ -102,13 +120,82 @@ func (ns *nodeServer) silentFor() time.Duration {
 // The value cannot collide with a real chain ID: chain IDs are non-empty and cannot contain spaces.
 const retiredChainID = "\x00 cosmosigner retired connection"
 
+// dial is the endpoint's SocketDialer. It returns a connection, or an error only once the connector
+// is retired: cometbft's service loop exits for good on a dialer error, so returning one while still
+// serving would leave the node without a signer until something recreated the connector.
+func (ns *nodeServer) dial(connKey crypto.PrivKey, timeoutReadWrite, retryWait time.Duration, logger cmtlog.Logger) (net.Conn, error) {
+	for {
+		conn, err := ns.dialOnce(connKey, timeoutReadWrite)
+		if err == nil {
+			return conn, nil
+		}
+		if ns.dialCtx.Err() != nil {
+			return nil, errConnectorRetired
+		}
+		logger.Debug("dial node", "err", err)
+		select {
+		case <-ns.dialCtx.Done():
+			return nil, errConnectorRetired
+		case <-time.After(retryWait):
+		}
+	}
+}
+
+func (ns *nodeServer) dialOnce(connKey crypto.PrivKey, timeoutReadWrite time.Duration) (net.Conn, error) {
+	proto, address := cmtnet.ProtocolAndAddress(ns.addr)
+	dialer := net.Dialer{Timeout: dialTimeout}
+	conn, err := dialer.DialContext(ns.dialCtx, proto, address)
+	if err != nil {
+		return nil, err
+	}
+	if !ns.track(conn) {
+		_ = conn.Close()
+		return nil, errConnectorRetired
+	}
+	// The node accepts one signer at a time, so the handshake can sit in its accept queue; the
+	// deadline keeps that wait bounded.
+	if err := conn.SetDeadline(time.Now().Add(timeoutReadWrite)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	secret, err := p2pconn.MakeSecretConnection(conn, connKey)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return secret, nil
+}
+
+// track records conn for closeConn, or reports false when the connector is already retired and the
+// caller must close conn itself. Checking under connMu is what guarantees every socket is closed by
+// exactly one side: closeConn runs after retired is set, so it either sees conn or track refuses it.
+func (ns *nodeServer) track(conn net.Conn) bool {
+	ns.connMu.Lock()
+	defer ns.connMu.Unlock()
+	if ns.retired.Load() {
+		return false
+	}
+	ns.conn = conn
+	return true
+}
+
+// closeConn closes the last dialed socket. The endpoint's own Close only covers a connection it has
+// already been handed; a dial that completes around retirement would otherwise leave a socket that
+// holds the node's single signer slot and never answers.
+func (ns *nodeServer) closeConn() {
+	ns.connMu.Lock()
+	defer ns.connMu.Unlock()
+	if ns.conn != nil {
+		_ = ns.conn.Close()
+	}
+}
+
 // retireReason classifies why a connection should be recreated, or retireNone to keep it.
 type retireReason int
 
 const (
 	retireNone retireReason = iota
 	retireSilent
-	retireExhausted
 )
 
 // observe updates the connection-state latch and reports whether this connection should be
@@ -117,7 +204,7 @@ const (
 // silently disagreed with reconcile about the latch and never fired.
 //
 // Callers must hold Lifecycle.mu.
-func (ns *nodeServer) observe(staleTimeout, dialBudget time.Duration) retireReason {
+func (ns *nodeServer) observe(staleTimeout time.Duration) retireReason {
 	if ns.ep.IsConnected() {
 		// Start the silence clock at connection establishment, not at connector creation — a
 		// connector that spent time dialing a not-yet-up node must not be judged "silent" the
@@ -133,18 +220,15 @@ func (ns *nodeServer) observe(staleTimeout, dialBudget time.Duration) retireReas
 		}
 		return retireNone
 	}
+	// Still dialing: the connector keeps trying until it is retired, so there is nothing to recycle.
 	ns.connected = false
-	// Not connected and past the dial budget → connector exhausted.
-	if time.Since(ns.createdAt) > dialBudget {
-		return retireExhausted
-	}
 	return retireNone
 }
 
 // Lifecycle serves the gated PrivValidator to a dynamic set of target nodes,
 // but only while this process holds raft leadership. On every reconcile it
 // resolves the NodeSource and diffs it against the live connections: new nodes
-// get a connector, removed nodes are dropped, and dead/exhausted connectors are
+// get a connector, removed nodes are dropped, and dead connections are
 // recreated. On leadership loss it tears down everything; a non-leader never
 // serves signatures. Graceful shutdown hands off leadership before retiring
 // connections: a node keeps a connection that only refuses, so retiring first
@@ -184,9 +268,14 @@ type Lifecycle struct {
 // The retired flag closes that gap synchronously — the request handler refuses every request once
 // it is set, so a removed node cannot race its replacement to reserve a height/round/step while the
 // asynchronous Stop() is still in flight.
+//
+// Stop() does not reach a connector that is still dialing either, so retirement also cancels the
+// dial and closes whatever socket it had opened: a retired connector that kept dialing could win
+// the node's single signer slot and then refuse every request on it.
 func (l *Lifecycle) retire(addr string, ns *nodeServer) {
 	// Synchronous: disables signing on this connection before the caller releases l.mu.
 	ns.retired.Store(true)
+	ns.stopDial()
 	delete(l.servers, addr)
 	// A retired address usually means a pod is being replaced and the replacement's DNS record is not
 	// published yet. In a multi-node target set the dead address is simply dropped, so once this entry
@@ -197,6 +286,7 @@ func (l *Lifecycle) retire(addr string, ns *nodeServer) {
 	go func() {
 		defer l.stopping.Done()
 		_ = ns.srv.Stop()
+		ns.closeConn()
 		// A retired connection usually means the node is being replaced (new pod, new IP), so the
 		// resolved node set is likely stale too. Re-resolve now rather than waiting out the tick.
 		l.requestReconcile()
@@ -209,13 +299,6 @@ func (l *Lifecycle) requestReconcile() {
 	case l.wake <- struct{}{}:
 	default:
 	}
-}
-
-// dialBudget is how long a connector may keep dialing before it is recreated: the endpoint's own
-// retry budget plus one reconcile interval of slack, so a connector is never judged exhausted by
-// the same pass that would have let it finish its last retry.
-func (l *Lifecycle) dialBudget() time.Duration {
-	return time.Duration(l.cfg.MaxRetries)*l.cfg.RetryWait + l.cfg.ReconcileInterval
 }
 
 // discoveryPendingWindow is how long discovery stays fast after a retirement, giving a replacement
@@ -249,7 +332,7 @@ func (l *Lifecycle) watchInterval() time.Duration {
 //
 // The unconnected case matters because DNS lags pod churn: when a node is replaced, the first wake
 // after teardown often still resolves the dead address, so reconcile recreates a connector for it.
-// That connector is not "exhausted" for MaxRetries×RetryWait (~10min by default), so keying re-
+// That connector dials the dead address indefinitely and is never retired on its own, so keying re-
 // resolution on retirement alone would go quiet exactly when the replacement record is about to
 // appear — leaving the tick to find it, which is the delay this is meant to remove. Staying fast
 // while anything is unconnected keeps re-resolving until the replacement is actually being served.
@@ -257,15 +340,13 @@ func (l *Lifecycle) watchInterval() time.Duration {
 // observe() latches connection state, so this is not read-only; reconcile remains the only mutator
 // of the servers map itself.
 func (l *Lifecycle) needsFastDiscovery() bool {
-	dialBudget := l.dialBudget()
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if time.Now().Before(l.discoveryPendingUntil) {
 		return true
 	}
 	for _, ns := range l.servers {
-		if ns.observe(l.cfg.StaleConnTimeout, dialBudget) != retireNone {
+		if ns.observe(l.cfg.StaleConnTimeout) != retireNone {
 			return true
 		}
 		if !ns.connected {
@@ -278,9 +359,6 @@ func (l *Lifecycle) needsFastDiscovery() bool {
 func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.PrivKey, store state.StateStore, logger cmtlog.Logger) *Lifecycle {
 	if cfg.TimeoutReadWrite <= 0 {
 		cfg.TimeoutReadWrite = 3 * time.Second
-	}
-	if cfg.MaxRetries <= 0 {
-		cfg.MaxRetries = 6000 // ~10min of continuous dialing at the default RetryWait
 	}
 	if cfg.RetryWait <= 0 {
 		cfg.RetryWait = 100 * time.Millisecond
@@ -305,7 +383,7 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 
 // Run reconciles serving state with raft leadership and the resolved node set
 // until ctx is cancelled. The periodic tick backstops a missed LeaderCh
-// transition, refreshes node discovery, and recovers dead/exhausted connectors.
+// transition, refreshes node discovery, and recovers dead connections.
 // Retiring a connection also wakes the loop directly, so a node replaced by a
 // new pod (and so a new IP) is rediscovered without waiting out the tick. On cancellation,
 // a bounded leadership handoff runs first and the connections are torn down after it.
@@ -358,8 +436,6 @@ func (l *Lifecycle) reconcile() {
 		want[addr] = struct{}{}
 	}
 
-	dialBudget := l.dialBudget()
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -369,14 +445,10 @@ func (l *Lifecycle) reconcile() {
 			l.logger.Info("stopped serving node", "node", addr)
 			continue
 		}
-		switch ns.observe(l.cfg.StaleConnTimeout, dialBudget) {
-		case retireSilent:
+		if ns.observe(l.cfg.StaleConnTimeout) == retireSilent {
 			silent := ns.silentFor().Round(time.Second)
 			l.retire(addr, ns)
 			l.logger.Info("recycling silent signer connection", "node", addr, "silent", silent)
-		case retireExhausted:
-			l.retire(addr, ns)
-			l.logger.Info("redialing exhausted connector", "node", addr)
 		}
 	}
 	for addr := range want {
@@ -394,22 +466,35 @@ func (l *Lifecycle) reconcile() {
 }
 
 func (l *Lifecycle) startOne(addr string) (*nodeServer, error) {
-	dialer := privval.DialTCPFn(addr, l.cfg.TimeoutReadWrite, l.connKey)
-	ep := privval.NewSignerDialerEndpoint(
-		l.logger.With("node", addr),
-		dialer,
-		privval.SignerDialerEndpointTimeoutReadWrite(l.cfg.TimeoutReadWrite),
-		privval.SignerDialerEndpointConnRetries(l.cfg.MaxRetries),
-		privval.SignerDialerEndpointRetryWaitInterval(l.cfg.RetryWait),
-	)
-	srv := privval.NewSignerServer(ep, l.cfg.ChainID, l.pv)
-	ns := &nodeServer{srv: srv, ep: ep, createdAt: time.Now()}
-	ns.touch()
-	srv.SetRequestHandler(ns.handleRequest)
-	if err := srv.Start(); err != nil {
+	ns := l.newNodeServer(addr)
+	if err := ns.srv.Start(); err != nil {
+		ns.stopDial()
 		return nil, err
 	}
 	return ns, nil
+}
+
+// newNodeServer builds the connector for addr without starting it.
+func (l *Lifecycle) newNodeServer(addr string) *nodeServer {
+	ns := &nodeServer{addr: addr}
+	ns.dialCtx, ns.stopDial = context.WithCancel(context.Background())
+	logger := l.logger.With("node", addr)
+	ns.ep = privval.NewSignerDialerEndpoint(
+		logger,
+		func() (net.Conn, error) {
+			return ns.dial(l.connKey, l.cfg.TimeoutReadWrite, l.cfg.RetryWait, logger)
+		},
+		privval.SignerDialerEndpointTimeoutReadWrite(l.cfg.TimeoutReadWrite),
+		// ns.dial retries by itself and fails only once retired, so the endpoint's own loop gets a
+		// single attempt and no wait: on that error the service loop ends, which is what stops a
+		// retired connector from dialing.
+		privval.SignerDialerEndpointConnRetries(1),
+		privval.SignerDialerEndpointRetryWaitInterval(0),
+	)
+	ns.srv = privval.NewSignerServer(ns.ep, l.cfg.ChainID, l.pv)
+	ns.touch()
+	ns.srv.SetRequestHandler(ns.handleRequest)
+	return ns
 }
 
 func (l *Lifecycle) stopAll() {

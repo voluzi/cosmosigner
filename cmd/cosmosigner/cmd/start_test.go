@@ -155,6 +155,16 @@ func TestWriteInsecureRaftWarning(t *testing.T) {
 	require.Empty(t, out.String())
 }
 
+func TestWriteMaxRetriesWarning(t *testing.T) {
+	var out bytes.Buffer
+	writeMaxRetriesWarning(&out, "6000")
+	require.Contains(t, out.String(), "WARNING: COSMOSIGNER_CONN_MAX_RETRIES is deprecated and ignored")
+
+	out.Reset()
+	writeMaxRetriesWarning(&out, "")
+	require.Empty(t, out.String())
+}
+
 func TestVerifyExpectedPublicKey(t *testing.T) {
 	priv := ed25519.GenPrivKey()
 	be := backend.NewSoftwareFromPriv(priv)

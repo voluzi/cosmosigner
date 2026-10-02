@@ -147,6 +147,7 @@ func parseMembers(raw []string) ([]config.Member, error) {
 func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
 	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
+	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
 
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
@@ -168,6 +169,7 @@ func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
 func runStartModeContext(ctx context.Context, cfg config.Config, initializeOnly bool, out io.Writer) error {
 	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
+	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
 		return err
@@ -273,7 +275,6 @@ func runStartWithContext(
 	lc := server.New(server.Config{
 		ChainID:           cfg.ChainID,
 		TimeoutReadWrite:  cfg.TimeoutReadWrite,
-		MaxRetries:        cfg.MaxRetries,
 		RetryWait:         cfg.RetryWait,
 		ReconcileInterval: cfg.ReconcileInterval,
 		StaleConnTimeout:  cfg.StaleConnTimeout,
@@ -367,6 +368,17 @@ func prepareStartupWithClaim(ctx context.Context, be backend.KeyBackend, store s
 func writeInsecureRaftWarning(w io.Writer, insecure bool) {
 	if insecure {
 		fmt.Fprintln(w, "WARNING: raft transport is insecure; configure mutual TLS for production")
+	}
+}
+
+// maxRetriesEnv used to cap how many times a connector dialed a node. Connectors now dial until
+// they are retired, so the variable is still accepted, to keep existing deployments starting, but
+// has no effect.
+const maxRetriesEnv = "COSMOSIGNER_CONN_MAX_RETRIES"
+
+func writeMaxRetriesWarning(w io.Writer, value string) {
+	if value != "" {
+		fmt.Fprintf(w, "WARNING: %s is deprecated and ignored; a node is dialed until it leaves the target set\n", maxRetriesEnv)
 	}
 }
 
