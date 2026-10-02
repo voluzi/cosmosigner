@@ -72,5 +72,11 @@ func overlayBackendFlags(cmd *cobra.Command, c *backend.Config) {
 		slot, _ := cmd.Flags().GetUint("pkcs11-slot")
 		c.PKCS11.Slot = &slot
 	}
+	if cmd.Flags().Changed("pkcs11-slot") && !cmd.Flags().Changed("pkcs11-token-label") {
+		c.PKCS11.TokenLabel = ""
+	}
+	if cmd.Flags().Changed("pkcs11-token-label") && !cmd.Flags().Changed("pkcs11-slot") {
+		c.PKCS11.Slot = nil
+	}
 
 }
