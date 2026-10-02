@@ -1,6 +1,11 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +16,8 @@ import (
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/types"
 	"github.com/stretchr/testify/require"
+
+	"github.com/voluzi/cosmosigner/internal/state"
 )
 
 const testChainID = "test-chain"
@@ -178,4 +185,84 @@ func TestNeedsFastDiscoveryAfterRetirement(t *testing.T) {
 		require.Equal(t, 2*time.Second, short.discoveryPendingWindow(),
 			"a short interval must not be extended by the window")
 	})
+}
+
+// failingTransferStore is a leader whose handoff always fails. Only the methods the lifecycle calls
+// are implemented; the embedded interface is nil.
+type failingTransferStore struct {
+	state.StateStore
+	leaderCh   chan bool
+	transfers  atomic.Int32
+	onTransfer func()
+}
+
+func (s *failingTransferStore) IsLeader() bool        { return true }
+func (s *failingTransferStore) LeaderCh() <-chan bool { return s.leaderCh }
+func (s *failingTransferStore) TransferLeadership(context.Context) error {
+	s.transfers.Add(1)
+	s.onTransfer()
+	return errors.New("no eligible peer")
+}
+
+// TestRunShutdownResetsNodeBeforeFailedHandoff covers the shutdown order on the lifecycle side, with
+// a handoff that fails: the node must have lost its connection, by a reset, before the handoff is
+// attempted, and the failure must not keep Run from returning.
+func TestRunShutdownResetsNodeBeforeFailedHandoff(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	// The node side never answers the handshake, so the connector stays mid-handshake; retirement
+	// has to reach a socket at that stage too. Its read ends when the signer closes or resets.
+	nodeReadErr := make(chan error, 1)
+	handshaking := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// The signer's first handshake bytes: from here on the connector owns this socket.
+		if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+			nodeReadErr <- err
+			return
+		}
+		close(handshaking)
+		_, err = io.Copy(io.Discard, conn)
+		if err == nil {
+			err = io.EOF
+		}
+		nodeReadErr <- err
+	}()
+
+	var errBeforeTransfer error
+	store := &failingTransferStore{leaderCh: make(chan bool)}
+	store.onTransfer = func() {
+		select {
+		case errBeforeTransfer = <-nodeReadErr:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	l := New(Config{ChainID: testChainID}, StaticNodes{ln.Addr().String()}, newFakePV(),
+		ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- l.Run(ctx) }()
+	select {
+	case <-handshaking:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signer did not dial the node")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown did not complete after a failed handoff")
+	}
+	require.EqualValues(t, 1, store.transfers.Load())
+	require.Error(t, errBeforeTransfer, "the node still had its connection when the handoff started")
+	require.NotErrorIs(t, errBeforeTransfer, io.EOF, "the node connection was closed, not reset")
+	require.Empty(t, l.Status())
 }

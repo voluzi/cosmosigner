@@ -422,6 +422,47 @@ func TestIntegration_GracefulLeaderShutdownResetsNodeConnection(t *testing.T) {
 	}
 }
 
+// TestIntegration_GracefulLeaderShutdownNeverRefusesNode pins that a node never hears a refusal from
+// a leader that is shutting down. cometbft does not retry a remote signer error, so a refusal is a
+// lost vote, where a dropped connection is retried onto the next leader.
+//
+// A request has to fall inside the handoff for a refusal to be possible at all, which at one request
+// per 1.4s block happens in a fraction of handoffs. Signing every 100ms puts one inside every
+// handoff, so a few handoffs are enough to tell the two orders apart.
+func TestIntegration_GracefulLeaderShutdownNeverRefusesNode(t *testing.T) {
+	r := newHandoffRig(t, handoffRigConfig{liveFor: 0})
+	require.Eventually(t, func() bool { return r.sign(1).err == nil }, 30*time.Second, 100*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signing := make(chan struct{})
+	go func() {
+		defer close(signing)
+		r.signAtCadence(ctx, 2, 100*time.Millisecond)
+	}()
+	stop := func() {
+		cancel()
+		<-signing
+	}
+	defer stop()
+
+	for range 5 {
+		// Long enough for the replica restarted by the previous handoff to rejoin as a follower.
+		time.Sleep(300 * time.Millisecond)
+		_, retired := r.handOff()
+		require.Eventually(t, func() bool { return r.successAfter(retired) }, 10*time.Second, time.Millisecond,
+			"signing did not resume after the handoff")
+	}
+	stop()
+
+	events := r.snapshot()
+	require.NotEmpty(t, events)
+	for _, ev := range events {
+		if ev.err != nil {
+			t.Errorf("height %d was not signed: %s", ev.height, classifySignError(ev.err))
+		}
+	}
+}
+
 // TestIntegration_HandoffGapStudy measures what a node loses across many graceful leader shutdowns.
 // It is a measurement, not a check, so it only runs on request:
 //

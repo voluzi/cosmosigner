@@ -381,7 +381,7 @@ func TestIntegration_GracefulLeaderShutdownHandsOffSigning(t *testing.T) {
 	require.NoError(t, h.stores[leader].Close())
 
 	// The bound is the point: the node must reach the new leader without waiting out a connection
-	// timeout, which takes seconds when the old leader retires its connections before handing off.
+	// timeout or its own ping, which is what a connection the old leader left half-open costs.
 	vote = makeVote(11, 0, time.Now().UTC(), "block-B")
 	require.Eventually(t, func() bool {
 		return h.client.SignVote(itestChain, vote) == nil

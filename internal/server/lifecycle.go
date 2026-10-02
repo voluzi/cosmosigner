@@ -101,6 +101,9 @@ func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
 // new synchronization on the signing path in exchange for a liveness blip that already fails closed.
 func (ns *nodeServer) handleRequest(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
 	if ns.retired.Load() {
+		// retire sets the flag just before it closes the socket; closing here as well keeps the
+		// refusal below from being written in between, where the node would take it as final.
+		ns.closeConn()
 		return privval.DefaultValidationRequestHandler(pv, req, retiredChainID)
 	}
 	ns.touch()
@@ -282,9 +285,9 @@ func (ns *nodeServer) observe(staleTimeout time.Duration) retireReason {
 // resolves the NodeSource and diffs it against the live connections: new nodes
 // get a connector, removed nodes are dropped, and dead connections are
 // recreated. On leadership loss it tears down everything; a non-leader never
-// serves signatures. Graceful shutdown hands off leadership before retiring
-// connections, so a node loses this signer only once another replica can dial
-// it.
+// serves signatures. Graceful shutdown retires the connections first and hands
+// off leadership after, so a node is never answered by a leader that is giving
+// leadership up; see Run.
 type Lifecycle struct {
 	cfg     Config
 	nodes   NodeSource
@@ -498,8 +501,17 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 // until ctx is cancelled. The periodic tick backstops a missed LeaderCh
 // transition, refreshes node discovery, and recovers dead connections.
 // Retiring a connection also wakes the loop directly, so a node replaced by a
-// new pod (and so a new IP) is rediscovered without waiting out the tick. On cancellation,
-// a bounded leadership handoff runs first and the connections are torn down after it.
+// new pod (and so a new IP) is rediscovered without waiting out the tick.
+//
+// On cancellation the connections are retired first and the bounded leadership handoff runs after.
+// The order follows from what cometbft retries. Raft refuses reservations from the moment a
+// transfer starts, and a refusal that reaches the node is final: its retrying client returns a
+// remote signer error at once and the vote is lost. A connection that is reset is retried instead,
+// every 100ms for 5s, each attempt waiting for a signer to dial in. So the node must lose this
+// connection before the transfer can make this replica refuse, and its own retries then carry the
+// request to the next leader, which dials as soon as it is elected. If the transfer fails, the
+// node has no signer while this replica is still leader, for at most the transfer's bound; the
+// process is exiting either way, and the followers elect once it is gone.
 func (l *Lifecycle) Run(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -510,8 +522,8 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			l.transferLeadership()
 			l.stopAll()
+			l.transferLeadership()
 			l.stopping.Wait()
 			return ctx.Err()
 		case <-l.store.LeaderCh():
