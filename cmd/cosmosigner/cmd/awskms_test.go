@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -146,14 +146,28 @@ func TestImportAWSCommandRecoveryReminder(t *testing.T) {
 }
 
 func TestAWSClaimStartupWarning(t *testing.T) {
-	be := &claimingBackend{}
-	var logs bytes.Buffer
-	err := claimWithConfig(backend.Config{Type: backend.TypeAWSKMS}, be, false, cmtlog.NewTMLogger(&logs))(t.Context(), startTestClusterID)
-	require.NoError(t, err)
-	require.Len(t, be.claims, 1)
-	require.Contains(t, logs.String(), "eventually consistent")
-	require.Contains(t, logs.String(), "compare-and-set")
-	require.Contains(t, logs.String(), "serialize")
+	for _, level := range []string{"info", "warn", "error"} {
+		t.Run(level, func(t *testing.T) {
+			read, write, err := os.Pipe()
+			require.NoError(t, err)
+			stderr := os.Stderr
+			os.Stderr = write
+			t.Cleanup(func() {
+				os.Stderr = stderr
+				_ = write.Close()
+				_ = read.Close()
+			})
+			be := &claimingBackend{}
+			require.NoError(t, claimWithConfig(backend.Config{Type: backend.TypeAWSKMS}, be, false, newCmtLogger(level))(t.Context(), startTestClusterID))
+			require.NoError(t, write.Close())
+			warning, err := io.ReadAll(read)
+			require.NoError(t, err)
+			require.Len(t, be.claims, 1)
+			require.Contains(t, string(warning), "eventually consistent")
+			require.Contains(t, string(warning), "compare-and-set")
+			require.Contains(t, string(warning), "serialize")
+		})
+	}
 }
 
 func TestAWSImportPartialFailureReportsRecoveryTarget(t *testing.T) {

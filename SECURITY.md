@@ -50,3 +50,4 @@ Out of scope:
 - Upgrade all replicas while stopped. Preserve the complete authoritative Raft history, initialize its immutable cluster ID, claim the key once with separate administrative credentials, and only then restart signers.
 - Never delete, overwrite, expire, or reassign a cluster claim to recover from lost Raft state. Recover the signing history or use a validator key-rotation procedure that is independently safe.
 - Externally serialize the first Google Cloud KMS claim while signers are stopped; CryptoKey label updates have no atomic compare-and-set precondition.
+- Externally serialize the first AWS KMS claim while signers are stopped and wait for prior claims to become visible; tag updates have no atomic compare-and-set and tag reads are eventually consistent. Read-back polling does not make concurrent claims safe.
