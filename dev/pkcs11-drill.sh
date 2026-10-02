@@ -35,12 +35,13 @@ fi
 
 # A separate marker exercises the orchestrated claim against the initialized history.
 export COSMOSIGNER_PKCS11_BINDING_FILE="$state/start-binding.json"
-"$binary" start "${common[@]}" --claim-if-unclaimed --http-addr 127.0.0.1:18047 > "$state/start.log" 2>&1 &
+"$binary" start "${common[@]}" --claim-if-unclaimed --http-addr 127.0.0.1:0 > "$state/start.log" 2>&1 &
 pid=$!
 ready=false
 for _ in {1..100}; do
   if ! kill -0 "$pid" 2>/dev/null; then cat "$state/start.log" >&2; exit 1; fi
-  if curl -fsS http://127.0.0.1:18047/readyz > /dev/null 2>&1; then
+  address=$(sed -n 's/.*health endpoints listening.*addr=\(127\.0\.0\.1:[0-9]*\).*/\1/p' "$state/start.log" | head -1)
+  if [[ -n "$address" ]] && curl -fsS "http://$address/readyz" > /dev/null 2>&1; then
     ready=true
     break
   fi

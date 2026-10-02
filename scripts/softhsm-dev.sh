@@ -4,7 +4,7 @@ set -euo pipefail
 # Disposable native token only. stdout contains shell exports for eval.
 case "${1:-}" in
   up)
-    module="${COSMOSIGNER_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}"
+    module="${COSMOSIGNER_SOFTHSM_MODULE:-/usr/lib/softhsm/libsofthsm2.so}"
     state=$(mktemp -d "${TMPDIR:-/tmp}/cosmosigner-softhsm.XXXXXX")
     trap 'if [[ $? != 0 ]]; then rm -rf "$state"; fi' EXIT
     mkdir "$state/tokens"
@@ -37,5 +37,5 @@ case "${1:-}" in
     fi
     rm -rf "$state"
     ;;
-  *) echo 'usage: eval "$(scripts/softhsm-dev.sh up)"; scripts/softhsm-dev.sh down' >&2; exit 1 ;;
+  *) echo 'usage: exports=$(scripts/softhsm-dev.sh up) && eval "$exports"; scripts/softhsm-dev.sh down' >&2; exit 1 ;;
 esac

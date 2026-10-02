@@ -420,10 +420,16 @@ run before use with a validator key. PureEdDSA (`CKM_EDDSA`, no mechanism parame
 identical signatures for identical messages. Startup signs a non-consensus probe twice and refuses
 randomized or invalid signatures.
 
-Default binaries, the filtered installer command above, `go install` and default images remain
-static and do not include PKCS#11 support. Selecting this backend in them returns an explicit unsupported-build error.
+Default release binaries, the filtered installer command above and default images remain static.
+The documented `go install` command also omits PKCS#11 support because it has no `pkcs11` build tag;
+its linking depends on the local toolchain. Selecting this backend without that tag returns an
+explicit unsupported-build error.
 `cosmosigner version` reports `pkcs11: true` or `false`. Linux releases additionally provide
 `cosmosigner-pkcs11_<version>_linux_{amd64,arm64}.tar.gz`, containing a `cosmosigner` executable.
+Native archives are built in snapshots but disabled for release tags until the owner sets the
+repository variable `COSMOSIGNER_RELEASE_PKCS11=1` after updating the external installer to prefer
+the static `cosmosigner_` prefix. Native images and source builds remain available while that
+release gate is disabled.
 These native artifacts use glibc and are built with Debian 12/bookworm compilers. The native image
 uses `distroless/cc-debian12` and its builder also uses bookworm; a binary built on a newer Linux
 host may require a newer glibc. Inspect `readelf --version-info cosmosigner` for that binary's
@@ -456,7 +462,8 @@ backend:
 ```
 
 The token selector must match exactly one present token. Key selection must match exactly one
-signing `CKO_PRIVATE_KEY` and one `CKO_PUBLIC_KEY` of type `CKK_EC_EDWARDS`. Both objects must have
+signing `CKO_PRIVATE_KEY` and one `CKO_PUBLIC_KEY` of type `CKK_EC_EDWARDS`. The private key must
+have `CKA_SENSITIVE=true` and `CKA_EXTRACTABLE=false`. Both objects must have
 Ed25519 parameters: DER OID `1.3.101.112` or DER PrintableString `edwards25519`. Ed448, X25519,
 malformed parameters and keys are rejected. Public points must be exactly 32 raw bytes or a DER
 OCTET STRING wrapping 32 bytes. Every returned signature must be 64 bytes and verify under the
@@ -472,9 +479,10 @@ originally cached public key, including when label/ID selectors select mismatche
 | `pin_file` | `--pkcs11-pin-file` | `COSMOSIGNER_PKCS11_PIN_FILE` |
 | `binding_file` | `--pkcs11-binding-file` | `COSMOSIGNER_PKCS11_BINDING_FILE` |
 
-Precedence is flags → environment → YAML → defaults. There is no default binding file and no
-selector switching across layers: clear a configured `token_label` before selecting `slot`, or
-remove a configured `slot` before selecting `token_label`; setting both fails validation. There is no
+Precedence is flags → environment → YAML → defaults. One explicit token selector flag replaces
+the other selector from configuration. Setting both flags fails validation. Environment overrides
+replace individual fields; clear a configured `token_label` before selecting `slot` by environment,
+or remove a configured `slot` before selecting `token_label`. There is no default binding file and no
 `pin` or `pin_env` field or secret-valued flag/environment variable. Use a restricted PIN file;
 only trailing CR/LF bytes are removed, so spaces remain part of the PIN. Cosmosigner does not
 provision or import token keys: generate them using the vendor's provisioning tools.
@@ -503,9 +511,11 @@ not live fencing against another running signer.
 One session is serialized for all signing, recovery and preflight calls. On a closed/invalid
 session, removed device, absent token or lost login, Cosmosigner refreshes slots, reopens and logs
 in, reacquires handles, validates the objects and compares their public key to the original key
-before retrying the exact message once. Any failure returns no signature; the Raft reservation
+before retrying the exact message once. Other signing errors close the session without an immediate
+retry; the next call reopens it. Any failure returns no signature; the Raft reservation
 stays in flight. A later call may recover when the token returns. Incorrect or locked PIN errors
-latch token access for the process. Automatic supervisor or pod restarts reset that latch and
+latch token access for the process by manufacturer, model and token serial number, including across
+module copies and slot changes. A token must report a non-empty serial number. Automatic restarts reset that latch and
 consume another hardware PIN attempt. Stop automatic restarts and correct access before restarting;
 repeated incorrect PINs can lock or zeroize a device according to its policy.
 Recovery never finalizes the module or logs out other sessions. Modules are shared
@@ -518,10 +528,13 @@ compiler and `curl`):
 ```sh
 dev/pkcs11-drill.sh
 # Or configure a disposable token for a manual integration run:
-eval "$(scripts/softhsm-dev.sh up)"
+exports=$(scripts/softhsm-dev.sh up) && eval "$exports"
 make test-pkcs11
 scripts/softhsm-dev.sh down
 ```
+
+The setup script ignores runtime HSM configuration. Set `COSMOSIGNER_SOFTHSM_MODULE` only when
+SoftHSM's library is installed at a different path.
 
 The drill checks signing determinism across instances, session recovery, key replacement refusal,
 curve rejection, shared binding, CLI startup/claim and the static binary's unsupported error.

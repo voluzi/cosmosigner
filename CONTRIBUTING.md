@@ -99,7 +99,7 @@ exit; it starts no containers. Missing integration configuration fails rather th
 ```sh
 dev/pkcs11-drill.sh
 # Individual runs:
-eval "$(scripts/softhsm-dev.sh up)"
+exports=$(scripts/softhsm-dev.sh up) && eval "$exports"
 make test-pkcs11
 make build-pkcs11
 scripts/softhsm-dev.sh down

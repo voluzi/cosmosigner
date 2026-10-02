@@ -80,6 +80,8 @@ jobs:
           cache: true
       - name: Install Debian 12 native and cross compilers
         run: apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Trust the mounted checkout for release tools
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Validate and build all release archives
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
