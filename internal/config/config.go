@@ -33,6 +33,9 @@ type Config struct {
 	// it only where one owner per key is guaranteed externally (e.g. by an operator), because the
 	// claim is what stops a second signing history from adopting an unclaimed key.
 	ClaimIfUnclaimed bool `yaml:"claim_if_unclaimed" env:"COSMOSIGNER_CLAIM_IF_UNCLAIMED"`
+	// HTTPAddr is the listen address (host:port) of the unauthenticated health endpoints. Empty
+	// disables them; there is no default port because replicas sharing a host would collide on it.
+	HTTPAddr string `yaml:"http_addr" env:"COSMOSIGNER_HTTP_ADDR"`
 
 	// Connection tuning (durations are not YAML-friendly; flag/env/default only).
 	ReconcileInterval time.Duration `yaml:"-" env:"COSMOSIGNER_RECONCILE_INTERVAL" default:"5s"`

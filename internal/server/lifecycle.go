@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -252,6 +253,57 @@ type Lifecycle struct {
 	// discoveryPendingUntil keeps discovery on the fast cadence for a bounded window after a
 	// connection is retired, even once nothing in the serving set looks unhealthy. Guarded by mu.
 	discoveryPendingUntil time.Time
+
+	// status is the serving set as of the last reconcile pass or health scan, published for Status.
+	status atomic.Pointer[[]servedNode]
+}
+
+// servedNode is one entry of the published serving set.
+type servedNode struct {
+	addr      string
+	connected bool
+	ns        *nodeServer
+}
+
+// NodeStatus describes one node connection held by this replica.
+type NodeStatus struct {
+	Address string
+	// Connected is as of the last reconcile pass or health scan.
+	Connected bool
+	// LastActivity is the last request handled on the connection (pings included); zero while not
+	// connected.
+	LastActivity time.Time
+}
+
+// Status returns the nodes this replica is serving, sorted by address; empty on a non-leader.
+//
+// It reads a snapshot instead of the live connections: asking an endpoint whether it is connected
+// waits on the lock its service loop holds for a whole read, up to TimeoutReadWrite, and l.mu is
+// held across that same call during a reconcile. A status request must not queue behind either.
+func (l *Lifecycle) Status() []NodeStatus {
+	served := l.status.Load()
+	if served == nil {
+		return nil
+	}
+	nodes := make([]NodeStatus, 0, len(*served))
+	for _, n := range *served {
+		node := NodeStatus{Address: n.addr, Connected: n.connected}
+		if n.connected {
+			node.LastActivity = time.Unix(0, n.ns.lastActivity.Load())
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+// publishStatus snapshots the serving set for Status. Callers must hold l.mu.
+func (l *Lifecycle) publishStatus() {
+	served := make([]servedNode, 0, len(l.servers))
+	for addr, ns := range l.servers {
+		served = append(served, servedNode{addr: addr, connected: ns.connected, ns: ns})
+	}
+	sort.Slice(served, func(i, j int) bool { return served[i].addr < served[j].addr })
+	l.status.Store(&served)
 }
 
 // retire stops a node connection and drops it from the serving set.
@@ -342,6 +394,8 @@ func (l *Lifecycle) watchInterval() time.Duration {
 func (l *Lifecycle) needsFastDiscovery() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// The scan can be the first to see a connection come up, and then asks for no reconcile.
+	defer l.publishStatus()
 	if time.Now().Before(l.discoveryPendingUntil) {
 		return true
 	}
@@ -438,6 +492,7 @@ func (l *Lifecycle) reconcile() {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	defer l.publishStatus()
 
 	for addr, ns := range l.servers {
 		if _, wanted := want[addr]; !wanted {
@@ -503,6 +558,7 @@ func (l *Lifecycle) stopAll() {
 	for addr, ns := range l.servers {
 		l.retire(addr, ns)
 	}
+	l.publishStatus()
 }
 
 func (l *Lifecycle) transferLeadership() {

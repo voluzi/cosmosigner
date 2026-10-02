@@ -19,9 +19,11 @@ import (
 
 	"github.com/voluzi/cosmosigner/internal/backend"
 	"github.com/voluzi/cosmosigner/internal/config"
+	"github.com/voluzi/cosmosigner/internal/health"
 	"github.com/voluzi/cosmosigner/internal/server"
 	"github.com/voluzi/cosmosigner/internal/signer"
 	"github.com/voluzi/cosmosigner/internal/state"
+	"github.com/voluzi/cosmosigner/internal/version"
 )
 
 // NewStartCmd builds the `start` command.
@@ -51,6 +53,7 @@ func NewStartCmd() *cobra.Command {
 	f.String("node-service", "", "headless service host:port to auto-discover nodes from (mutually exclusive with --node)")
 	f.String("conn-key", d.ConnKey, "path to the SecretConnection identity key")
 	f.String("state-dir", d.StateDir, "state directory")
+	f.String("http-addr", d.HTTPAddr, "listen address (host:port) for the /livez, /readyz and /status endpoints; empty disables them")
 	f.Duration("reconcile-interval", d.ReconcileInterval, "how often to re-resolve nodes / re-check leadership")
 	f.Duration("stale-conn-timeout", d.StaleConnTimeout, "recycle a node connection with no inbound activity for this long")
 	f.String("raft-node-id", d.Raft.NodeID, "raft node id")
@@ -88,6 +91,7 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 	s("node-service", &c.NodeService)
 	s("conn-key", &c.ConnKey)
 	s("state-dir", &c.StateDir)
+	s("http-addr", &c.HTTPAddr)
 	if f.Changed("reconcile-interval") {
 		c.ReconcileInterval, _ = f.GetDuration("reconcile-interval")
 	}
@@ -149,6 +153,12 @@ func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
 
+	hs, err := startHealthServer(cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer hs.Close()
+
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
 		return err
@@ -163,13 +173,18 @@ func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
 	// operations and provider preflights receive the signal-aware context.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return runStartWithContext(ctx, cfg, initializeOnly, out, be, logger, raftLogger)
+	return runStartWithContext(ctx, cfg, initializeOnly, out, be, hs, logger, raftLogger)
 }
 
 func runStartModeContext(ctx context.Context, cfg config.Config, initializeOnly bool, out io.Writer) error {
 	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
+	hs, err := startHealthServer(cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer hs.Close()
 	be, err := backend.New(cfg.Backend)
 	if err != nil {
 		return err
@@ -178,7 +193,21 @@ func runStartModeContext(ctx context.Context, cfg config.Config, initializeOnly 
 	if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
 		return err
 	}
-	return runStartWithContext(ctx, cfg, initializeOnly, out, be, logger, raftLogger)
+	return runStartWithContext(ctx, cfg, initializeOnly, out, be, hs, logger, raftLogger)
+}
+
+// startHealthServer serves the health endpoints when http_addr is set and returns nil otherwise.
+// It runs before the backend is built so /livez answers while a slow backend or raft is still
+// starting.
+func startHealthServer(cfg config.Config, logger cmtlog.Logger) (*health.Server, error) {
+	if cfg.HTTPAddr == "" {
+		return nil, nil
+	}
+	return health.Start(cfg.HTTPAddr, health.Info{
+		Version:    version.Version,
+		ChainID:    cfg.ChainID,
+		RaftNodeID: cfg.Raft.NodeID,
+	}, logger)
 }
 
 func startLoggers(level string) (cmtlog.Logger, hclog.Logger) {
@@ -196,6 +225,7 @@ func runStartWithContext(
 	initializeOnly bool,
 	out io.Writer,
 	be backend.KeyBackend,
+	hs *health.Server,
 	logger cmtlog.Logger,
 	raftLogger hclog.Logger,
 ) error {
@@ -224,6 +254,15 @@ func runStartWithContext(
 		return err
 	}
 	defer store.Close()
+	hs.SetRaft(func() health.Raft {
+		raft := health.Raft{Leader: store.IsLeader(), State: "follower"}
+		if reader, ok := store.(state.RaftStateReader); ok {
+			raft.State = reader.RaftState()
+		} else if raft.Leader {
+			raft.State = "leader"
+		}
+		return raft
+	})
 	var claim startupClaimer
 	if cfg.ClaimIfUnclaimed {
 		claim = claimWithConfig(backend.ClaimConfig(cfg.Backend), be, backend.HasSeparateClaimCredentials(cfg.Backend), logger)
@@ -279,10 +318,25 @@ func runStartWithContext(
 		ReconcileInterval: cfg.ReconcileInterval,
 		StaleConnTimeout:  cfg.StaleConnTimeout,
 	}, nodes, pv, connKey, store, logger)
+	hs.SetNodes(func() []health.Node {
+		served := lc.Status()
+		nodes := make([]health.Node, 0, len(served))
+		for _, n := range served {
+			nodes = append(nodes, health.Node{Address: n.Address, Connected: n.Connected, LastActivity: n.LastActivity})
+		}
+		return nodes
+	})
 
 	logger.Info("cosmosigner starting",
 		"chain_id", cfg.ChainID, "nodes", nodes.Describe(), "backend", cfg.Backend.Type,
 		"raft_node", cfg.Raft.NodeID, "raft_mtls", raftCfg.TLS.Enabled(), "cluster_id", clusterID)
+
+	// Ready from here on, on followers too: the raft store is open and the binding and backend
+	// preflight passed. Readiness ends when shutdown begins, not when the handoff completes, so
+	// the replica is reported as going away while it still hands off.
+	hs.SetReady(true)
+	defer hs.SetReady(false)
+	defer context.AfterFunc(ctx, func() { hs.SetReady(false) })()
 
 	if err := lc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err

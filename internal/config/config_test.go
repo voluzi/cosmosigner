@@ -23,6 +23,7 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, "127.0.0.1:7070", d.Raft.BindAddr)
 	require.False(t, d.Raft.Insecure)
 	require.False(t, d.Raft.SingleNode)
+	require.Empty(t, d.HTTPAddr, "the health endpoints are opt-in")
 }
 
 func TestValidate_RequiresRaftTransportSecurity(t *testing.T) {
@@ -137,6 +138,34 @@ func TestLoad_EnvOverridesFile(t *testing.T) {
 	require.Equal(t, "from-env", cfg.ChainID)                 // env > file
 	require.Equal(t, []string{"1.2.3.4:5555"}, cfg.NodeAddrs) // file
 	require.Equal(t, "/key.json", cfg.Backend.SoftwareKeyFile)
+}
+
+func TestLoad_HTTPAddr(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "c.yaml")
+	require.NoError(t, os.WriteFile(file, []byte(
+		"chain_id: c\nhttp_addr: 0.0.0.0:8080\nnodes:\n  - 1.2.3.4:5555\nbackend:\n  key_file: /key.json\nraft:\n  insecure: true\n"), 0o600))
+
+	cfg, err := Load(file, nil)
+	require.NoError(t, err)
+	require.Equal(t, "0.0.0.0:8080", cfg.HTTPAddr)
+
+	t.Setenv("COSMOSIGNER_HTTP_ADDR", "127.0.0.1:9090")
+	cfg, err = Load(file, nil)
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1:9090", cfg.HTTPAddr)
+}
+
+// A deployment that still sets the removed retry cap must keep starting; start warns about it.
+func TestLoad_IgnoresRemovedMaxRetries(t *testing.T) {
+	t.Setenv("COSMOSIGNER_CONN_MAX_RETRIES", "6000")
+	_, err := Load("", func(c *Config) error {
+		c.ChainID = "c"
+		c.NodeAddrs = []string{"x:1"}
+		c.Backend.SoftwareKeyFile = "/k"
+		c.Raft.Insecure = true
+		return nil
+	})
+	require.NoError(t, err)
 }
 
 func TestLoad_FlagOverlayWins(t *testing.T) {

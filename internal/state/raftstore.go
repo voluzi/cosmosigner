@@ -579,6 +579,8 @@ func (s *raftStore) Get(chainID string) (*SignState, error) {
 
 func (s *raftStore) IsLeader() bool { return s.raft.State() == raft.Leader }
 
+func (s *raftStore) RaftState() string { return strings.ToLower(s.raft.State().String()) }
+
 func (s *raftStore) LeaderCh() <-chan bool { return s.raft.LeaderCh() }
 
 func (s *raftStore) Close() error {
