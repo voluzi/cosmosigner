@@ -73,7 +73,7 @@ type nodeServer struct {
 	connMu sync.Mutex
 	// conn is the socket most recently opened by dial, kept so retirement can close it whatever
 	// stage it reached. Guarded by connMu.
-	conn net.Conn
+	conn *onceCloseConn
 }
 
 func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
@@ -188,10 +188,30 @@ func (c *onceCloseConn) Close() error {
 	return c.err
 }
 
+// abort closes the connection with a reset instead of an orderly FIN, so the node learns from the
+// close itself that the connection is dead.
+//
+// A FIN does not tell it. cometbft's listener endpoint drops a connection only on an error that
+// carries a Timeout method, which a reset is (*net.OpError) and io.EOF is not: after a FIN the node
+// keeps the connection, every request on it fails with EOF, and it reconnects only when one of its
+// writes is answered with a reset or when its own ping fails, a ping interval (3.3s by default)
+// after the last answer. The first needs this host to still be answering, and on a graceful
+// shutdown the process exits right after retiring, the pod's network with it. The node then signs
+// nothing until the ping, however early the next leader dialed.
+//
+// A reset discards a reply still in the send buffer. Retirement already forfeits that reply; see
+// handleRequest for why losing it is safe.
+func (c *onceCloseConn) abort() {
+	if tcp, ok := c.Conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = c.Close()
+}
+
 // track records conn for closeConn, or reports false when the connector is already retired and the
 // caller must close conn itself. Checking under connMu is what guarantees every socket is closed by
 // exactly one side: closeConn runs after retired is set, so it either sees conn or track refuses it.
-func (ns *nodeServer) track(conn net.Conn) bool {
+func (ns *nodeServer) track(conn *onceCloseConn) bool {
 	ns.connMu.Lock()
 	defer ns.connMu.Unlock()
 	if ns.retired.Load() {
@@ -211,14 +231,14 @@ func (ns *nodeServer) handOver() bool {
 	return !ns.retired.Load()
 }
 
-// closeConn closes the last dialed socket, whatever stage it reached: mid-handshake, returned by
+// closeConn resets the last dialed socket, whatever stage it reached: mid-handshake, returned by
 // dial but not yet installed in the endpoint, or serving. The endpoint's own Close only covers the
 // last of these.
 func (ns *nodeServer) closeConn() {
 	ns.connMu.Lock()
 	defer ns.connMu.Unlock()
 	if ns.conn != nil {
-		_ = ns.conn.Close()
+		ns.conn.abort()
 	}
 }
 
@@ -357,7 +377,8 @@ func (l *Lifecycle) publishStatus() {
 // public-key request instead of accepting the next signer's dial. So the socket is closed here as
 // well, before Stop(), which can spend its whole wait behind a read that would otherwise deliver
 // the node's request to the refusing handler. Closing does not block. It costs a request that was
-// already being handled its reply — see handleRequest for why that is safe.
+// already being handled its reply — see handleRequest for why that is safe. The close is a reset,
+// which is what makes the node move to the next signer's connection at once; see abort.
 //
 // Stop() does not reach a connector that is still dialing either, so retirement also cancels the
 // dial, and the same close aborts a handshake in flight: a retired connector that kept dialing
