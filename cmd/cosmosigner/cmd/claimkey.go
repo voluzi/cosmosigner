@@ -34,6 +34,9 @@ func NewClaimKeyCmd() *cobra.Command {
 			if cfg.Type == backend.TypeGCPKMS {
 				fmt.Fprintln(command.ErrOrStderr(), "WARNING: Cloud KMS label updates have no atomic compare-and-set; stop signers and externally serialize the initial claim")
 			}
+			if cfg.Type == backend.TypeAWSKMS {
+				fmt.Fprintln(command.ErrOrStderr(), awsClaimWarning)
+			}
 			if err := be.ClaimCluster(command.Context(), clusterID); err != nil {
 				return err
 			}
@@ -45,3 +48,5 @@ func NewClaimKeyCmd() *cobra.Command {
 	registerBackendFlags(command)
 	return command
 }
+
+const awsClaimWarning = "WARNING: AWS KMS tag updates have no atomic compare-and-set and reads are eventually consistent; stop signers, externally serialize the initial claim, and wait for prior claims to be visible"
