@@ -9,6 +9,7 @@ Cosmosigner is security-sensitive validator infrastructure. Keep changes small, 
 - Go version from `go.mod`.
 - `make`.
 - Optional: Docker for Vault development and integration tests.
+- Optional: a C compiler, `softhsm2`, `opensc` and `curl` for native PKCS#11 tests.
 - Optional: `golangci-lint` for `make lint`.
 
 ## Local Workflow
@@ -89,6 +90,28 @@ local transport tests cannot establish AWS determinism or acceptance of Ed25519 
 Retain protected recovery material for real imported keys, as required by AWS.
 
 Do not commit credentials, real validator keys, generated token files, raft data, or local test data.
+
+### PKCS#11 / SoftHSM2
+
+Use only a disposable SoftHSM token. The drill provisions local test state and removes it on
+exit; it starts no containers. Missing integration configuration fails rather than skipping tests.
+
+```sh
+dev/pkcs11-drill.sh
+# Individual runs:
+eval "$(scripts/softhsm-dev.sh up)"
+make test-pkcs11
+make build-pkcs11
+scripts/softhsm-dev.sh down
+```
+
+The `pkcs11 && cgo` backend is opt-in; default builds must stay static. Native release binaries
+and the `pkcs11` Docker target use Debian 12/bookworm compilers for the `cc-debian12` runtime.
+When checking another compiler host, record the required glibc symbol versions instead of
+assuming runtime compatibility. Preserve all existing default archive names, including the
+Darwin universal archive. The CI SoftHSM job runs the same drill; it is not a hardware claim.
+For each real device, validate deterministic PureEdDSA, removal/recovery, PIN semantics and
+vendor module loading before using a validator key. Do not run destructive SoftHSM tests on it.
 
 ## Pull Request Guidelines
 

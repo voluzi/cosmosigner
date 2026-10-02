@@ -39,5 +39,29 @@ builds:
       - -X github.com/voluzi/cosmosigner/internal/version.Commit={{ .Commit }}
       - -X github.com/voluzi/cosmosigner/internal/version.Date={{ .Date }}
 
+  - id: linux-pkcs11
+    main: ./cmd/cosmosigner
+    binary: cosmosigner
+    goos: [linux]
+    goarch: [amd64, arm64]
+    env:
+      - CGO_ENABLED=1
+      - 'CC={{ if eq .Arch "amd64" }}x86_64-linux-gnu-gcc{{ else }}aarch64-linux-gnu-gcc{{ end }}'
+    tags: [pkcs11]
+    flags: [-mod=readonly, -trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/voluzi/cosmosigner/internal/version.Version={{ .Version }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Commit={{ .Commit }}
+      - -X github.com/voluzi/cosmosigner/internal/version.Date={{ .Date }}
+
 universal_binaries:
   - id: darwin
+
+archives:
+  - id: default
+    ids: [darwin, linux]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
+  - id: pkcs11
+    ids: [linux-pkcs11]
+    name_template: '{{ .ProjectName }}-pkcs11_{{ .Version }}_{{ .Os }}_{{ .Arch }}'

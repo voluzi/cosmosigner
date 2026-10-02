@@ -13,7 +13,7 @@ import (
 func registerBackendFlags(cmd *cobra.Command) {
 	d := config.Defaults().Backend
 	f := cmd.Flags()
-	f.String("backend", string(d.Type), "key backend: software | vault | gcpkms | awskms")
+	f.String("backend", string(d.Type), "key backend: software | vault | gcpkms | awskms | pkcs11")
 	f.String("key-file", "", "software backend: priv_validator_key.json path")
 	f.String("binding-file", "", "software backend: cluster marker path (default: next to --key-file; set when the key is read-only)")
 	f.String("vault-addr", "", "vault address")
@@ -28,6 +28,13 @@ func registerBackendFlags(cmd *cobra.Command) {
 	f.String("aws-region", "", "aws region (else the standard AWS SDK region chain)")
 	f.String("gcp-key-version", "", "gcp kms cryptoKeyVersion resource name")
 	f.String("gcp-credentials-file", "", "gcp service account JSON path (else ADC)")
+	f.String("pkcs11-module", "", "PKCS#11 shared library path")
+	f.String("pkcs11-token-label", "", "PKCS#11 token label (exclusive with --pkcs11-slot)")
+	f.Uint("pkcs11-slot", 0, "PKCS#11 slot number, including 0 (exclusive with --pkcs11-token-label)")
+	f.String("pkcs11-key-label", "", "PKCS#11 key label")
+	f.String("pkcs11-key-id", "", "PKCS#11 key ID in hexadecimal; combined with key label when both are set")
+	f.String("pkcs11-pin-file", "", "PKCS#11 PIN file path")
+	f.String("pkcs11-binding-file", "", "PKCS#11 persistent cluster marker shared by all replicas")
 }
 
 // overlayBackendFlags applies explicitly-set backend flags onto c (highest
@@ -55,4 +62,15 @@ func overlayBackendFlags(cmd *cobra.Command, c *backend.Config) {
 	s("aws-region", &c.AWSKMS.Region)
 	s("gcp-key-version", &c.GCPKMS.KeyVersion)
 	s("gcp-credentials-file", &c.GCPKMS.CredentialsFile)
+	s("pkcs11-module", &c.PKCS11.Module)
+	s("pkcs11-token-label", &c.PKCS11.TokenLabel)
+	s("pkcs11-key-label", &c.PKCS11.KeyLabel)
+	s("pkcs11-key-id", &c.PKCS11.KeyID)
+	s("pkcs11-pin-file", &c.PKCS11.PINFile)
+	s("pkcs11-binding-file", &c.PKCS11.BindingFile)
+	if cmd.Flags().Changed("pkcs11-slot") {
+		slot, _ := cmd.Flags().GetUint("pkcs11-slot")
+		c.PKCS11.Slot = &slot
+	}
+
 }

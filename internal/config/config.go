@@ -158,6 +158,10 @@ func (c *Config) Validate() error {
 		if c.Backend.AWSKMS.KeyID == "" {
 			return fmt.Errorf("awskms backend requires backend.aws.key_id")
 		}
+	case backend.TypePKCS11:
+		if err := backend.ValidatePKCS11Config(c.Backend.PKCS11); err != nil {
+			return err
+		}
 	case backend.TypeGCPKMS:
 		if c.Backend.GCPKMS.KeyVersion == "" {
 			return fmt.Errorf("gcpkms backend requires backend.gcp.key_version")
