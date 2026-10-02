@@ -73,7 +73,7 @@ type nodeServer struct {
 	connMu sync.Mutex
 	// conn is the socket most recently opened by dial, kept so retirement can close it whatever
 	// stage it reached. Guarded by connMu.
-	conn net.Conn
+	conn *onceCloseConn
 }
 
 func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
@@ -101,6 +101,9 @@ func (ns *nodeServer) touch() { ns.lastActivity.Store(time.Now().UnixNano()) }
 // new synchronization on the signing path in exchange for a liveness blip that already fails closed.
 func (ns *nodeServer) handleRequest(pv types.PrivValidator, req privvalproto.Message, chainID string) (privvalproto.Message, error) {
 	if ns.retired.Load() {
+		// retire sets the flag just before it closes the socket; closing here as well keeps the
+		// refusal below from being written in between, where the node would take it as final.
+		ns.closeConn()
 		return privval.DefaultValidationRequestHandler(pv, req, retiredChainID)
 	}
 	ns.touch()
@@ -188,10 +191,30 @@ func (c *onceCloseConn) Close() error {
 	return c.err
 }
 
+// abort closes the connection with a reset instead of an orderly FIN, so the node learns from the
+// close itself that the connection is dead.
+//
+// A FIN does not tell it. cometbft's listener endpoint drops a connection only on an error that
+// carries a Timeout method, which a reset is (*net.OpError) and io.EOF is not: after a FIN the node
+// keeps the connection, every request on it fails with EOF, and it reconnects only when one of its
+// writes is answered with a reset or when its own ping fails, a ping interval (3.3s by default)
+// after the last answer. The first needs this host to still be answering, and on a graceful
+// shutdown the process exits right after retiring, the pod's network with it. The node then signs
+// nothing until the ping, however early the next leader dialed.
+//
+// A reset discards a reply still in the send buffer. Retirement already forfeits that reply; see
+// handleRequest for why losing it is safe.
+func (c *onceCloseConn) abort() {
+	if tcp, ok := c.Conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = c.Close()
+}
+
 // track records conn for closeConn, or reports false when the connector is already retired and the
 // caller must close conn itself. Checking under connMu is what guarantees every socket is closed by
 // exactly one side: closeConn runs after retired is set, so it either sees conn or track refuses it.
-func (ns *nodeServer) track(conn net.Conn) bool {
+func (ns *nodeServer) track(conn *onceCloseConn) bool {
 	ns.connMu.Lock()
 	defer ns.connMu.Unlock()
 	if ns.retired.Load() {
@@ -211,14 +234,14 @@ func (ns *nodeServer) handOver() bool {
 	return !ns.retired.Load()
 }
 
-// closeConn closes the last dialed socket, whatever stage it reached: mid-handshake, returned by
+// closeConn resets the last dialed socket, whatever stage it reached: mid-handshake, returned by
 // dial but not yet installed in the endpoint, or serving. The endpoint's own Close only covers the
 // last of these.
 func (ns *nodeServer) closeConn() {
 	ns.connMu.Lock()
 	defer ns.connMu.Unlock()
 	if ns.conn != nil {
-		_ = ns.conn.Close()
+		ns.conn.abort()
 	}
 }
 
@@ -262,9 +285,9 @@ func (ns *nodeServer) observe(staleTimeout time.Duration) retireReason {
 // resolves the NodeSource and diffs it against the live connections: new nodes
 // get a connector, removed nodes are dropped, and dead connections are
 // recreated. On leadership loss it tears down everything; a non-leader never
-// serves signatures. Graceful shutdown hands off leadership before retiring
-// connections, so a node loses this signer only once another replica can dial
-// it.
+// serves signatures. Graceful shutdown retires the connections first and hands
+// off leadership after, so a node is never answered by a leader that is giving
+// leadership up; see Run.
 type Lifecycle struct {
 	cfg     Config
 	nodes   NodeSource
@@ -357,7 +380,8 @@ func (l *Lifecycle) publishStatus() {
 // public-key request instead of accepting the next signer's dial. So the socket is closed here as
 // well, before Stop(), which can spend its whole wait behind a read that would otherwise deliver
 // the node's request to the refusing handler. Closing does not block. It costs a request that was
-// already being handled its reply — see handleRequest for why that is safe.
+// already being handled its reply — see handleRequest for why that is safe. The close is a reset,
+// which is what makes the node move to the next signer's connection at once; see abort.
 //
 // Stop() does not reach a connector that is still dialing either, so retirement also cancels the
 // dial, and the same close aborts a handshake in flight: a retired connector that kept dialing
@@ -477,8 +501,17 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 // until ctx is cancelled. The periodic tick backstops a missed LeaderCh
 // transition, refreshes node discovery, and recovers dead connections.
 // Retiring a connection also wakes the loop directly, so a node replaced by a
-// new pod (and so a new IP) is rediscovered without waiting out the tick. On cancellation,
-// a bounded leadership handoff runs first and the connections are torn down after it.
+// new pod (and so a new IP) is rediscovered without waiting out the tick.
+//
+// On cancellation the connections are retired first and the bounded leadership handoff runs after.
+// The order follows from what cometbft retries. Raft refuses reservations from the moment a
+// transfer starts, and a refusal that reaches the node is final: its retrying client returns a
+// remote signer error at once and the vote is lost. A connection that is reset is retried instead,
+// up to 50 attempts 100ms apart, each waiting for a signer to dial in. So the node must lose this
+// connection before the transfer can make this replica refuse, and its own retries then carry the
+// request to the next leader, which dials as soon as it is elected. If the transfer fails, the
+// node has no signer while this replica is still leader, for at most the transfer's bound; the
+// process is exiting either way, and the followers elect once it is gone.
 func (l *Lifecycle) Run(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -489,8 +522,8 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			l.transferLeadership()
 			l.stopAll()
+			l.transferLeadership()
 			l.stopping.Wait()
 			return ctx.Err()
 		case <-l.store.LeaderCh():

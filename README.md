@@ -435,15 +435,24 @@ Target-node discovery and the bind address do not determine the signer topology.
 
 ### Graceful shutdown
 
-On SIGINT or SIGTERM, a serving leader transfers Raft leadership to an up-to-date follower,
-waits until it observes the new leader, and only then drops its node connections and exits.
+On SIGINT or SIGTERM, a serving leader first resets its node connections, then transfers Raft
+leadership to an up-to-date follower, waits until it observes the new leader, and exits.
 `/readyz` (see [Health endpoints](#health-endpoints)) answers `503` once the signal arrives; it is
 cleared alongside the handoff, not strictly before it.
-Raft refuses new signing reservations on the old leader from the moment the transfer starts. The handoff
-is bounded at 5 seconds; on failure, shutdown continues and followers elect normally. Keep
-Kubernetes `terminationGracePeriodSeconds` at its default of 30 seconds, or at least well above
-10 seconds to allow handoff and teardown. A crash or node loss still waits for the election
-timeout. Single-node signers and `--initialize-only` processes do not hand off leadership.
+
+The order is chosen for how CometBFT treats each outcome. Raft refuses new signing reservations on
+the old leader from the moment the transfer starts, and CometBFT does not retry a request the signer
+refused, so that vote would be lost. A reset connection it does retry, up to 50 attempts 100 ms apart,
+each waiting for a signer to connect, and the new leader dials the node as soon as it is elected, so a request made during the handoff is
+answered by the new leader. The connections are reset rather than closed because CometBFT keeps a
+connection whose peer closed it and only notices at its next ping, about 3.3 seconds later.
+
+The handoff is bounded at 5 seconds. If it fails or times out, the node has no signer for up to
+that bound while this replica is still leader; shutdown then continues and the followers elect
+normally once the process is gone. Keep Kubernetes `terminationGracePeriodSeconds` at its default
+of 30 seconds, or at least well above 10 seconds to allow handoff and teardown. A crash or node
+loss still waits for the election timeout. Single-node signers and `--initialize-only` processes
+do not hand off leadership.
 
 At startup, the Raft log records the node ID, bind and advertise addresses,
 configured member list, single-node opt-in, bootstrap request, whether existing
