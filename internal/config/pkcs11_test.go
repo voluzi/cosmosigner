@@ -10,6 +10,7 @@ import (
 
 func TestPKCS11YAMLAndEnvironment(t *testing.T) {
 	t.Setenv("COSMOSIGNER_PKCS11_TOKEN_LABEL", "")
+	t.Setenv("COSMOSIGNER_PKCS11_SLOT", "")
 	file := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(`chain_id: test
 node_service: node:5555

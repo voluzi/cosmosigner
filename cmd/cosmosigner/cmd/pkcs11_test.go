@@ -36,3 +36,24 @@ func TestPKCS11ManagementUnsupported(t *testing.T) {
 		require.ErrorContains(t, cmd.Execute(), "not supported")
 	}
 }
+
+func TestPKCS11TokenSelectorFlagOverrides(t *testing.T) {
+	for _, selector := range []string{"--pkcs11-slot=0", "--pkcs11-token-label=flag-token"} {
+		t.Run(selector, func(t *testing.T) {
+			cmd := &cobra.Command{}
+			registerBackendFlags(cmd)
+			require.NoError(t, cmd.Flags().Parse([]string{selector}))
+			slot := uint(9)
+			cfg := backend.Config{PKCS11: backend.PKCS11Config{TokenLabel: "configured", Slot: &slot}}
+			overlayBackendFlags(cmd, &cfg)
+			if selector == "--pkcs11-slot=0" {
+				require.Empty(t, cfg.PKCS11.TokenLabel)
+				require.NotNil(t, cfg.PKCS11.Slot)
+				require.Zero(t, *cfg.PKCS11.Slot)
+			} else {
+				require.Nil(t, cfg.PKCS11.Slot)
+				require.Equal(t, "flag-token", cfg.PKCS11.TokenLabel)
+			}
+		})
+	}
+}
