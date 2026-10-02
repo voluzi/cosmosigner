@@ -13,7 +13,7 @@ import (
 func registerBackendFlags(cmd *cobra.Command) {
 	d := config.Defaults().Backend
 	f := cmd.Flags()
-	f.String("backend", string(d.Type), "key backend: software | vault | gcpkms")
+	f.String("backend", string(d.Type), "key backend: software | vault | gcpkms | awskms")
 	f.String("key-file", "", "software backend: priv_validator_key.json path")
 	f.String("binding-file", "", "software backend: cluster marker path (default: next to --key-file; set when the key is read-only)")
 	f.String("vault-addr", "", "vault address")
@@ -24,6 +24,8 @@ func registerBackendFlags(cmd *cobra.Command) {
 	f.Int("vault-key-version", 0, "vault transit key version (0 selects the latest once at startup)")
 	f.String("vault-namespace", "", "vault namespace")
 	f.String("vault-ca-cert", "", "vault CA cert path")
+	f.String("aws-key-id", "", "aws kms key ID, key ARN, alias or alias ARN (pinned to its key ARN at startup)")
+	f.String("aws-region", "", "aws region (else the standard AWS SDK region chain)")
 	f.String("gcp-key-version", "", "gcp kms cryptoKeyVersion resource name")
 	f.String("gcp-credentials-file", "", "gcp service account JSON path (else ADC)")
 }
@@ -49,6 +51,8 @@ func overlayBackendFlags(cmd *cobra.Command, c *backend.Config) {
 	}
 	s("vault-namespace", &c.Vault.Namespace)
 	s("vault-ca-cert", &c.Vault.TLSCACert)
+	s("aws-key-id", &c.AWSKMS.KeyID)
+	s("aws-region", &c.AWSKMS.Region)
 	s("gcp-key-version", &c.GCPKMS.KeyVersion)
 	s("gcp-credentials-file", &c.GCPKMS.CredentialsFile)
 }

@@ -367,6 +367,9 @@ func claimWithConfig(claimCfg backend.Config, be backend.KeyBackend, separate bo
 		if claimCfg.Type == backend.TypeGCPKMS {
 			logger.Info("Cloud KMS label updates have no atomic compare-and-set; one owner per key must be guaranteed externally")
 		}
+		if claimCfg.Type == backend.TypeAWSKMS {
+			logger.Info(awsClaimWarning)
+		}
 		if err := claimer.ClaimCluster(ctx, clusterID); err != nil {
 			return fmt.Errorf("claim %s for cluster %s: %w", backend.BindingResource(be), clusterID, err)
 		}

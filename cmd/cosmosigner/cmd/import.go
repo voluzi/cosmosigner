@@ -19,16 +19,19 @@ func NewImportCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "import",
-		Short: "Import an existing consensus key (BYOK) into vault or gcpkms",
+		Short: "Import an existing consensus key (BYOK) into vault, gcpkms or awskms",
 		Long: `Import an existing priv_validator_key.json into the selected backend,
 preserving the validator's on-chain identity.
 
   vault:  wrap with the Transit mount's RSA wrapping key (CKM_RSA_AES_KEY_WRAP)
   gcpkms: wrap with a Cloud KMS ImportJob key (RSA-OAEP-SHA256)
+  awskms: wrap PKCS#8 with an AWS KMS RSA_4096 key (RSA-OAEP-SHA256)
 
 The key is imported NON-EXPORTABLE. The source file existed outside the
-backend: securely destroy all copies of it once the validator is confirmed
-signing through cosmosigner.`,
+backend. For Vault and Google Cloud KMS, securely destroy file copies once
+the validator is confirmed signing through cosmosigner. For AWS KMS, retain
+a protected recovery backup outside AWS, preferably in an HSM; the customer
+is responsible for the durability of imported key material.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if from == "" {
 				return fmt.Errorf("--from is required (path to priv_validator_key.json)")
@@ -47,9 +50,8 @@ signing through cosmosigner.`,
 			// file, so a wrong-key import fails loudly instead of silently
 			// changing the validator identity.
 			verifyCfg := be
-			// deferVerify is set when the backend accepted the import but cannot
-			// yet serve the public key (KMS still finalizing the version); the
-			// automatic identity check is then deferred to a follow-up command.
+			// Accepted material may need a follow-up identity check when the
+			// public key is not readable with this identity or within the timeout.
 			deferVerify := false
 
 			switch be.Type {
@@ -60,7 +62,15 @@ signing through cosmosigner.`,
 				if err := backend.VaultImportKey(be.Vault, pkcs8); err != nil {
 					return err
 				}
-				fmt.Printf("imported key into transit mount %q as %q (non-exportable)\n", be.Vault.Mount, be.Vault.KeyName)
+				fmt.Fprintf(cmd.OutOrStdout(), "imported key into transit mount %q as %q (non-exportable)\n", be.Vault.Mount, be.Vault.KeyName)
+			case backend.TypeAWSKMS:
+				keyARN, ready, err := backend.AWSImportKey(cmd.Context(), be.AWSKMS, pkcs8)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "imported AWS key: %s\nrun cosmosigner with %s\n", keyARN, awsBackendArgs(keyARN, be.AWSKMS.Region))
+				verifyCfg.AWSKMS.KeyID = keyARN
+				deferVerify = !ready
 			case backend.TypeGCPKMS:
 				if err := gcp.validate(); err != nil {
 					return err
@@ -84,37 +94,53 @@ signing through cosmosigner.`,
 				if err != nil {
 					return err
 				}
-				fmt.Printf("imported key version: %s\n", version)
-				fmt.Printf("run cosmosigner with --backend gcpkms --gcp-key-version %s\n", version)
+				fmt.Fprintf(cmd.OutOrStdout(), "imported key version: %s\n", version)
+				fmt.Fprintf(cmd.OutOrStdout(), "run cosmosigner with --backend gcpkms --gcp-key-version %s\n", version)
 				verifyCfg.GCPKMS.KeyVersion = version
 				deferVerify = !ready
 			default:
-				return fmt.Errorf("import targets vault or gcpkms (the file already IS the software backend)")
+				return fmt.Errorf("import targets vault, gcpkms or awskms (the file already IS the software backend)")
 			}
 
-			// KMS accepted the import but has not finished enabling the version,
-			// so its public key isn't readable yet. Print the identity the backend
-			// MUST serve and the command to confirm it, and defer the destroy
-			// reminder until that check passes.
+			// A pending import cannot establish the on-chain identity until KMS exposes its public key.
 			if deferVerify {
-				fmt.Println("import accepted, but the key version is still finalizing in KMS — identity not verified yet.")
-				fmt.Println("the backend MUST end up serving this exact identity:")
-				printPubKey(pub.Address().String(), pub.Bytes())
+				if be.Type == backend.TypeAWSKMS {
+					fmt.Fprintln(cmd.OutOrStdout(), "import accepted, but KMS public key verification is pending — identity not verified yet.")
+				} else {
+					fmt.Fprintln(cmd.OutOrStdout(), "import accepted, but the key is still finalizing in KMS — identity not verified yet.")
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "the backend MUST end up serving this exact identity:")
+				printPubKeyTo(cmd.OutOrStdout(), pub.Address().String(), pub.Bytes())
 				verifyCmd := fmt.Sprintf("cosmosigner pubkey --backend gcpkms --gcp-key-version %s", verifyCfg.GCPKMS.KeyVersion)
 				if verifyCfg.GCPKMS.CredentialsFile != "" {
 					verifyCmd += " --gcp-credentials-file " + verifyCfg.GCPKMS.CredentialsFile
 				}
-				fmt.Printf("once the version is ENABLED, verify it with:\n  %s\n", verifyCmd)
-				fmt.Println("destroy the source key file only AFTER that command prints the identity above")
+
+				if be.Type == backend.TypeAWSKMS {
+					verifyCmd = "cosmosigner pubkey " + awsBackendArgs(verifyCfg.AWSKMS.KeyID, verifyCfg.AWSKMS.Region)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "once the key is enabled, verify it with:\n  %s\n", verifyCmd)
+				if be.Type == backend.TypeAWSKMS {
+					fmt.Fprintln(cmd.OutOrStdout(), awsImportRecoveryReminder)
+				} else {
+					fmt.Fprintln(cmd.OutOrStdout(), "destroy the source key file only AFTER that command prints the identity above")
+				}
 				return nil
 			}
 
-			if err := verifyImportedKey(verifyCfg, pub.Bytes()); err != nil {
+			if be.Type == backend.TypeAWSKMS {
+				// AWSImportKey verifies the pinned identity before returning ready.
+				fmt.Fprintln(cmd.OutOrStdout(), "verified: backend public key matches the source file")
+			} else if err := verifyImportedKey(verifyCfg, pub.Bytes()); err != nil {
 				return err
 			}
 
-			printPubKey(pub.Address().String(), pub.Bytes())
-			fmt.Println("reminder: securely destroy all copies of the source key file")
+			printPubKeyTo(cmd.OutOrStdout(), pub.Address().String(), pub.Bytes())
+			if be.Type == backend.TypeAWSKMS {
+				fmt.Fprintln(cmd.OutOrStdout(), awsImportRecoveryReminder)
+			} else {
+				fmt.Fprintln(cmd.OutOrStdout(), "reminder: securely destroy all copies of the source key file")
+			}
 			return nil
 		},
 	}
@@ -143,3 +169,5 @@ func verifyImportedKey(cfg backend.Config, wantPub []byte) error {
 	fmt.Println("verified: backend public key matches the source file")
 	return nil
 }
+
+const awsImportRecoveryReminder = "reminder: retain a protected recovery backup of the original imported material outside AWS, preferably in an HSM; AWS customers are responsible for its durability"

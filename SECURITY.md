@@ -18,7 +18,7 @@ Report vulnerabilities through one of these channels:
 Helpful report details:
 
 - Affected version or commit.
-- Deployment mode and backend (`software`, `vault`, or `gcpkms`).
+- Deployment mode and backend (`software`, `vault`, `gcpkms`, or `awskms`).
 - Impact, especially whether the issue can cause key exposure, double-signing, unauthorized signing, denial of signing, or cluster takeover.
 - Reproduction steps, proof of concept, logs, and relevant configuration with secrets redacted.
 
