@@ -437,8 +437,8 @@ Target-node discovery and the bind address do not determine the signer topology.
 
 On SIGINT or SIGTERM, a serving leader transfers Raft leadership to an up-to-date follower,
 waits until it observes the new leader, and only then drops its node connections and exits.
-`/readyz` (see [Health endpoints](#health-endpoints)) answers `503` from the moment the signal
-arrives, before the handoff starts.
+`/readyz` (see [Health endpoints](#health-endpoints)) answers `503` once the signal arrives; it is
+cleared alongside the handoff, not strictly before it.
 Raft refuses new signing reservations on the old leader from the moment the transfer starts. The handoff
 is bounded at 5 seconds; on failure, shutdown continues and followers elect normally. Keep
 Kubernetes `terminationGracePeriodSeconds` at its default of 30 seconds, or at least well above

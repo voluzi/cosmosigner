@@ -333,7 +333,8 @@ func runStartWithContext(
 
 	// Ready from here on, on followers too: the raft store is open and the binding and backend
 	// preflight passed. Readiness ends when shutdown begins, not when the handoff completes, so
-	// the replica is reported as going away while it still hands off.
+	// the replica is reported as going away while it still hands off. The two are not ordered:
+	// a probe polls far slower than the instant between them.
 	hs.SetReady(true)
 	defer hs.SetReady(false)
 	defer context.AfterFunc(ctx, func() { hs.SetReady(false) })()
