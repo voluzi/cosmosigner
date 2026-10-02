@@ -32,7 +32,7 @@ type fakePKCS11 struct {
 func newFakePKCS11() *fakePKCS11 {
 	priv := ed25519.GenPrivKey()
 	return &fakePKCS11{priv: priv, tokens: []pkcs11Token{{slot: 0, label: "test"}}, mechanisms: []uint{pkcs11EdDSA},
-		private: pkcs11Key{class: 3, keyType: 0x40, sign: true, params: []byte{6, 3, 43, 101, 112}},
+		private: pkcs11Key{class: 3, keyType: 0x40, sign: true, sensitive: true, nonExtractable: true, params: []byte{6, 3, 43, 101, 112}},
 		public:  pkcs11Key{class: 2, keyType: 0x40, params: []byte{6, 3, 43, 101, 112}, point: priv.PubKey().Bytes()}, privateCount: 1, publicCount: 1}
 }
 func (f *fakePKCS11) Tokens() ([]pkcs11Token, error)  { return f.tokens, nil }
@@ -227,6 +227,24 @@ func TestPKCS11SignRejectsInvalidSignatures(t *testing.T) {
 		})
 	}
 }
+func TestPKCS11RejectsExportableKeys(t *testing.T) {
+	for _, attribute := range []string{"sensitive", "non-extractable"} {
+		t.Run(attribute, func(t *testing.T) {
+			cfg, f := pkcs11Fixture(t)
+			if attribute == "sensitive" {
+				f.private.sensitive = false
+			} else {
+				f.private.nonExtractable = false
+			}
+			be, err := newPKCS11(cfg, f, func() error { return nil })
+			if be != nil {
+				require.NoError(t, be.Close())
+			}
+			require.ErrorContains(t, err, "sensitive and non-extractable")
+		})
+	}
+}
+
 func TestPKCS11PreflightRejectsHedgedSignatures(t *testing.T) {
 	cfg, f := pkcs11Fixture(t)
 	b := openFakePKCS11(t, cfg, f)
