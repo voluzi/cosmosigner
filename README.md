@@ -376,9 +376,10 @@ pod goes away — tying recovery to the tick makes an ordinary node restart look
 like a multi-minute outage.
 
 Each target address has one connector, and it dials until the address leaves the
-target set: every 100ms (`COSMOSIGNER_CONN_RETRY_WAIT`) while the port refuses
-connections, with each connect attempt capped at 1s so an address whose packets
-are still being dropped is retried on the same schedule. A node therefore finds
+target set, waiting 100ms (`COSMOSIGNER_CONN_RETRY_WAIT`) after each failed
+attempt. A port that refuses connections fails at once, so it is retried about
+every 100ms; an address whose packets are still being dropped takes the full 1s
+connect timeout per attempt, so it is retried about every 1.1s. A node therefore finds
 a signer dialing however long it takes to start listening, and a signer that has
 dropped an address stops dialing it at once instead of competing for the node's
 single signer connection. `COSMOSIGNER_CONN_MAX_RETRIES`, which used to cap the
