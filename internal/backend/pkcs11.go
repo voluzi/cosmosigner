@@ -65,9 +65,10 @@ type pkcs11Token struct {
 	label string
 }
 type pkcs11Key struct {
-	class, keyType uint
-	sign           bool
-	params, point  []byte
+	class, keyType            uint
+	sign                      bool
+	sensitive, nonExtractable bool
+	params, point             []byte
 }
 type pkcs11Module interface {
 	Tokens() ([]pkcs11Token, error)
@@ -217,6 +218,9 @@ func (b *PKCS11) keys() (uint, ed25519.PubKey, error) {
 			return 0, nil, fmt.Errorf("pkcs11 %s key parameters are not Ed25519", kind)
 		}
 		if isPrivate {
+			if !key.sensitive || !key.nonExtractable {
+				return 0, nil, errors.New("pkcs11 private key must be sensitive and non-extractable")
+			}
 			private = objects[0]
 			continue
 		}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	p11 "github.com/miekg/pkcs11"
@@ -21,8 +22,7 @@ type nativePKCS11 struct {
 	path string
 }
 type pkcs11PINResource struct {
-	module string
-	slot   uint
+	manufacturer, model, serial string
 }
 
 var pkcs11PINFailures = struct {
@@ -68,9 +68,20 @@ func acquirePKCS11Module(path string) (*nativePKCS11, func() error, error) {
 	loadPath := path
 	pkcs11Modules.Lock()
 	defer pkcs11Modules.Unlock()
-	// dlopen coalesces hard links too. Retain identity across last-close for the PIN latch.
+	// dlopen coalesces hard links too; retained identities must still name the same file.
 	for knownPath, knownInfo := range pkcs11Modules.files {
 		if os.SameFile(info, knownInfo) {
+			// Unloaded files can disappear and their inodes can be reused by other modules.
+			if pkcs11Modules.entries[knownPath] == nil {
+				currentInfo, statErr := os.Stat(knownPath)
+				if errors.Is(statErr, os.ErrNotExist) || (statErr == nil && !os.SameFile(currentInfo, knownInfo)) {
+					delete(pkcs11Modules.files, knownPath)
+					continue
+				}
+				if statErr != nil {
+					return nil, nil, fmt.Errorf("inspect cached pkcs11 module %q: %w", knownPath, statErr)
+				}
+			}
 			path = knownPath
 			break
 		}
@@ -166,7 +177,14 @@ func (n *nativePKCS11) Login(sh uint, pin string) error {
 	if err != nil {
 		return nativePKCS11Error(err)
 	}
-	resource := pkcs11PINResource{module: n.path, slot: info.SlotID}
+	token, err := n.ctx.GetTokenInfo(info.SlotID)
+	if err != nil {
+		return nativePKCS11Error(err)
+	}
+	if strings.TrimSpace(token.SerialNumber) == "" {
+		return errors.New("pkcs11 token must report a serial number for PIN retry protection")
+	}
+	resource := pkcs11PINResource{manufacturer: token.ManufacturerID, model: token.Model, serial: token.SerialNumber}
 	// Retain failures across backend close/reopen, and serialize concurrent login attempts.
 	pkcs11PINFailures.Lock()
 	defer pkcs11PINFailures.Unlock()
@@ -222,7 +240,7 @@ func (n *nativePKCS11) Find(sh uint, private bool, cfg PKCS11Config) (objects []
 func (n *nativePKCS11) Key(sh, obj uint, private bool) (pkcs11Key, error) {
 	types := []uint{p11.CKA_CLASS, p11.CKA_KEY_TYPE, p11.CKA_EC_PARAMS}
 	if private {
-		types = append(types, p11.CKA_SIGN)
+		types = append(types, p11.CKA_SIGN, p11.CKA_SENSITIVE, p11.CKA_EXTRACTABLE)
 	} else {
 		types = append(types, p11.CKA_EC_POINT)
 	}
@@ -251,6 +269,10 @@ func (n *nativePKCS11) Key(sh, obj uint, private bool) (pkcs11Key, error) {
 			}
 		case p11.CKA_SIGN:
 			key.sign = bytes.Equal(a.Value, p11.NewAttribute(a.Type, true).Value)
+		case p11.CKA_SENSITIVE:
+			key.sensitive = bytes.Equal(a.Value, p11.NewAttribute(a.Type, true).Value)
+		case p11.CKA_EXTRACTABLE:
+			key.nonExtractable = bytes.Equal(a.Value, p11.NewAttribute(a.Type, false).Value)
 		case p11.CKA_EC_PARAMS:
 			key.params = a.Value
 		case p11.CKA_EC_POINT:

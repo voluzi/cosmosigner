@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -189,14 +190,34 @@ func TestPKCS11IntegrationPINFailureSurvivesNewBackend(t *testing.T) {
 	require.NoError(t, err)
 	moduleCopy := filepath.Join(dir, "softhsm.so")
 	require.NoError(t, os.WriteFile(moduleCopy, data, 0600))
-	originalPIN, err := os.ReadFile(os.Getenv("COSMOSIGNER_PKCS11_PIN_FILE"))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "tokens"), 0700))
+	conf := filepath.Join(dir, "softhsm2.conf")
+	require.NoError(t, os.WriteFile(conf, []byte("directories.tokendir = "+filepath.Join(dir, "tokens")+"\nobjectstore.backend = file\nlog.level = ERROR\n"), 0600))
+	t.Setenv("SOFTHSM2_CONF", conf)
+	output, err := exec.Command("softhsm2-util", "--init-token", "--free", "--label", "pin-latch-test", "--so-pin", "12345678", "--pin", "123456").CombinedOutput()
+	require.NoError(t, err, string(output))
+	output, err = exec.Command("pkcs11-tool", "--module", moduleCopy, "--token-label", "pin-latch-test", "--login", "--pin", "123456", "--keypairgen", "--key-type", "EC:edwards25519", "--label", "validator", "--id", "01").CombinedOutput()
+	require.NoError(t, err, string(output))
+	info, err := os.Stat(moduleCopy)
 	require.NoError(t, err)
+	retiredPath := filepath.Join(dir, "removed-module.so")
+	// Model an inode recycled after a previous module was unloaded and removed.
+	pkcs11Modules.Lock()
+	pkcs11Modules.files[retiredPath] = info
+	pkcs11Modules.Unlock()
+	t.Cleanup(func() {
+		pkcs11Modules.Lock()
+		delete(pkcs11Modules.files, retiredPath)
+		pkcs11Modules.Unlock()
+	})
+	originalPIN := []byte("123456\n")
 	pinFile := filepath.Join(dir, "pin")
 	require.NoError(t, os.WriteFile(pinFile, originalPIN, 0600))
-	cfg := PKCS11Config{Module: moduleCopy, TokenLabel: os.Getenv("COSMOSIGNER_PKCS11_TOKEN_LABEL"), KeyLabel: os.Getenv("COSMOSIGNER_PKCS11_KEY_LABEL"), PINFile: pinFile, BindingFile: filepath.Join(dir, "binding")}
+	cfg := PKCS11Config{Module: moduleCopy, TokenLabel: "pin-latch-test", KeyLabel: "validator", PINFile: pinFile, BindingFile: filepath.Join(dir, "binding")}
 	a, err := NewPKCS11(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	require.Equal(t, moduleCopy, a.module.(*nativePKCS11).path)
 	alias := filepath.Join(dir, "softhsm-alias.so")
 	require.NoError(t, os.Link(moduleCopy, alias))
 	aliasCfg := cfg
@@ -225,6 +246,13 @@ func TestPKCS11IntegrationPINFailureSurvivesNewBackend(t *testing.T) {
 		require.NoError(t, reopened.Close())
 	}
 	require.ErrorContains(t, err, "latched", "correcting the PIN must not bypass the process latch")
+	cfg.Module = filepath.Join(dir, "another-module-copy.so")
+	require.NoError(t, os.WriteFile(cfg.Module, data, 0600))
+	reopened, err = NewPKCS11(cfg)
+	if reopened != nil {
+		require.NoError(t, reopened.Close())
+	}
+	require.ErrorContains(t, err, "latched", "a copied module must not bypass the token's process latch")
 }
 
 func cleanupIntegrationKeys(t *testing.T, p *p11.Ctx, slot uint, cfg PKCS11Config) {
