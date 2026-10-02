@@ -31,6 +31,9 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        variant:
+          - {target: default, suffix: ""}
+          - {target: pkcs11, suffix: "-pkcs11"}
         build:
           - platform: linux/amd64
             runner: ubuntu-24.04
@@ -68,7 +71,7 @@ jobs:
           path: |
             go-build
             go-pkg-mod
-          key: ${{ runner.os }}-${{ runner.arch }}-cosmosigner-docker-${{ hashFiles('go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cosmosigner-docker-${{ matrix.variant.target }}-${{ hashFiles('go.sum') }}
 
       - name: Inject cache
         uses: reproducible-containers/buildkit-cache-dance@v3.4.0
@@ -85,13 +88,15 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          tags: ${{ needs.version.outputs.version }}-${{ env.ARCH }}
+          flavor: latest=false
+          tags: ${{ needs.version.outputs.version }}${{ matrix.variant.suffix }}-${{ env.ARCH }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           push: true
+          target: ${{ matrix.variant.target }}
           platforms: ${{ matrix.build.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -104,6 +109,11 @@ jobs:
     needs:
       - version
       - build
+    strategy:
+      matrix:
+        variant:
+          - {suffix: ""}
+          - {suffix: "-pkcs11"}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -122,9 +132,10 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
-            type=raw,value=${{ needs.version.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(needs.version.outputs.version, '-') }}
+            type=raw,value=${{ needs.version.outputs.version }}${{ matrix.variant.suffix }}
+            type=raw,value=latest${{ matrix.variant.suffix }},enable=${{ !contains(needs.version.outputs.version, '-') }}
 
       - name: Create manifest list and push
         run: |
@@ -132,5 +143,5 @@ jobs:
           TAGS=$(jq -r '.tags[] | "--tag " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
           docker buildx imagetools create \
             $TAGS \
-            "${image}:${{ needs.version.outputs.version }}-amd64" \
-            "${image}:${{ needs.version.outputs.version }}-arm64"
+            "${image}:${{ needs.version.outputs.version }}${{ matrix.variant.suffix }}-amd64" \
+            "${image}:${{ needs.version.outputs.version }}${{ matrix.variant.suffix }}-arm64"

@@ -10,3 +10,5 @@ coverage.out
 vault-token
 .DS_Store
 .idea
+
+dist

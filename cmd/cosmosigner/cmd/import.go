@@ -30,12 +30,15 @@ The key is imported NON-EXPORTABLE. The source file existed outside the
 backend: securely destroy all copies of it once the validator is confirmed
 signing through cosmosigner.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if from == "" {
-				return fmt.Errorf("--from is required (path to priv_validator_key.json)")
-			}
 			be, err := config.LoadBackend(func(c *backend.Config) { overlayBackendFlags(cmd, c) })
 			if err != nil {
 				return err
+			}
+			if be.Type == backend.TypePKCS11 {
+				return fmt.Errorf("pkcs11 import is not supported; generate the key with the vendor tool")
+			}
+			if from == "" {
+				return fmt.Errorf("--from is required (path to priv_validator_key.json)")
 			}
 			pkcs8, pub, err := backend.LoadKeyFilePKCS8(from)
 			if err != nil {

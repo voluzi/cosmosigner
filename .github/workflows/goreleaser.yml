@@ -13,7 +13,8 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    container: golang:1.27.1-bookworm
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -25,6 +26,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Install Debian 12 native and cross compilers
+        run: apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@v7

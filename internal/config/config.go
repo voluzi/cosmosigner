@@ -154,6 +154,10 @@ func (c *Config) Validate() error {
 		if err := backend.ValidateVaultAddressing(c.Backend.Vault.Mount, c.Backend.Vault.BindingMount, c.Backend.Vault.KeyName); err != nil {
 			return err
 		}
+	case backend.TypePKCS11:
+		if err := backend.ValidatePKCS11Config(c.Backend.PKCS11); err != nil {
+			return err
+		}
 	case backend.TypeGCPKMS:
 		if c.Backend.GCPKMS.KeyVersion == "" {
 			return fmt.Errorf("gcpkms backend requires backend.gcp.key_version")
