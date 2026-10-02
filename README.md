@@ -511,8 +511,9 @@ not live fencing against another running signer.
 One session is serialized for all signing, recovery and preflight calls. On a closed/invalid
 session, removed device, absent token or lost login, Cosmosigner refreshes slots, reopens and logs
 in, reacquires handles, validates the objects and compares their public key to the original key
-before retrying the exact message once. Other signing errors close the session without an immediate
-retry; the next call reopens it. Any failure returns no signature; the Raft reservation
+before retrying the exact message once. Other errors returned by the PKCS#11 signing call close the
+session without an immediate retry; the next call reopens it. Signature validation failures return
+an error and keep the session open. Any failure returns no signature; the Raft reservation
 stays in flight. A later call may recover when the token returns. Incorrect or locked PIN errors
 latch token access for the process by manufacturer, model and token serial number, including across
 module copies and slot changes. A token must report a non-empty serial number. Automatic restarts reset that latch and
