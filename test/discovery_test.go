@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"sync"
@@ -10,7 +11,10 @@ import (
 
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/protoio"
+	p2pconn "github.com/cometbft/cometbft/p2p/conn"
 	"github.com/cometbft/cometbft/privval"
+	privvalproto "github.com/cometbft/cometbft/proto/tendermint/privval"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 
@@ -235,7 +239,7 @@ func TestDiscovery_NodeReplacedAtNewAddress(t *testing.T) {
 // replacement record shows up shortly after.
 //
 // A one-shot wake is not enough here — reconcile recreates a connector for the stale address, which
-// is not "exhausted" for MaxRetries×RetryWait (~10min), so discovery would go quiet and leave the
+// keeps dialing it and is never retired on its own, so discovery would go quiet and leave the
 // periodic tick to find the replacement. ReconcileInterval is set to 30s, far beyond the assertion
 // window, so this passes only if discovery keeps re-resolving while a connector is unconnected.
 func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
@@ -290,4 +294,227 @@ func TestDiscovery_ReplacementAddressAppearsAfterWake(t *testing.T) {
 		return clientNew.SignVote(itestChain, makeVote(11, 0, time.Now().UTC(), "A")) == nil
 	}, 15*time.Second, 200*time.Millisecond,
 		"discovery must keep re-resolving until the replacement address is served")
+}
+
+// TestDiscovery_NodeListensLongAfterDialStart proves a connector never gives up: a node that starts
+// listening long after dialing began is served by the connector that was created for it.
+//
+// ReconcileInterval and StaleConnTimeout are far beyond the test, so nothing recreates the
+// connector. If its dial loop had ended, the address would stay unserved.
+func TestDiscovery_NodeListensLongAfterDialStart(t *testing.T) {
+	dir := t.TempDir()
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	store, err := state.NewRaftStore(state.RaftConfig{
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(dir, "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	defer store.Close()
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	pv, err := signer.New(be, store)
+	require.NoError(t, err)
+	pub, err := be.PubKey()
+	require.NoError(t, err)
+
+	addr := freeAddr(t)
+	lc := server.New(server.Config{
+		ChainID:           itestChain,
+		ReconcileInterval: time.Minute,
+		StaleConnTimeout:  time.Minute,
+		RetryWait:         10 * time.Millisecond,
+	}, server.StaticNodes{addr}, pv, ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lc.Run(ctx) }()
+
+	// Hundreds of refused dials: far more than any fixed retry count the endpoint would allow.
+	time.Sleep(3 * time.Second)
+
+	ln, err := net.Listen("tcp", addr)
+	require.NoError(t, err)
+	sl := privval.NewSignerListenerEndpoint(cmtlog.NewNopLogger(),
+		privval.NewTCPListener(ln, ed25519.GenPrivKey()),
+		privval.SignerListenerEndpointTimeoutReadWrite(2*time.Second))
+	require.NoError(t, sl.Start())
+	defer func() { _ = sl.Stop() }()
+
+	// No retry here on purpose. A starting node asks for the public key once, waits 3s for a signer
+	// to connect (cometbft's accept timeout, which this listener shares) and exits if none does.
+	client, err := privval.NewSignerClient(sl, itestChain)
+	require.NoError(t, err)
+	got, err := client.GetPubKey()
+	require.NoError(t, err, "the connector must still be dialing when the node starts listening")
+	require.Equal(t, pub.Bytes(), got.Bytes())
+}
+
+// startRetirementTest runs a lifecycle against one address that the returned source can drop.
+func startRetirementTest(t *testing.T, addr string, timeoutReadWrite time.Duration) (*mutableNodes, *server.Lifecycle) {
+	t.Helper()
+	be := backend.NewSoftwareFromPriv(ed25519.GenPrivKey())
+	store, err := state.NewRaftStore(state.RaftConfig{
+		NodeID:     "n1",
+		BindAddr:   freeAddr(t),
+		DataDir:    filepath.Join(t.TempDir(), "raft"),
+		Bootstrap:  true,
+		SingleNode: true,
+		Insecure:   true,
+	}, hclog.NewNullLogger())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	require.Eventually(t, store.IsLeader, 10*time.Second, 50*time.Millisecond)
+
+	pv, err := signer.New(be, store)
+	require.NoError(t, err)
+
+	src := &mutableNodes{}
+	src.set(addr)
+	lc := server.New(server.Config{
+		ChainID:           itestChain,
+		ReconcileInterval: 100 * time.Millisecond,
+		TimeoutReadWrite:  timeoutReadWrite,
+		RetryWait:         10 * time.Millisecond,
+	}, src, pv, ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = lc.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return src, lc
+}
+
+// TestDiscovery_RetiredConnectorStopsDialing proves a connector dropped from the target set stops
+// dialing. A node accepts one signer at a time, so a retired connector that kept dialing could take
+// that slot and refuse every request on it.
+func TestDiscovery_RetiredConnectorStopsDialing(t *testing.T) {
+	// A plain TCP listener stands in for the node: it never completes the handshake, so the
+	// connector is permanently mid-dial, the state cometbft's Stop() does not interrupt.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	tcpLn := ln.(*net.TCPListener)
+	accept := func(wait time.Duration) bool {
+		require.NoError(t, tcpLn.SetDeadline(time.Now().Add(wait)))
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+
+	src, _ := startRetirementTest(t, ln.Addr().String(), time.Second)
+	for range 3 {
+		require.True(t, accept(10*time.Second), "the connector must redial while the node is in the target set")
+	}
+
+	src.set()
+
+	// Dials already in flight may still land; after that the listener must stay quiet. The quiet
+	// window is 100 times the 10ms retry wait, so a connector that is still dialing cannot fit a
+	// silence that long, while a slow machine only makes the silence easier to observe.
+	require.Eventually(t, func() bool { return !accept(time.Second) }, 20*time.Second, time.Millisecond,
+		"a retired connector must stop dialing")
+}
+
+// TestDiscovery_RetiredConnectorNeverAnswers proves the node gets no response from a connector
+// once it is retired, whatever stage its connection had reached. The node holds one signer
+// connection and takes a refusal as that signer's answer, so the connection must be closed instead:
+// a node that has just started listening exits on a refused public-key request.
+func TestDiscovery_RetiredConnectorNeverAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// established completes the handshake before retirement, so the connector is retired while
+		// reading from a live connection. Otherwise the node holds the handshake until after.
+		established bool
+	}{
+		{name: "handshake pending at retirement"},
+		{name: "connection established before retirement", established: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			addr := ln.Addr().String()
+
+			// The read/write timeout is far beyond the test, so only retirement can close the socket.
+			src, lc := startRetirementTest(t, addr, time.Minute)
+
+			// Whether a connector that outlives its retirement gets to answer depends on scheduling, so
+			// the node is dropped and added back several times: each round retires a fresh connector.
+			for range 8 {
+				requireNoAnswerAfterRetirement(t, ln, src, lc, tc.established)
+				src.set(addr)
+			}
+		})
+	}
+}
+
+// requireNoAnswerAfterRetirement accepts the connector's dial as the node, drops the node from the
+// target set and requires that a public-key request sent afterwards is not answered.
+func requireNoAnswerAfterRetirement(t *testing.T, ln net.Listener, src *mutableNodes, lc *server.Lifecycle, established bool) {
+	t.Helper()
+	// Accept and stay silent: the connector blocks waiting for the node's half of the handshake.
+	conn, err := ln.Accept()
+	require.NoError(t, err)
+	defer conn.Close()
+	// The deadline only bounds a failing run; a passing one returns as soon as the peer closes.
+	require.NoError(t, conn.SetDeadline(time.Now().Add(20*time.Second)))
+	nodeKey := ed25519.GenPrivKey()
+
+	var secret net.Conn
+	roundTrip := func(req privvalproto.Message) (privvalproto.Message, error) {
+		var res privvalproto.Message
+		if _, err := protoio.NewDelimitedWriter(secret).WriteMsg(&req); err != nil {
+			return res, err
+		}
+		_, err := protoio.NewDelimitedReader(secret, 10*1024).ReadMsg(&res)
+		return res, err
+	}
+	ping := privvalproto.Message{Sum: &privvalproto.Message_PingRequest{PingRequest: &privvalproto.PingRequest{}}}
+
+	if established {
+		secret, err = p2pconn.MakeSecretConnection(conn, nodeKey)
+		require.NoError(t, err)
+		_, err = roundTrip(ping)
+		require.NoError(t, err, "the connector must serve before it is retired")
+	}
+	require.Eventually(t, func() bool { return len(lc.Status()) == 1 }, 10*time.Second, 10*time.Millisecond)
+
+	src.set()
+	retired := func() bool { return len(lc.Status()) == 0 }
+	if established {
+		// Keep pinging as a node does: the connector's read holds the endpoint lock that a reconcile
+		// waits behind, so a silent connection would stall the retirement itself.
+		for err == nil && !retired() {
+			_, err = roundTrip(ping)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	require.Eventually(t, retired, 10*time.Second, 10*time.Millisecond)
+
+	if !established {
+		secret, err = p2pconn.MakeSecretConnection(conn, nodeKey)
+	}
+	var res privvalproto.Message
+	if err == nil {
+		res, err = roundTrip(privvalproto.Message{Sum: &privvalproto.Message_PubKeyRequest{
+			PubKeyRequest: &privvalproto.PubKeyRequest{ChainId: itestChain},
+		}})
+	}
+
+	require.Error(t, err, "a retired connector must not answer, got %v", &res)
+	// A timeout means the connector still holds the socket.
+	var netErr net.Error
+	require.False(t, errors.As(err, &netErr) && netErr.Timeout(),
+		"retirement must close the connection: %v", err)
 }

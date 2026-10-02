@@ -375,6 +375,17 @@ usually replaced at a **new IP**, so the resolved address is stale the moment th
 pod goes away — tying recovery to the tick makes an ordinary node restart look
 like a multi-minute outage.
 
+Each target address has one connector, and it dials until the address leaves the
+target set, waiting 100ms (`COSMOSIGNER_CONN_RETRY_WAIT`) after each failed
+attempt. A port that refuses connections fails at once, so it is retried about
+every 100ms; an address whose packets are still being dropped takes the full 1s
+connect timeout per attempt, so it is retried about every 1.1s. A node therefore finds
+a signer dialing however long it takes to start listening, and a signer that has
+dropped an address stops dialing it at once instead of competing for the node's
+single signer connection. `COSMOSIGNER_CONN_MAX_RETRIES`, which used to cap the
+number of attempts, is still accepted but ignored; `start` prints a deprecation
+warning when it is set.
+
 Cosmosigner also waits for its own `--raft-advertise` address to become
 resolvable at startup (up to 90s) instead of exiting immediately. Under a
 StatefulSet the per-pod DNS record is published moments after the pod starts, so
@@ -426,6 +437,8 @@ Target-node discovery and the bind address do not determine the signer topology.
 
 On SIGINT or SIGTERM, a serving leader transfers Raft leadership to an up-to-date follower,
 waits until it observes the new leader, and only then drops its node connections and exits.
+`/readyz` (see [Health endpoints](#health-endpoints)) answers `503` once the signal arrives; it is
+cleared alongside the handoff, not strictly before it.
 Raft refuses new signing reservations on the old leader from the moment the transfer starts. The handoff
 is bounded at 5 seconds; on failure, shutdown continues and followers elect normally. Keep
 Kubernetes `terminationGracePeriodSeconds` at its default of 30 seconds, or at least well above
@@ -559,6 +572,46 @@ rejection of an untrusted peer.)
 > allow-list. Protect that link with network topology (co-location, a private
 > mesh) instead.
 
+## Health endpoints
+
+Set `--http-addr` (YAML `http_addr`, env `COSMOSIGNER_HTTP_ADDR`) to a `host:port` to serve three
+HTTP endpoints. The listener is disabled by default; a port that cannot be bound fails startup.
+
+| Endpoint | Answers | Use |
+|---|---|---|
+| `GET /livez` | `200` whenever the process serves HTTP. | Liveness probe |
+| `GET /readyz` | `200` once the Raft store is open, the key's cluster claim matches and the backend preflight has passed; `503` before that and from the start of shutdown. | Readiness probe |
+| `GET /status` | `200` with a JSON description of this replica. | Diagnostics |
+
+`/livez` is local on purpose: it does not look at the key backend or at Raft quorum, so a backend
+outage or a lost quorum never makes Kubernetes restart every replica at once. The listener starts
+before the backend is opened, so it also answers during a slow startup. `/readyz` is true on
+followers as well as on the leader; it reports that the replica has joined and may take over, not
+that it is signing. `start --initialize-only` never becomes ready.
+
+```json
+{
+  "version": "3.1.0",
+  "chain_id": "my-chain",
+  "raft": { "node_id": "node-1", "state": "leader", "leader": true },
+  "ready": true,
+  "nodes": [
+    { "address": "10.0.0.5:5555", "connected": true, "last_activity": "2026-10-02T10:00:00Z" }
+  ]
+}
+```
+
+`raft.state` is this replica's local view (`leader`, `follower`, `candidate`, `shutdown`, or
+`unknown` until the Raft store is open). `nodes` lists the target addresses this replica is dialing
+and is empty on a non-leader. `connected` is sampled, so it can trail the connection by a few
+seconds, and `last_activity` (the last request or ping handled on that connection) is present only
+while connected.
+
+The endpoints have no authentication or TLS, so restrict the port with network policy. `/status`
+is limited to what the logs already print: it never includes key material, the consensus public
+key, the backend type or its coordinates, credential paths, Raft peer addresses, the cluster ID or
+the signing state. There are no Prometheus metrics.
+
 ## Environment variables
 
 Every config field declares its `COSMOSIGNER_*` env var (and YAML key and
@@ -576,6 +629,8 @@ export COSMOSIGNER_GCP_KEY_VERSION=projects/.../cryptoKeyVersions/1
 # export COSMOSIGNER_VAULT_BINDING_MOUNT=cosmosigner
 # Orchestrated deployments can claim an unclaimed key at startup (see "Claiming at startup"):
 # export COSMOSIGNER_CLAIM_IF_UNCLAIMED=true
+# Health endpoints are off unless an address is set (see "Health endpoints"):
+# export COSMOSIGNER_HTTP_ADDR=0.0.0.0:8080
 export COSMOSIGNER_RAFT_NODE_ID=node-1
 export COSMOSIGNER_RAFT_BIND=0.0.0.0:7070
 export COSMOSIGNER_RAFT_BOOTSTRAP=true
@@ -600,6 +655,7 @@ nodes:                       # static list, OR use node_service (mutually exclus
 # node_service: sentries.my-ns.svc.cluster.local:5555
 conn_key: /data/conn_key.json
 claim_if_unclaimed: false    # true lets start claim an unclaimed key (orchestrated deployments)
+# http_addr: 0.0.0.0:8080    # serve /livez, /readyz and /status; disabled when unset
 backend:
   type: vault
   vault:

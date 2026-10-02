@@ -7,7 +7,6 @@ import (
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
-	"github.com/cometbft/cometbft/privval"
 	privvalproto "github.com/cometbft/cometbft/proto/tendermint/privval"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/types"
@@ -69,7 +68,7 @@ func voteRequest() privvalproto.Message {
 // height/round/step reservation.
 func TestNodeServerHandleRequestRefusesWhenRetired(t *testing.T) {
 	pv := newFakePV()
-	ns := &nodeServer{createdAt: time.Now()}
+	ns := &nodeServer{}
 	ns.touch()
 
 	// Before retirement: served normally.
@@ -99,7 +98,7 @@ func TestNodeServerHandleRequestRefusesWhenRetired(t *testing.T) {
 // empty response message, which the node cannot interpret.
 func TestNodeServerHandleRequestRefusesPubKeyWhenRetired(t *testing.T) {
 	pv := newFakePV()
-	ns := &nodeServer{createdAt: time.Now()}
+	ns := &nodeServer{}
 	ns.touch()
 	ns.retired.Store(true)
 
@@ -117,7 +116,7 @@ func TestNodeServerHandleRequestRefusesPubKeyWhenRetired(t *testing.T) {
 // like liveness, so it cannot mask itself as healthy while awaiting teardown.
 func TestNodeServerRetiredDoesNotTouchActivity(t *testing.T) {
 	pv := newFakePV()
-	ns := &nodeServer{createdAt: time.Now()}
+	ns := &nodeServer{}
 	ns.lastActivity.Store(time.Now().Add(-time.Hour).UnixNano())
 	ns.retired.Store(true)
 
@@ -150,14 +149,7 @@ func TestNeedsFastDiscoveryAfterRetirement(t *testing.T) {
 		l := newLifecycle()
 		// A real (never-started) SignerServer: retire() calls Stop() on it, which must not panic.
 		addr := "127.0.0.1:5555"
-		ep := privval.NewSignerDialerEndpoint(cmtlog.NewNopLogger(),
-			privval.DialTCPFn(addr, time.Second, ed25519.GenPrivKey()))
-		ns := &nodeServer{
-			srv:       privval.NewSignerServer(ep, testChainID, newFakePV()),
-			ep:        ep,
-			createdAt: time.Now(),
-		}
-		ns.touch()
+		ns := l.newNodeServer(addr)
 		l.servers[addr] = ns
 
 		l.mu.Lock()

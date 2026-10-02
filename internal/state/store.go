@@ -80,6 +80,14 @@ type RaftMembershipReader interface {
 	RaftMembership(ctx context.Context) (RaftMembership, error)
 }
 
+// RaftStateReader is separate from StateStore so in-memory gates do not need to implement a
+// diagnostic.
+type RaftStateReader interface {
+	// RaftState names the local Raft role: leader, follower, candidate or shutdown. It is read
+	// locally without a quorum check, so it is for diagnostics only.
+	RaftState() string
+}
+
 // LeadershipTransferer is separate from StateStore so in-memory gates do not need to
 // implement the operational Raft shutdown handoff.
 type LeadershipTransferer interface {

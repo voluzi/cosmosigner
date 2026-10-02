@@ -103,6 +103,17 @@ func TestOverlayStartFlags_ExpectedPublicKey(t *testing.T) {
 	require.Equal(t, "claims", cfg.Backend.Vault.BindingMount)
 }
 
+func TestOverlayStartFlags_HTTPAddr(t *testing.T) {
+	cmd := NewStartCmd()
+	cfg := &config.Config{HTTPAddr: "from-env:8080"}
+	require.NoError(t, overlayStartFlags(cmd, cfg))
+	require.Equal(t, "from-env:8080", cfg.HTTPAddr, "an unset flag must not clear the configured address")
+
+	require.NoError(t, cmd.Flags().Set("http-addr", "0.0.0.0:9090"))
+	require.NoError(t, overlayStartFlags(cmd, cfg))
+	require.Equal(t, "0.0.0.0:9090", cfg.HTTPAddr)
+}
+
 func TestOverlayStartFlags_ExplicitInsecureRaft(t *testing.T) {
 	cmd := NewStartCmd()
 	require.NoError(t, cmd.Flags().Set("raft-insecure", "true"))
@@ -152,6 +163,16 @@ func TestWriteInsecureRaftWarning(t *testing.T) {
 
 	out.Reset()
 	writeInsecureRaftWarning(&out, false)
+	require.Empty(t, out.String())
+}
+
+func TestWriteMaxRetriesWarning(t *testing.T) {
+	var out bytes.Buffer
+	writeMaxRetriesWarning(&out, "6000")
+	require.Contains(t, out.String(), "WARNING: COSMOSIGNER_CONN_MAX_RETRIES is deprecated and ignored")
+
+	out.Reset()
+	writeMaxRetriesWarning(&out, "")
 	require.Empty(t, out.String())
 }
 
