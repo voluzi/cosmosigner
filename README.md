@@ -287,7 +287,8 @@ runtime identity, or grant `kms:TagResource` to the runtime identity when using
 | `import` into a new target | `kms:CreateKey`, plus the import parameter/material/public-key permissions above on the created key |
 | Import integration drill cleanup | `kms:ScheduleKeyDeletion` on the created test key |
 
-These operations must also be allowed by the key policy. New keys use the default
+Key-level operations must also be allowed by the key policy; grant `kms:CreateKey`
+through the caller's IAM policy. New keys use the default
 AWS key policy; custom policies, aliases and tags are administered outside this command.
 Use the same AWS account and Region for the signer and key. Cross-account cluster
 binding is unsupported because tag operations do not support cross-account access.
