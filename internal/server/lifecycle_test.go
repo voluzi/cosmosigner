@@ -236,12 +236,9 @@ func TestRunShutdownResetsNodeBeforeFailedHandoff(t *testing.T) {
 
 	var errBeforeTransfer error
 	store := &failingTransferStore{leaderCh: make(chan bool)}
-	store.onTransfer = func() {
-		select {
-		case errBeforeTransfer = <-nodeReadErr:
-		case <-time.After(2 * time.Second):
-		}
-	}
+	// Blocks until the node has lost its connection: under the wrong order that never happens
+	// before the transfer, and the shutdown bound below fails the test.
+	store.onTransfer = func() { errBeforeTransfer = <-nodeReadErr }
 	l := New(Config{ChainID: testChainID}, StaticNodes{ln.Addr().String()}, newFakePV(),
 		ed25519.GenPrivKey(), store, cmtlog.NewNopLogger())
 

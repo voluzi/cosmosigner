@@ -47,7 +47,14 @@ type podLink struct {
 	wg      sync.WaitGroup
 
 	mu       sync.Mutex
-	exitedAt time.Time // zero while the signer process runs
+	exitedAt time.Time  // zero while the signer process runs
+	conns    []net.Conn // every proxied socket, closed at cleanup
+}
+
+func (p *podLink) own(c net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conns = append(p.conns, c)
 }
 
 // exit marks the signer process as gone; its pod's network follows liveFor later.
@@ -86,6 +93,13 @@ func newPodLink(t *testing.T, target string, liveFor time.Duration) *podLink {
 	}()
 	t.Cleanup(func() {
 		_ = ln.Close()
+		// Links are cleaned up before the lifecycles are stopped, so a replica may still hold a live
+		// connection through this one; close it rather than wait for the replica.
+		p.mu.Lock()
+		for _, c := range p.conns {
+			_ = c.Close()
+		}
+		p.mu.Unlock()
 		p.wg.Wait()
 	})
 	return p
@@ -99,12 +113,14 @@ func reset(c *net.TCPConn) {
 }
 
 func (p *podLink) pipe(signerSide *net.TCPConn) {
+	p.own(signerSide)
 	raw, err := net.Dial("tcp", p.target)
 	if err != nil {
 		reset(signerSide)
 		return
 	}
 	nodeSide := raw.(*net.TCPConn)
+	p.own(nodeSide)
 
 	var signerClosed atomic.Bool // the signer's FIN arrived
 
