@@ -74,6 +74,7 @@ const (
 	TypeSoftware Type = "software"
 	TypeVault    Type = "vault"
 	TypeGCPKMS   Type = "gcpkms"
+	TypePKCS11   Type = "pkcs11"
 )
 
 // Config selects and configures a KeyBackend.
@@ -86,6 +87,7 @@ type Config struct {
 	SoftwareBindingFile string       `yaml:"binding_file" env:"COSMOSIGNER_BINDING_FILE"`
 	Vault               VaultConfig  `yaml:"vault"`
 	GCPKMS              GCPKMSConfig `yaml:"gcp"`
+	PKCS11              PKCS11Config `yaml:"pkcs11"`
 }
 
 // ClaimConfig returns the configuration used to write a missing cluster claim at startup. It is
@@ -122,6 +124,8 @@ func New(cfg Config) (KeyBackend, error) {
 		return NewVault(cfg.Vault)
 	case TypeGCPKMS:
 		return NewGCPKMS(cfg.GCPKMS)
+	case TypePKCS11:
+		return NewPKCS11(cfg.PKCS11)
 	default:
 		return nil, fmt.Errorf("unknown backend type %q", cfg.Type)
 	}

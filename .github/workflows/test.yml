@@ -45,3 +45,45 @@ jobs:
           name: coverage
           path: coverage.out
           if-no-files-found: warn
+
+  pkcs11:
+    name: PKCS#11 (SoftHSM2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install SoftHSM2
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends softhsm2 opensc
+      - name: Native conformance and fail-closed drill
+        run: dev/pkcs11-drill.sh
+
+  release-snapshot:
+    name: Native release snapshot (Debian 12 amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: golang:1.27.1-bookworm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install Debian 12 native and cross compilers
+        run: apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Trust the mounted checkout for release tools
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Validate and build all release archives
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish

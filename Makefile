@@ -7,10 +7,10 @@ LDFLAGS := -X github.com/voluzi/cosmosigner/internal/version.Version=$(VERSION) 
            -X github.com/voluzi/cosmosigner/internal/version.Commit=$(COMMIT) \
            -X github.com/voluzi/cosmosigner/internal/version.Date=$(DATE)
 
-.PHONY: build install test test-race vet tidy clean
+.PHONY: build build-pkcs11 install test test-pkcs11 test-race vet tidy clean
 
 build:
-	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/cosmosigner
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/cosmosigner
 
 install:
 	go install -ldflags "$(LDFLAGS)" ./cmd/cosmosigner
@@ -35,3 +35,11 @@ tidy:
 
 clean:
 	rm -rf bin
+
+build-pkcs11: ## Build the native PKCS#11 variant (requires a C compiler).
+	CGO_ENABLED=1 go build -tags pkcs11 -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-pkcs11 ./cmd/cosmosigner
+
+test-pkcs11: ## Test a disposable token configured by scripts/softhsm-dev.sh.
+	CGO_ENABLED=1 go vet -tags pkcs11 ./...
+	CGO_ENABLED=1 go test -race -tags "pkcs11 pkcs11_integration" -run PKCS11 -count=10 ./internal/backend ./internal/config ./cmd/cosmosigner/cmd
+	CGO_ENABLED=1 go test -race -tags "pkcs11 pkcs11_integration" ./...
