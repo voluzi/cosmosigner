@@ -507,7 +507,7 @@ func New(cfg Config, nodes NodeSource, pv types.PrivValidator, connKey crypto.Pr
 // The order follows from what cometbft retries. Raft refuses reservations from the moment a
 // transfer starts, and a refusal that reaches the node is final: its retrying client returns a
 // remote signer error at once and the vote is lost. A connection that is reset is retried instead,
-// every 100ms for 5s, each attempt waiting for a signer to dial in. So the node must lose this
+// up to 50 attempts 100ms apart, each waiting for a signer to dial in. So the node must lose this
 // connection before the transfer can make this replica refuse, and its own retries then carry the
 // request to the next leader, which dials as soon as it is elected. If the transfer fails, the
 // node has no signer while this replica is still leader, for at most the transfer's bound; the

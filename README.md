@@ -442,8 +442,8 @@ cleared alongside the handoff, not strictly before it.
 
 The order is chosen for how CometBFT treats each outcome. Raft refuses new signing reservations on
 the old leader from the moment the transfer starts, and CometBFT does not retry a request the signer
-refused, so that vote would be lost. A reset connection it does retry, every 100 ms for 5 seconds,
-and the new leader dials the node as soon as it is elected, so a request made during the handoff is
+refused, so that vote would be lost. A reset connection it does retry, up to 50 attempts 100 ms apart,
+each waiting for a signer to connect, and the new leader dials the node as soon as it is elected, so a request made during the handoff is
 answered by the new leader. The connections are reset rather than closed because CometBFT keeps a
 connection whose peer closed it and only notices at its next ping, about 3.3 seconds later.
 
