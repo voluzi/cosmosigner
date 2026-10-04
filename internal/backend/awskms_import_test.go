@@ -247,70 +247,76 @@ func TestAWSKMSImportAliasRerun(t *testing.T) {
 	der, err := x509.MarshalPKIXPublicKey(&wrapping.PublicKey)
 	require.NoError(t, err)
 	pub := awsPublicResponse(t, ed25519.NewKeyFromSeed(make([]byte, 32)))
-	for _, keyID := range []string{"alias/validator", "arn:aws:kms:eu-west-1:123456789012:alias/validator"} {
-		for _, pending := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/pending=%t", keyID, pending), func(t *testing.T) {
-				var creates, aliases, imports atomic.Int32
-				var exists, enabled atomic.Bool
-				exists.Store(pending)
-				awsTestServer(t, func(op string, raw json.RawMessage) (any, int) {
-					var req struct{ KeyId, AliasName, TargetKeyId string }
-					assert.NoError(t, json.Unmarshal(raw, &req))
-					switch op {
-					case "DescribeKey":
-						assert.Equal(t, keyID, req.KeyId)
-						if !exists.Load() {
-							return map[string]any{"__type": "NotFoundException"}, 400
-						}
-						state := "PendingImport"
-						if enabled.Load() {
-							state = "Enabled"
-						}
-						return map[string]any{"KeyMetadata": awsMetadata("EXTERNAL", state)}, 200
-					case "CreateKey":
-						creates.Add(1)
-						return map[string]any{"KeyMetadata": awsMetadata("EXTERNAL", "PendingImport")}, 200
-					case "CreateAlias":
-						aliases.Add(1)
-						assert.Equal(t, "alias/validator", req.AliasName)
-						assert.Equal(t, testAWSARN, req.TargetKeyId)
-						exists.Store(true)
-						return map[string]any{}, 200
-					case "ListResourceTags", "GetParametersForImport", "ImportKeyMaterial", "GetPublicKey":
-						assert.Equal(t, testAWSARN, req.KeyId)
-						switch op {
-						case "ListResourceTags":
-							return map[string]any{}, 200
-						case "GetParametersForImport":
-							assert.True(t, exists.Load(), "alias must be published before material import")
-							return map[string]any{"KeyId": testAWSARN, "PublicKey": der, "ImportToken": []byte("token"), "ParametersValidTo": float64(time.Now().Add(time.Hour).Unix())}, 200
-						case "ImportKeyMaterial":
-							imports.Add(1)
-							enabled.Store(true)
-							return map[string]any{"KeyId": testAWSARN}, 200
-						case "GetPublicKey":
-							return pub, 200
-						}
+	for _, tc := range []struct {
+		keyID   string
+		pending bool
+	}{
+		{keyID: "alias/validator"},
+		{keyID: "alias/validator", pending: true},
+		{keyID: "arn:aws:kms:eu-west-1:123456789012:alias/validator", pending: true},
+	} {
+		keyID, pending := tc.keyID, tc.pending
+		t.Run(fmt.Sprintf("%s/pending=%t", keyID, pending), func(t *testing.T) {
+			var creates, aliases, imports atomic.Int32
+			var exists, enabled atomic.Bool
+			exists.Store(pending)
+			awsTestServer(t, func(op string, raw json.RawMessage) (any, int) {
+				var req struct{ KeyId, AliasName, TargetKeyId string }
+				assert.NoError(t, json.Unmarshal(raw, &req))
+				switch op {
+				case "DescribeKey":
+					assert.Equal(t, keyID, req.KeyId)
+					if !exists.Load() {
+						return map[string]any{"__type": "NotFoundException"}, 400
 					}
-					t.Errorf("unexpected AWS call %s", op)
-					return map[string]any{}, 400
-				})
-				for range 2 {
-					got, ready, err := AWSImportKey(t.Context(), AWSKMSConfig{KeyID: keyID}, awsImportSource(t))
-					require.NoError(t, err)
-					require.True(t, ready)
-					require.Equal(t, testAWSARN, got)
+					state := "PendingImport"
+					if enabled.Load() {
+						state = "Enabled"
+					}
+					return map[string]any{"KeyMetadata": awsMetadata("EXTERNAL", state)}, 200
+				case "CreateKey":
+					creates.Add(1)
+					return map[string]any{"KeyMetadata": awsMetadata("EXTERNAL", "PendingImport")}, 200
+				case "CreateAlias":
+					aliases.Add(1)
+					assert.Equal(t, "alias/validator", req.AliasName)
+					assert.Equal(t, testAWSARN, req.TargetKeyId)
+					exists.Store(true)
+					return map[string]any{}, 200
+				case "ListResourceTags", "GetParametersForImport", "ImportKeyMaterial", "GetPublicKey":
+					assert.Equal(t, testAWSARN, req.KeyId)
+					switch op {
+					case "ListResourceTags":
+						return map[string]any{}, 200
+					case "GetParametersForImport":
+						assert.True(t, exists.Load(), "alias must be published before material import")
+						return map[string]any{"KeyId": testAWSARN, "PublicKey": der, "ImportToken": []byte("token"), "ParametersValidTo": float64(time.Now().Add(time.Hour).Unix())}, 200
+					case "ImportKeyMaterial":
+						imports.Add(1)
+						enabled.Store(true)
+						return map[string]any{"KeyId": testAWSARN}, 200
+					case "GetPublicKey":
+						return pub, 200
+					}
 				}
-				require.EqualValues(t, 1, imports.Load())
-				if pending {
-					require.Zero(t, creates.Load())
-					require.Zero(t, aliases.Load())
-				} else {
-					require.EqualValues(t, 1, creates.Load())
-					require.EqualValues(t, 1, aliases.Load())
-				}
+				t.Errorf("unexpected AWS call %s", op)
+				return map[string]any{}, 400
 			})
-		}
+			for range 2 {
+				got, ready, err := AWSImportKey(t.Context(), AWSKMSConfig{KeyID: keyID}, awsImportSource(t))
+				require.NoError(t, err)
+				require.True(t, ready)
+				require.Equal(t, testAWSARN, got)
+			}
+			require.EqualValues(t, 1, imports.Load())
+			if pending {
+				require.Zero(t, creates.Load())
+				require.Zero(t, aliases.Load())
+			} else {
+				require.EqualValues(t, 1, creates.Load())
+				require.EqualValues(t, 1, aliases.Load())
+			}
+		})
 	}
 }
 
@@ -410,8 +416,8 @@ func TestAWSKMSImportCreateAliasFailureReportsKey(t *testing.T) {
 	}
 }
 
-func TestAWSKMSImportMissingKeyDoesNotCreate(t *testing.T) {
-	for _, keyID := range []string{testAWSARN, "12345678-1234-1234-1234-123456789012"} {
+func TestAWSKMSImportMissingResourceDoesNotCreate(t *testing.T) {
+	for _, keyID := range []string{testAWSARN, "12345678-1234-1234-1234-123456789012", "arn:aws:kms:eu-west-1:123456789012:alias/validator", "arn:aws:kms:eu-west-1:999999999999:alias/validator", "arn:aws:kms:us-east-1:123456789012:alias/validator"} {
 		t.Run(keyID, func(t *testing.T) {
 			var writes atomic.Int32
 			awsTestServer(t, func(op string, raw json.RawMessage) (any, int) {

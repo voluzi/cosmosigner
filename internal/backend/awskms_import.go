@@ -14,13 +14,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 )
 
 // AWSImportKey imports PKCS#8 Ed25519 material into a new or PendingImport EXTERNAL key.
-// Aliases resolve or create a target; an Enabled target succeeds only if its identity matches.
+// Alias names resolve or create a target; ARNs must exist. An Enabled target must match.
 // ready is true only after the pinned public key matches the source. A false ready with
 // no error means AWS accepted the material but its public key is not yet readable.
 // Errors after selecting a PendingImport target return its ARN for inspection and recovery.
@@ -64,17 +63,16 @@ func AWSImportKey(ctx context.Context, cfg AWSKMSConfig, pkcs8DER []byte) (resul
 	} else {
 		resp, err := client.DescribeKey(cctx, &kms.DescribeKeyInput{KeyId: aws.String(cfg.KeyID)})
 		if err != nil {
-			aliasName, isAlias := awsAliasName(cfg.KeyID)
 			var notFound *types.NotFoundException
-			if !isAlias || !errors.As(err, &notFound) {
+			if !strings.HasPrefix(cfg.KeyID, "alias/") || !errors.As(err, &notFound) {
 				return "", false, fmt.Errorf("describe AWS import target: %w", err)
 			}
 			keyARN, err = createAWSKey(cctx, client, types.OriginTypeExternal)
 			if err != nil {
 				return "", false, err
 			}
-			if _, err := client.CreateAlias(cctx, &kms.CreateAliasInput{AliasName: aws.String(aliasName), TargetKeyId: aws.String(keyARN)}); err != nil {
-				return "", false, fmt.Errorf("create alias %s for new key %s: %w", aliasName, keyARN, err)
+			if _, err := client.CreateAlias(cctx, &kms.CreateAliasInput{AliasName: aws.String(cfg.KeyID), TargetKeyId: aws.String(keyARN)}); err != nil {
+				return "", false, fmt.Errorf("create alias %s for new key %s: %w", cfg.KeyID, keyARN, err)
 			}
 		} else {
 			if resp == nil {
@@ -199,15 +197,4 @@ func awsImportNotReady(err error) bool {
 	var notFound *types.NotFoundException
 	var invalidState *types.KMSInvalidStateException
 	return errors.As(err, &notFound) || errors.As(err, &invalidState)
-}
-
-func awsAliasName(keyID string) (string, bool) {
-	if strings.HasPrefix(keyID, "alias/") {
-		return keyID, true
-	}
-	parsed, err := arn.Parse(keyID)
-	if err == nil && strings.HasPrefix(parsed.Resource, "alias/") {
-		return parsed.Resource, true
-	}
-	return "", false
 }
