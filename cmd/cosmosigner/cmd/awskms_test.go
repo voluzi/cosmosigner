@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -44,12 +46,17 @@ func commandAWSEndpoint(t *testing.T, handler func(string, json.RawMessage) (any
 		}
 	}))
 	t.Cleanup(server.Close)
+	commandAWSConfig(t, server.URL)
+}
+
+func commandAWSConfig(t *testing.T, endpoint string) {
+	t.Helper()
 	shared := filepath.Join(t.TempDir(), "empty-aws-config")
 	require.NoError(t, os.WriteFile(shared, nil, 0600))
 	t.Setenv("AWS_PROFILE", "")
 	t.Setenv("AWS_CONFIG_FILE", shared)
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", shared)
-	t.Setenv("AWS_ENDPOINT_URL_KMS", server.URL)
+	t.Setenv("AWS_ENDPOINT_URL_KMS", endpoint)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
 	t.Setenv("AWS_SESSION_TOKEN", "")
@@ -96,13 +103,18 @@ func TestImportAWSCommandRecoveryReminder(t *testing.T) {
 	require.NoError(t, err)
 	pubDER, err := x509.MarshalPKIXPublicKey(ed25519.PublicKey(sourcePub.Bytes()))
 	require.NoError(t, err)
-	for _, mode := range []string{"ready", "deferred", "read denied", "read cancelled"} {
+	for _, mode := range []string{"ready", "enabled", "deferred", "read denied", "read cancelled"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			commandAWSEndpoint(t, func(op string, raw json.RawMessage) (any, int) {
 				switch op {
+				case "DescribeKey":
+					return map[string]any{"KeyMetadata": map[string]any{"Arn": awsCommandARN, "KeyId": "12345678-1234-1234-1234-123456789012", "KeySpec": "ECC_NIST_EDWARDS25519", "KeyUsage": "SIGN_VERIFY", "KeyManager": "CUSTOMER", "KeyState": "Enabled", "Origin": "EXTERNAL", "MultiRegion": false}}, 200
+				case "ListResourceTags":
+					return map[string]any{}, 200
 				case "CreateKey":
+					assert.NotEqual(t, "enabled", mode)
 					return map[string]any{"KeyMetadata": map[string]any{"Arn": awsCommandARN, "KeyId": "12345678-1234-1234-1234-123456789012", "KeySpec": "ECC_NIST_EDWARDS25519", "KeyUsage": "SIGN_VERIFY", "KeyManager": "CUSTOMER", "KeyState": "PendingImport", "Origin": "EXTERNAL", "MultiRegion": false}}, 200
 				case "GetParametersForImport":
 					return map[string]any{"KeyId": awsCommandARN, "PublicKey": wrappingDER, "ImportToken": []byte("token"), "ParametersValidTo": float64(time.Now().Add(time.Hour).Unix())}, 200
@@ -129,12 +141,16 @@ func TestImportAWSCommandRecoveryReminder(t *testing.T) {
 			command := NewImportCmd()
 			command.SetContext(ctx)
 			command.SetOut(&output)
-			command.SetArgs([]string{"--backend", "awskms", "--aws-region", "eu-west-2", "--from", sourceFile})
+			args := []string{"--backend", "awskms", "--aws-region", "eu-west-2", "--from", sourceFile}
+			if mode == "enabled" {
+				args = append(args, "--aws-key-id", "alias/validator")
+			}
+			command.SetArgs(args)
 			require.NoError(t, command.Execute())
-			require.Contains(t, output.String(), awsCommandARN)
+			require.Contains(t, output.String(), "imported key version: "+awsCommandARN+"\n")
 			require.Contains(t, output.String(), "protected recovery backup")
 			require.NotContains(t, output.String(), "destroy all copies")
-			if mode == "ready" {
+			if mode == "ready" || mode == "enabled" {
 				require.Contains(t, output.String(), "verified: backend public key matches")
 			} else {
 				require.Contains(t, output.String(), "identity not verified yet")
@@ -208,4 +224,24 @@ func TestAWSImportPartialFailureReportsRecoveryTarget(t *testing.T) {
 			require.Contains(t, output.String(), awsCommandARN)
 		})
 	}
+}
+
+func TestPubkeyAWSCommandPrintsResolvedARN(t *testing.T) {
+	key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	der, err := x509.MarshalPKIXPublicKey(key.Public())
+	require.NoError(t, err)
+	commandAWSEndpoint(t, func(op string, raw json.RawMessage) (any, int) {
+		assert.Equal(t, "GetPublicKey", op)
+		var req struct{ KeyId string }
+		assert.NoError(t, json.Unmarshal(raw, &req))
+		assert.Equal(t, "alias/validator", req.KeyId)
+		return map[string]any{"KeyId": awsCommandARN, "KeySpec": "ECC_NIST_EDWARDS25519", "KeyUsage": "SIGN_VERIFY", "SigningAlgorithms": []string{"ED25519_SHA_512"}, "PublicKey": der}, 200
+	})
+	var output bytes.Buffer
+	command := NewPubkeyCmd()
+	command.SetOut(&output)
+	command.SetArgs([]string{"--backend", "awskms", "--aws-region", "eu-west-2", "--aws-key-id", "alias/validator"})
+	require.NoError(t, command.Execute())
+	pub := cmted25519.PubKey(key.Public().(ed25519.PublicKey))
+	require.Equal(t, "aws key arn:    "+awsCommandARN+"\naddress:        "+pub.Address().String()+"\npubkey (base64): "+base64.StdEncoding.EncodeToString(pub)+"\n", output.String())
 }

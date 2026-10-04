@@ -20,9 +20,10 @@ import (
 )
 
 // AWSImportKey imports PKCS#8 Ed25519 material into a new or PendingImport EXTERNAL key.
+// Aliases resolve or create a target; an Enabled target succeeds only if its identity matches.
 // ready is true only after the pinned public key matches the source. A false ready with
 // no error means AWS accepted the material but its public key is not yet readable.
-// Errors after target resolution return its ARN so an operator can inspect and resume.
+// Errors after selecting a PendingImport target return its ARN for inspection and recovery.
 // Retain a protected recovery copy: AWS makes the customer responsible for imported material.
 func AWSImportKey(ctx context.Context, cfg AWSKMSConfig, pkcs8DER []byte) (resultARN string, ready bool, resultErr error) {
 	parsed, err := x509.ParsePKCS8PrivateKey(pkcs8DER)
@@ -32,15 +33,6 @@ func AWSImportKey(ctx context.Context, cfg AWSKMSConfig, pkcs8DER []byte) (resul
 	source, ok := parsed.(ed25519.PrivateKey)
 	if !ok || len(source) != ed25519.PrivateKeySize {
 		return "", false, fmt.Errorf("import material must be an Ed25519 PKCS#8 private key")
-	}
-	if strings.HasPrefix(cfg.KeyID, "alias/") {
-		return "", false, fmt.Errorf("AWS import requires a key ID or key ARN; aliases are unsupported")
-	}
-	if strings.HasPrefix(cfg.KeyID, "arn:") {
-		target, err := arn.Parse(cfg.KeyID)
-		if err != nil || strings.HasPrefix(target.Resource, "alias/") {
-			return "", false, fmt.Errorf("AWS import requires a key ID or key ARN; aliases are unsupported")
-		}
 	}
 	cctx, cancel := context.WithTimeout(ctx, awsTimeout(cfg))
 	defer cancel()
@@ -72,20 +64,51 @@ func AWSImportKey(ctx context.Context, cfg AWSKMSConfig, pkcs8DER []byte) (resul
 	} else {
 		resp, err := client.DescribeKey(cctx, &kms.DescribeKeyInput{KeyId: aws.String(cfg.KeyID)})
 		if err != nil {
-			return "", false, fmt.Errorf("describe AWS import target: %w", err)
-		}
-		if resp == nil {
-			return "", false, fmt.Errorf("empty AWS DescribeKey response")
-		}
-		if err := checkAWSMetadata(resp.KeyMetadata, cfg.KeyID, types.OriginTypeExternal, types.KeyStatePendingImport); err != nil {
-			return "", false, err
-		}
-		keyARN = aws.ToString(resp.KeyMetadata.Arn)
-		target := &AWSKMS{client: client, keyARN: keyARN, timeout: awsTimeout(cfg)}
-		// PendingImport can be a recovery after material deletion. AWS permits only the
-		// original immutable material to be restored; a valid history claim stays intact.
-		if _, err := target.ClusterBinding(cctx); err != nil && !errors.Is(err, ErrBindingUnclaimed) {
-			return "", false, fmt.Errorf("read AWS import target claim: %w", err)
+			aliasName, isAlias := awsAliasName(cfg.KeyID)
+			var notFound *types.NotFoundException
+			if !isAlias || !errors.As(err, &notFound) {
+				return "", false, fmt.Errorf("describe AWS import target: %w", err)
+			}
+			keyARN, err = createAWSKey(cctx, client, types.OriginTypeExternal)
+			if err != nil {
+				return "", false, err
+			}
+			if _, err := client.CreateAlias(cctx, &kms.CreateAliasInput{AliasName: aws.String(aliasName), TargetKeyId: aws.String(keyARN)}); err != nil {
+				return "", false, fmt.Errorf("create alias %s for new key %s: %w", aliasName, keyARN, err)
+			}
+		} else {
+			if resp == nil {
+				return "", false, fmt.Errorf("empty AWS DescribeKey response")
+			}
+			if err := checkAWSMetadata(resp.KeyMetadata, cfg.KeyID, types.OriginTypeExternal, types.KeyStatePendingImport, types.KeyStateEnabled); err != nil {
+				return "", false, err
+			}
+			resolvedARN := aws.ToString(resp.KeyMetadata.Arn)
+			if resp.KeyMetadata.KeyState == types.KeyStatePendingImport {
+				keyARN = resolvedARN
+			}
+			target := &AWSKMS{client: client, keyARN: resolvedARN, timeout: awsTimeout(cfg)}
+			// PendingImport can follow material deletion; the history claim stays intact.
+			if _, err := target.ClusterBinding(cctx); err != nil && !errors.Is(err, ErrBindingUnclaimed) {
+				return "", false, fmt.Errorf("read AWS import target claim: %w", err)
+			}
+			if resp.KeyMetadata.KeyState == types.KeyStateEnabled {
+				pubResp, err := client.GetPublicKey(cctx, &kms.GetPublicKeyInput{KeyId: aws.String(resolvedARN)})
+				if err != nil {
+					return "", false, fmt.Errorf("get AWS public key for %s: %w", resolvedARN, err)
+				}
+				if pubResp == nil || aws.ToString(pubResp.KeyId) != resolvedARN {
+					return "", false, fmt.Errorf("AWS public key ARN mismatch for %s", resolvedARN)
+				}
+				pub, err := parseAWSPublicKey(pubResp)
+				if err != nil {
+					return "", false, err
+				}
+				if !bytes.Equal(pub, source.Public().(ed25519.PublicKey)) {
+					return "", false, fmt.Errorf("AWS key %s is Enabled with a different public key than the source; not importing", resolvedARN)
+				}
+				return resolvedARN, true, nil
+			}
 		}
 	}
 	params, err := awsImportParameters(cctx, client, keyARN)
@@ -176,4 +199,15 @@ func awsImportNotReady(err error) bool {
 	var notFound *types.NotFoundException
 	var invalidState *types.KMSInvalidStateException
 	return errors.As(err, &notFound) || errors.As(err, &invalidState)
+}
+
+func awsAliasName(keyID string) (string, bool) {
+	if strings.HasPrefix(keyID, "alias/") {
+		return keyID, true
+	}
+	parsed, err := arn.Parse(keyID)
+	if err == nil && strings.HasPrefix(parsed.Resource, "alias/") {
+		return parsed.Resource, true
+	}
+	return "", false
 }

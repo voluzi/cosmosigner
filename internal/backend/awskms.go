@@ -145,6 +145,9 @@ func parseAWSPublicKey(resp *kms.GetPublicKeyOutput) (cmted25519.PubKey, error) 
 	return append(cmted25519.PubKey(nil), pub...), nil
 }
 
+// KeyARN returns the immutable key ARN pinned at construction.
+func (a *AWSKMS) KeyARN() string { return a.keyARN }
+
 func (a *AWSKMS) PubKey() (crypto.PubKey, error) {
 	return append(cmted25519.PubKey(nil), a.pub...), nil
 }

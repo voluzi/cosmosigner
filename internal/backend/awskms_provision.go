@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
@@ -25,7 +26,7 @@ func AWSProvisionKey(ctx context.Context, cfg AWSKMSConfig) (string, error) {
 }
 
 func createAWSKey(ctx context.Context, client *kms.Client, origin types.OriginType) (string, error) {
-	// CreateKey has no idempotency token. A lost response must not create a second key.
+	// CreateKey has no idempotency token; disable retries to avoid duplicate keys.
 	resp, err := client.CreateKey(ctx, &kms.CreateKeyInput{
 		KeySpec:     types.KeySpecEccNistEdwards25519,
 		KeyUsage:    types.KeyUsageTypeSignVerify,
@@ -52,7 +53,7 @@ func createAWSKey(ctx context.Context, client *kms.Client, origin types.OriginTy
 	return aws.ToString(resp.KeyMetadata.Arn), nil
 }
 
-func checkAWSMetadata(meta *types.KeyMetadata, requested string, origin types.OriginType, state types.KeyState) error {
+func checkAWSMetadata(meta *types.KeyMetadata, requested string, origin types.OriginType, states ...types.KeyState) error {
 	if meta == nil {
 		return fmt.Errorf("empty AWS key metadata")
 	}
@@ -70,8 +71,8 @@ func checkAWSMetadata(meta *types.KeyMetadata, requested string, origin types.Or
 	if meta.KeySpec != types.KeySpecEccNistEdwards25519 || meta.KeyUsage != types.KeyUsageTypeSignVerify || meta.Origin != origin || meta.KeyManager != types.KeyManagerTypeCustomer {
 		return fmt.Errorf("AWS key metadata requires customer-managed ECC_NIST_EDWARDS25519 SIGN_VERIFY with origin %s", origin)
 	}
-	if meta.KeyState != state {
-		return fmt.Errorf("AWS key state %s, want %s", meta.KeyState, state)
+	if !slices.Contains(states, meta.KeyState) {
+		return fmt.Errorf("AWS key state %s, want %s", meta.KeyState, states)
 	}
 	return nil
 }

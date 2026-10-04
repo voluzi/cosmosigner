@@ -68,7 +68,7 @@ is responsible for the durability of imported key material.`,
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "imported AWS key: %s\nrun cosmosigner with %s\n", keyARN, awsBackendArgs(keyARN, be.AWSKMS.Region))
+				fmt.Fprintf(cmd.OutOrStdout(), "imported key version: %s\nrun cosmosigner with %s\n", keyARN, awsBackendArgs(keyARN, be.AWSKMS.Region))
 				verifyCfg.AWSKMS.KeyID = keyARN
 				deferVerify = !ready
 			case backend.TypeGCPKMS:
