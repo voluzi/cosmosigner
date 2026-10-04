@@ -272,10 +272,13 @@ Credentials use the standard AWS SDK chain: environment variables, shared profil
 web identity/IRSA, ECS task roles, and EC2 instance profiles. Region resolution uses
 `--aws-region` / `COSMOSIGNER_AWS_REGION` / `backend.aws.region` when specified,
 otherwise the SDK region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, shared config).
-There are no separate static credential fields or separate startup claim credentials
-for AWS. Run `claim-key` with an administrative AWS identity and use a restricted
-runtime identity, or grant `kms:TagResource` to the runtime identity when using
-`--claim-if-unclaimed`.
+For `start --claim-if-unclaimed`, `--aws-claim-role-arn` / `backend.aws.claim_role_arn` /
+`COSMOSIGNER_AWS_CLAIM_ROLE_ARN` optionally selects a role assumed through the SDK's
+standard STS credentials provider for the claim only. The runtime identity needs
+`sts:AssumeRole` on that role; the role needs the same key permissions as `claim-key`.
+Without a claim role, startup claiming uses the runtime identity and requires
+`kms:TagResource`. An unused claim role ARN is simply unused. Standalone `claim-key`
+always uses the caller's standard credential chain, like `import` and `pubkey`.
 
 | Operation | AWS permissions |
 |---|---|
@@ -284,12 +287,16 @@ runtime identity, or grant `kms:TagResource` to the runtime identity when using
 | `claim-key` | `kms:GetPublicKey`, `kms:ListResourceTags`, `kms:TagResource` on the key |
 | `provision` | `kms:CreateKey` (a new resource; IAM resource `*`) |
 | `import` into an existing target | `kms:DescribeKey`, `kms:ListResourceTags`, `kms:GetParametersForImport`, `kms:ImportKeyMaterial`, `kms:GetPublicKey` on the key |
-| `import` into a new target | `kms:CreateKey`, plus the import parameter/material/public-key permissions above on the created key |
+| `import` into a new target | `kms:CreateKey` (IAM resource `*`), plus the existing-target permissions above on the created key; alias targets also require `kms:DescribeKey` for alias lookup and `kms:CreateAlias` on the alias (IAM policy) and on the new key (key policy) |
 | Import integration drill cleanup | `kms:ScheduleKeyDeletion` on the created test key |
 
 Key-level operations must also be allowed by the key policy; grant `kms:CreateKey`
 through the caller's IAM policy. New keys use the default
-AWS key policy; custom policies, aliases and tags are administered outside this command.
+AWS key policy; custom policies and tags are administered outside this command.
+Import can create a missing alias but never replaces one. See the
+[CreateAlias permissions](https://docs.aws.amazon.com/kms/latest/APIReference/API_CreateAlias.html)
+and [key-state table](https://docs.aws.amazon.com/kms/latest/developerguide/key-state.html)
+(`CreateAlias` is allowed in `PendingImport`).
 Use the same AWS account and Region for the signer and key. Cross-account cluster
 binding is unsupported because tag operations do not support cross-account access.
 Multi-Region keys (`mrk-`) are rejected: replicas share material but their tags are
@@ -311,13 +318,13 @@ history protection. See [AWS KMS eventual consistency](https://docs.aws.amazon.c
 # Create a new signing key; record the printed ARN.
 ./bin/cosmosigner provision --backend awskms --aws-region eu-west-1
 
-# Import an existing validator identity into a new EXTERNAL key.
+# Import an existing validator identity using a stable alias target.
 ./bin/cosmosigner import --backend awskms --aws-region eu-west-1 \
-  --from priv_validator_key.json
+  --aws-key-id alias/my-validator --from priv_validator_key.json
 
-# Set KEY_ARN to the printed key ARN. Initialize Raft and set CLUSTER_ID to its output.
+# Set KEY_ARN to the ARN printed after "imported key version:" (or by provision).
 ./bin/cosmosigner pubkey --backend awskms --aws-region eu-west-1 --aws-key-id "$KEY_ARN"
-./bin/cosmosigner start --config cosmosigner.yaml --initialize-only
+CLUSTER_ID=$(./bin/cosmosigner start --config cosmosigner.yaml --initialize-only)
 ./bin/cosmosigner claim-key --backend awskms --aws-region eu-west-1 \
   --aws-key-id "$KEY_ARN" --cluster-id "$CLUSTER_ID"
 ./bin/cosmosigner start --config cosmosigner.yaml
@@ -338,20 +345,40 @@ backend:
 `--aws-key-id`. CreateKey retries are disabled because it has no idempotency token:
 a lost response can leave a created key, so inspect KMS before retrying.
 
-`import --aws-key-id <key-arn-or-id>` uses an existing customer-managed, single-Region
-EXTERNAL Ed25519 key in `PendingImport`; aliases are refused for imports. It checks any
-existing cluster claim and preserves it. A valid claim can accompany recovery after
-imported material was deleted: AWS permits only the original immutable material to be
+`import --aws-key-id <alias-name-or-arn>` resolves the alias or, when it is missing,
+creates a customer-managed, single-Region EXTERNAL Ed25519 key and publishes the alias
+before importing material. An existing alias, key ID or key ARN follows the same path:
+`PendingImport` resumes the import; `Enabled` returns success without writes only when
+its public key matches the source. A different identity fails without writes. A missing
+ordinary key ID or key ARN is an error and never creates a replacement. Omitting
+`--aws-key-id` creates a new key on every run; use an alias for retried imports.
+The command checks any existing cluster claim and preserves it. A valid claim can
+accompany recovery after imported material was deleted: AWS permits only the original immutable material to be
 restored. The import uses DER PKCS#8, a `RSA_4096` wrapping key, OAEP SHA-256, and
 `KEY_MATERIAL_DOES_NOT_EXPIRE`. All responses are checked against the pinned ARN; the
 imported public key must match the source before the command reports verified success.
 If AWS accepted the material but its public key cannot yet be read (including permission
 failures or an expired timeout), the command prints the expected identity and the
 `pubkey` command for a later check. Fix the read permissions or wait for availability;
-do not re-import an enabled key. ARN, algorithm or public-key mismatches remain hard
-errors. Errors retain the target ARN: failures before acceptance advise inspecting the
-key state before resuming with `--aws-key-id`, while failures after acceptance advise
-verifying identity with `pubkey`. No created keys are deleted automatically.
+verify identity before signing. ARN, algorithm or public-key mismatches remain hard
+errors. Once a PendingImport target is resolved, errors retain its ARN: failures before
+acceptance advise inspecting the key state before resuming with `--aws-key-id`, while
+failures after acceptance advise verifying identity with `pubkey`.
+
+Import prints `imported key version: <key ARN>` for verified, deferred and matching
+Enabled targets. `pubkey` prints `aws key arn:    <key ARN>` before the consensus identity.
+Configure the signer with that immutable ARN: an alias is a lookup name, and anyone with
+`kms:UpdateAlias` can retarget it.
+
+`CreateKey` and `CreateAlias` are separate, non-transactional calls. A crash or lost
+response between them can leave an unaliased EXTERNAL key in `PendingImport`. An immediate
+retry can also see a stale alias lookup, create another key, then fail to publish the
+alias. Two concurrent first runs can each create a key; one alias creation fails.
+Errors report the candidate key ARN when available, including alias creation failures.
+If the process died before reporting it, find the key in KMS. Inspect its state, then
+resume with `--aws-key-id <ARN>`, point the alias at it, or schedule its deletion as
+appropriate. Cosmosigner does not scan tags for recovery, replace aliases or delete keys
+automatically.
 
 **Retain a protected recovery backup of the original imported material outside AWS,
 preferably in an HSM.** AWS customers are responsible for its durability; imported
@@ -361,7 +388,9 @@ and [imported-key considerations](https://docs.aws.amazon.com/kms/latest/develop
 Retire unsecured working copies only after confirming the identity and protecting the
 recovery backup. AWS imports must never follow a destroy-all-copies procedure.
 
-Provider conformance and import drills are opt-in:
+Provider conformance and import drills are opt-in. Real-AWS validation of alias creation,
+PendingImport resume, Enabled reruns and the startup STS claim role remains pending;
+local HTTP tests do not establish those provider behaviors:
 
 ```sh
 AWS_REGION=eu-west-1 AWS_KMS_KEY_ID='<dedicated-test-key-arn>' \
@@ -627,21 +656,26 @@ for the claim only and dropped immediately afterwards:
 |---|---|---|
 | Vault | `--vault-claim-token-file` / `backend.vault.claim_token_file` / `COSMOSIGNER_VAULT_CLAIM_TOKEN_FILE` | `create`, `update` and `read` on `<binding_mount>/data/cluster-bindings/*`, plus `read` on `<binding_mount>/metadata/cluster-bindings/*` (already part of the runtime policy) |
 | Cloud KMS | `--gcp-claim-credentials-file` / `backend.gcp.claim_credentials_file` / `COSMOSIGNER_GCP_CLAIM_CREDENTIALS_FILE` | `cloudkms.cryptoKeys.update` on the CryptoKey |
-| AWS KMS | No separate claim credential support; use the standard AWS chain | `kms:TagResource` on the key |
+| AWS KMS | `--aws-claim-role-arn` / `backend.aws.claim_role_arn` / `COSMOSIGNER_AWS_CLAIM_ROLE_ARN` | `kms:TagResource` on the key |
 | software | — | write access to the marker directory |
 
 A dedicated claim credential needs the same access as `claim-key`: the one-shot claim policy above
 for Vault (including `read` on `transit/keys/<key>` and on the binding metadata), and
 `cloudkms.cryptoKeys.get`, `cloudkms.cryptoKeys.update` and `cloudkms.cryptoKeyVersions.viewPublicKey`
-for Cloud KMS. Claim credentials are rejected unless `claim_if_unclaimed` is enabled and they match
-the configured backend.
+for Cloud KMS; for AWS KMS, `kms:GetPublicKey`, `kms:ListResourceTags` and `kms:TagResource`
+on the key. With an AWS claim role, the runtime identity needs `sts:AssumeRole` on that
+role instead of standing `kms:TagResource` permission. It can still assume the role
+itself at any time; this is not a hard credential boundary, just as the sibling claim
+credentials remain available beside the signer. Vault and Cloud KMS claim credentials
+are rejected unless `claim_if_unclaimed` is enabled and they match the configured
+backend. An AWS claim role is used only by the AWS startup claim path and otherwise ignored.
 
 These claim permissions cannot delete, disable or export key material: Vault grants only reach the
 binding registry, `cryptoKeys.update` changes Cloud KMS metadata, and AWS `kms:TagResource` adds or
 replaces tags. They do let their holder rewrite the claim itself. Reusing the runtime identity
-therefore trades that protection for a simpler setup. Use a dedicated claim credential for Vault
-or Cloud KMS, or run AWS `claim-key` under an administrative identity separately, where the signer
-should not be able to reassign the key.
+therefore trades that protection for a simpler setup. Use dedicated claim credentials or run
+`claim-key` under an administrative identity separately where the signer should not be able to
+reassign the key.
 
 The software marker defaults to `<key file>.cosmosigner-cluster.json`, next to the key. When the key
 is mounted read-only (a Kubernetes Secret), place the marker, and its lock, on writable storage with
