@@ -22,8 +22,11 @@ keys.
 Install the latest release with the Voluzi installer:
 
 ```sh
-curl -s https://get.voluzi.com/cosmosigner! | bash
+curl -s 'https://get.voluzi.com/cosmosigner!?select=cosmosigner_' | bash
 ```
+
+Keep the `select=cosmosigner_` filter to select the static release archives. The unfiltered
+installer chooses the first archive for an OS/architecture and can select a native variant.
 
 You can also download binaries from GitHub Releases, use the published container
 image, or build from source:
@@ -40,11 +43,11 @@ docker pull ghcr.io/voluzi/cosmosigner:latest
 
 ## Why
 
-- **Key custody in Vault, Google Cloud KMS or AWS KMS.** The validator consensus key lives in
+- **Key custody in Vault, Google Cloud KMS, AWS KMS, or operator-held PKCS#11 tokens.** The validator consensus key lives in
   the Vault Transit engine, Google Cloud KMS (`EC_SIGN_ED25519`) or AWS KMS
   (`ECC_NIST_EDWARDS25519`), using PureEdDSA, and
   never leaves it — only signatures cross the wire. A `software` backend is
-  provided for local testing.
+  provided for local testing. The optional `pkcs11` variant signs on an operator-held token.
 - **Partition-safe double-sign protection within one signing history.** Every signature must pass through a
   raft-committed high-water-mark (height/round/step). A signer that loses raft
   quorum (e.g. a network partition) **cannot** advance the mark and therefore
@@ -63,7 +66,7 @@ docker pull ghcr.io/voluzi/cosmosigner:latest
 
 Two orthogonal, pluggable interfaces:
 
-- **`KeyBackend`** — *who signs.* `software`, `vault`, `gcpkms`, and `awskms`. It remains a signing oracle with no ordering logic, but also exposes the durable
+- **`KeyBackend`** — *who signs.* `software`, `vault`, `gcpkms`, `awskms`, and optional `pkcs11`. It remains a signing oracle with no ordering logic, but also exposes the durable
   cluster claim attached to that particular key resource.
 - **`StateStore`** — *who decides a height may be signed.* Embedded
   hashicorp/raft today. Consensus ordering stays backend-independent; the startup
@@ -407,6 +410,166 @@ AWS_REGION=eu-west-1 AWS_KMS_KEY_ID='<dedicated-test-key-arn>' \
 AWS_REGION=eu-west-1 AWS_KMS_IMPORT_TEST=1 \
   go test -race -tags awskms_integration -run TestAWSKMSIntegrationImportRoundTrip ./internal/backend/
 ```
+
+## PKCS#11 backend
+
+The optional `pkcs11` backend signs with a pre-existing, non-exportable Ed25519 key on an
+operator-held token. **Validated with software tokens SoftHSM2 2.6.1 and BouncyHsm 2.3.2; no
+physical HSM has been validated.** Each device, firmware and module configuration needs its own
+determinism conformance run before use with a validator key. PureEdDSA (`CKM_EDDSA`, no mechanism
+parameters) must produce identical signatures for identical messages. Startup signs a non-consensus probe twice and refuses
+randomized or invalid signatures.
+
+Default release binaries, the filtered installer command above and default images remain static.
+The documented `go install` command also omits PKCS#11 support because it has no `pkcs11` build tag;
+its linking depends on the local toolchain. Selecting this backend without that tag returns an
+explicit unsupported-build error.
+`cosmosigner version` reports `pkcs11: true` or `false`. Linux releases additionally provide
+`cosmosigner-pkcs11_<version>_linux_{amd64,arm64}.tar.gz`, containing a `cosmosigner` executable.
+Native archives are built in snapshots but disabled for release tags until the owner sets the
+repository variable `COSMOSIGNER_RELEASE_PKCS11=1` after updating the external installer to prefer
+the static `cosmosigner_` prefix. Native images and source builds remain available while that
+release gate is disabled.
+These native artifacts use glibc and are built with Debian 12/bookworm compilers. The native image
+uses `distroless/cc-debian12` and its builder also uses bookworm; a binary built on a newer Linux
+host may require a newer glibc. Inspect `readelf --version-info cosmosigner` for that binary's
+required `GLIBC_*` versions. A trixie test binary does not establish bookworm compatibility.
+
+```sh
+make build-pkcs11                         # C compiler required; bin/cosmosigner-pkcs11
+CGO_ENABLED=1 go build -tags pkcs11 ./cmd/cosmosigner
+# Native Linux images: <version>-pkcs11, latest-pkcs11, edge-pkcs11
+# Vendor modules and their dependencies/client configuration are NOT bundled.
+docker build --target pkcs11 -t cosmosigner-pkcs11 .
+```
+
+Mount the vendor's glibc shared library, its dependencies and any client configuration, or copy
+them into a derived native image. The native container runs as UID/GID 65532; give it access to
+those files, the PIN file, token device/client sockets and the persistent binding directory.
+There are no native macOS release archives; build from source there with a suitable module.
+
+```yaml
+backend:
+  type: pkcs11
+  pkcs11:
+    module: /opt/vendor/libpkcs11.so
+    token_label: validator-token          # exactly one of token_label or slot
+    # slot: 0                            # zero is a valid explicit slot
+    key_label: consensus
+    # key_id: "01a2"                     # hex bytes; label and ID intersect when both are set
+    pin_file: /run/secrets/token-pin
+    binding_file: /shared/consensus-cluster.json
+```
+
+The token selector must match exactly one present token. Key selection must match exactly one
+signing `CKO_PRIVATE_KEY` and one `CKO_PUBLIC_KEY` of type `CKK_EC_EDWARDS`. The private key must
+have `CKA_SENSITIVE=true` and `CKA_EXTRACTABLE=false`. Both objects must have
+Ed25519 parameters: DER OID `1.3.101.112` or DER PrintableString `edwards25519`. Ed448, X25519,
+malformed parameters and keys are rejected. Public points must be exactly 32 raw bytes or a DER
+OCTET STRING wrapping 32 bytes. Every returned signature must be 64 bytes and verify under the
+originally cached public key, including when label/ID selectors select mismatched key pairs.
+
+| YAML field (`backend.pkcs11`) | Flag | Environment variable |
+| --- | --- | --- |
+| `module` | `--pkcs11-module` | `COSMOSIGNER_PKCS11_MODULE` |
+| `token_label` | `--pkcs11-token-label` | `COSMOSIGNER_PKCS11_TOKEN_LABEL` |
+| `slot` | `--pkcs11-slot` | `COSMOSIGNER_PKCS11_SLOT` |
+| `key_label` | `--pkcs11-key-label` | `COSMOSIGNER_PKCS11_KEY_LABEL` |
+| `key_id` | `--pkcs11-key-id` | `COSMOSIGNER_PKCS11_KEY_ID` |
+| `pin_file` | `--pkcs11-pin-file` | `COSMOSIGNER_PKCS11_PIN_FILE` |
+| `binding_file` | `--pkcs11-binding-file` | `COSMOSIGNER_PKCS11_BINDING_FILE` |
+
+Precedence is flags → environment → YAML → defaults. One explicit token selector flag replaces
+the other selector from configuration. Setting both flags fails validation. Environment overrides
+replace individual fields; clear a configured `token_label` before selecting `slot` by environment,
+or remove a configured `slot` before selecting `token_label`. There is no default binding file and no
+`pin` or `pin_env` field or secret-valued flag/environment variable. Use a restricted PIN file;
+only trailing CR/LF bytes are removed, so spaces remain part of the PIN. Cosmosigner does not
+provision or import token keys: generate them using the vendor's provisioning tools.
+
+**Cluster binding is on the filesystem, not the token.** Replicas using one HSM key can share
+the same persistent `binding_file` in one trust domain to reject another cluster's claim.
+Per-replica files on each replica's persistent volume are also supported when an external
+orchestrator guarantees exclusive ownership of the consensus key. Each file then guards only
+that replica's Raft history and key material; it cannot detect another deployment using the same
+key with independent volumes. A replaced volume leaves its marker unclaimed. Restore or rejoin
+the authoritative Raft history before using `claim-key` or `start --claim-if-unclaimed`; never
+claim a fresh cluster ID after losing that history.
+
+The binding directory must already exist. Claims use the software backend's atomic file
+publication and lock, and records include the public key. A marker from another key, a different
+owner, or a corrupt marker is refused. Whoever can write the binding directory can remove its
+claim. Use storage that supports cross-process file locking, atomic hard links and durable
+file/directory sync. Cosmosigner does not enforce the deployment topology. This binding is a
+startup guardrail, not live fencing against another running signer.
+
+```sh
+./bin/cosmosigner-pkcs11 pubkey --backend pkcs11 --pkcs11-module /opt/vendor/libpkcs11.so \
+  --pkcs11-token-label validator-token --pkcs11-key-label consensus \
+  --pkcs11-pin-file /run/secrets/token-pin --pkcs11-binding-file /shared/consensus-cluster.json
+# Initialize the Raft history as documented below, then claim its printed UUID:
+./bin/cosmosigner-pkcs11 claim-key --backend pkcs11 --cluster-id <uuid> \
+  --pkcs11-module /opt/vendor/libpkcs11.so --pkcs11-token-label validator-token \
+  --pkcs11-key-label consensus --pkcs11-pin-file /run/secrets/token-pin \
+  --pkcs11-binding-file /shared/consensus-cluster.json
+# start --claim-if-unclaimed also uses the same atomic claim path.
+```
+
+One session is serialized for all signing, recovery and preflight calls. On a closed/invalid
+session, removed device, absent token or lost login, Cosmosigner refreshes slots, reopens and logs
+in, reacquires handles, validates the objects and compares their public key to the original key
+before retrying the exact message once. Other errors returned by the PKCS#11 signing call close the
+session without an immediate retry; the next call reopens it. Signature validation failures return
+an error and keep the session open. Any failure returns no signature; the Raft reservation
+stays in flight. A later call may recover when the token returns. Incorrect or locked PIN errors
+latch token access for the process by manufacturer, model and token serial number, including across
+module copies and slot changes. A token must report a non-empty serial number.
+
+With `http_addr` enabled, an incorrect or locked PIN during `start` construction, preflight or
+startup claim closes the backend and Raft resources, logs the cause once and keeps only the health
+listener running: `/livez` stays `200`, `/readyz` stays `503`. No further login is attempted until
+an explicit process restart, even if the PIN file is replaced. SIGTERM stops this hold cleanly
+without logging the PIN cause again. `start --initialize-only` also holds on a constructor PIN
+failure when HTTP is enabled; an init container or Job will wait for operator intervention.
+Management commands such as `pubkey` and `claim-key` still return the error immediately.
+
+Without `http_addr`, startup returns the PIN error immediately. Automatic restarts reset the
+latch and consume another hardware PIN attempt. Configure both Kubernetes startup and liveness
+probes to use `/livez`, and readiness to use `/readyz`: a startup probe on `/readyz` would restart
+a held replica. Each replica can spend one attempt, including replicas started in parallel with
+the same incorrect PIN. Correct access before explicitly restarting; repeated incorrect PINs
+can lock or zeroize a device according to its policy.
+Recovery never finalizes the module or logs out other sessions. Modules are shared
+by canonical path with reference counts; only the last close can finalize an initialization owned
+by Cosmosigner. A vendor C call that hangs cannot be cancelled and blocks signing.
+
+For a disposable native SoftHSM conformance and fault drill (requires `softhsm2`, `opensc`, a C
+compiler and `curl`):
+
+```sh
+dev/pkcs11-drill.sh
+# Or configure a disposable token for a manual integration run:
+exports=$(scripts/softhsm-dev.sh up) && eval "$exports"
+make test-pkcs11
+scripts/softhsm-dev.sh down
+```
+
+The setup script ignores runtime HSM configuration. Set `COSMOSIGNER_SOFTHSM_MODULE` only when
+SoftHSM's library is installed at a different path.
+
+The drill checks signing determinism across instances, session recovery, key replacement refusal,
+curve rejection, shared binding, CLI startup/claim and the static binary's unsupported error.
+Integration tests fail when token configuration is missing. They create and replace disposable
+keys: **never run the SoftHSM fault tests against a production token**. Hardware validation must
+also cover removal/reinsertion, login semantics, module dependencies and deterministic signatures
+on the actual firmware; software-token results are not vendor hardware claims.
+
+BouncyHsm 2.3.2 was additionally tested through its macOS ARM64 PKCS#11 module for deterministic
+signing, concurrent requests, session recovery, token removal/reinsertion, key replacement refusal,
+curve rejection, binding and CLI startup/PIN handling. Its key-generation fixture uses the curve
+OID rather than SoftHSM's curve name. Restarting the entire BouncyHsm server loses its Cryptoki
+initialization: signing fails closed with `CKR_CRYPTOKI_NOT_INITIALIZED`, and the signer process
+must be restarted. This server-restart case did not pass automatic recovery.
 
 ## Google Cloud KMS backend
 
@@ -765,7 +928,9 @@ HTTP endpoints. The listener is disabled by default; a port that cannot be bound
 outage or a lost quorum never makes Kubernetes restart every replica at once. The listener starts
 before the backend is opened, so it also answers during a slow startup. `/readyz` is true on
 followers as well as on the leader; it reports that the replica has joined and may take over, not
-that it is signing. `start --initialize-only` never becomes ready.
+that it is signing. A replica held after a startup PIN failure stays live and never becomes ready.
+Use `/livez` for both startup and liveness probes, and `/readyz` for readiness.
+`start --initialize-only` never becomes ready and can also hold on a PIN failure with HTTP enabled.
 
 ```json
 {
@@ -863,6 +1028,9 @@ raft:
 make build
 make test
 make vet
+# Optional native backend and disposable SoftHSM drill:
+make build-pkcs11
+dev/pkcs11-drill.sh
 ```
 
 `make test-cover` runs the race detector and writes `coverage.out`, matching CI.

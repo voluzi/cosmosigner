@@ -19,6 +19,7 @@ require (
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/hashicorp/vault/api v1.23.0
+	github.com/miekg/pkcs11 v1.1.2
 	github.com/oasisprotocol/curve25519-voi v0.0.0-20220708102147-0a8a51822cae
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1

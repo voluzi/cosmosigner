@@ -13,7 +13,8 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    container: golang:1.27.1-bookworm
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -26,16 +27,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install Debian 12 native and cross compilers
+        run: apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Trust the mounted checkout for release tools
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Check GoReleaser configuration
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           version: '~> v2'
           args: check
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSMOSIGNER_RELEASE_PKCS11: ${{ vars.COSMOSIGNER_RELEASE_PKCS11 }}

@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/voluzi/cosmosigner/internal/backend"
 	"github.com/voluzi/cosmosigner/internal/version"
 )
 
@@ -15,6 +16,7 @@ func NewVersionCmd() *cobra.Command {
 		Short: "Print version information",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			fmt.Printf("cosmosigner %s (commit %s, built %s)\n", version.Version, version.Commit, version.Date)
+			fmt.Printf("pkcs11: %t\n", backend.PKCS11Supported)
 			return nil
 		},
 	}

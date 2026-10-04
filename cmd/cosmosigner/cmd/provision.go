@@ -80,6 +80,8 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 				return nil
 			case backend.TypeGCPKMS:
 				return provisionGCP(gcp, be.GCPKMS.CredentialsFile)
+			case backend.TypePKCS11:
+				return fmt.Errorf("pkcs11 provision is not supported; generate the key with the vendor tool")
 			default:
 				return fmt.Errorf("unknown backend type %q", be.Type)
 			}

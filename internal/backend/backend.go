@@ -75,6 +75,7 @@ const (
 	TypeVault    Type = "vault"
 	TypeGCPKMS   Type = "gcpkms"
 	TypeAWSKMS   Type = "awskms"
+	TypePKCS11   Type = "pkcs11"
 )
 
 // Config selects and configures a KeyBackend.
@@ -88,6 +89,7 @@ type Config struct {
 	Vault               VaultConfig  `yaml:"vault"`
 	GCPKMS              GCPKMSConfig `yaml:"gcp"`
 	AWSKMS              AWSKMSConfig `yaml:"aws"`
+	PKCS11              PKCS11Config `yaml:"pkcs11"`
 }
 
 // ClaimConfig returns the configuration used to write a missing cluster claim at startup. It is
@@ -129,6 +131,8 @@ func New(cfg Config) (KeyBackend, error) {
 		return NewGCPKMS(cfg.GCPKMS)
 	case TypeAWSKMS:
 		return NewAWSKMS(cfg.AWSKMS)
+	case TypePKCS11:
+		return NewPKCS11(cfg.PKCS11)
 	default:
 		return nil, fmt.Errorf("unknown backend type %q", cfg.Type)
 	}
