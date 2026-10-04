@@ -492,8 +492,9 @@ the same persistent `binding_file` in one trust domain to reject another cluster
 Per-replica files on each replica's persistent volume are also supported when an external
 orchestrator guarantees exclusive ownership of the consensus key. Each file then guards only
 that replica's Raft history and key material; it cannot detect another deployment using the same
-key with independent volumes. A replaced volume is unclaimed and needs `claim-key` or
-`start --claim-if-unclaimed` against the existing Raft cluster ID.
+key with independent volumes. A replaced volume leaves its marker unclaimed. Restore or rejoin
+the authoritative Raft history before using `claim-key` or `start --claim-if-unclaimed`; never
+claim a fresh cluster ID after losing that history.
 
 The binding directory must already exist. Claims use the software backend's atomic file
 publication and lock, and records include the public key. A marker from another key, a different
