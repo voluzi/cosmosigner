@@ -487,14 +487,20 @@ or remove a configured `slot` before selecting `token_label`. There is no defaul
 only trailing CR/LF bytes are removed, so spaces remain part of the PIN. Cosmosigner does not
 provision or import token keys: generate them using the vendor's provisioning tools.
 
-**Cluster binding is on the filesystem, not the token.** All replicas using one HSM key must
-share the same persistent `binding_file` in one trust domain. The directory must already exist.
-Claims use the software backend's atomic file publication and lock, and records include the public
-key. A marker from another key, a different owner, or a corrupt marker is refused. Per-replica
-files reduce this guardrail to each replica; Cosmosigner cannot detect that topology. Whoever can
-write the binding directory can remove its claim. Use storage that supports cross-process file
-locking, atomic hard links and durable file/directory sync. This binding is a startup guardrail,
-not live fencing against another running signer.
+**Cluster binding is on the filesystem, not the token.** Replicas using one HSM key can share
+the same persistent `binding_file` in one trust domain to reject another cluster's claim.
+Per-replica files on each replica's persistent volume are also supported when an external
+orchestrator guarantees exclusive ownership of the consensus key. Each file then guards only
+that replica's Raft history and key material; it cannot detect another deployment using the same
+key with independent volumes. A replaced volume is unclaimed and needs `claim-key` or
+`start --claim-if-unclaimed` against the existing Raft cluster ID.
+
+The binding directory must already exist. Claims use the software backend's atomic file
+publication and lock, and records include the public key. A marker from another key, a different
+owner, or a corrupt marker is refused. Whoever can write the binding directory can remove its
+claim. Use storage that supports cross-process file locking, atomic hard links and durable
+file/directory sync. Cosmosigner does not enforce the deployment topology. This binding is a
+startup guardrail, not live fencing against another running signer.
 
 ```sh
 ./bin/cosmosigner-pkcs11 pubkey --backend pkcs11 --pkcs11-module /opt/vendor/libpkcs11.so \

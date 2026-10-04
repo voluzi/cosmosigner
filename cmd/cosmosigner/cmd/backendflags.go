@@ -34,7 +34,7 @@ func registerBackendFlags(cmd *cobra.Command) {
 	f.String("pkcs11-key-label", "", "PKCS#11 key label")
 	f.String("pkcs11-key-id", "", "PKCS#11 key ID in hexadecimal; combined with key label when both are set")
 	f.String("pkcs11-pin-file", "", "PKCS#11 PIN file path")
-	f.String("pkcs11-binding-file", "", "PKCS#11 persistent cluster marker shared by all replicas")
+	f.String("pkcs11-binding-file", "", "PKCS#11 persistent cluster marker path")
 }
 
 // overlayBackendFlags applies explicitly-set backend flags onto c (highest
