@@ -414,10 +414,10 @@ AWS_REGION=eu-west-1 AWS_KMS_IMPORT_TEST=1 \
 ## PKCS#11 backend
 
 The optional `pkcs11` backend signs with a pre-existing, non-exportable Ed25519 key on an
-operator-held token. **Validated against SoftHSM2 2.6.1 only; no real vendor hardware has been
-validated.** Each device, firmware and module configuration needs its own determinism conformance
-run before use with a validator key. PureEdDSA (`CKM_EDDSA`, no mechanism parameters) must produce
-identical signatures for identical messages. Startup signs a non-consensus probe twice and refuses
+operator-held token. **Validated with software tokens SoftHSM2 2.6.1 and BouncyHsm 2.3.2; no
+physical HSM has been validated.** Each device, firmware and module configuration needs its own
+determinism conformance run before use with a validator key. PureEdDSA (`CKM_EDDSA`, no mechanism
+parameters) must produce identical signatures for identical messages. Startup signs a non-consensus probe twice and refuses
 randomized or invalid signatures.
 
 Default release binaries, the filtered installer command above and default images remain static.
@@ -562,7 +562,14 @@ curve rejection, shared binding, CLI startup/claim and the static binary's unsup
 Integration tests fail when token configuration is missing. They create and replace disposable
 keys: **never run the SoftHSM fault tests against a production token**. Hardware validation must
 also cover removal/reinsertion, login semantics, module dependencies and deterministic signatures
-on the actual firmware; SoftHSM results are not vendor claims.
+on the actual firmware; software-token results are not vendor hardware claims.
+
+BouncyHsm 2.3.2 was additionally tested through its macOS ARM64 PKCS#11 module for deterministic
+signing, concurrent requests, session recovery, token removal/reinsertion, key replacement refusal,
+curve rejection, binding and CLI startup/PIN handling. Its key-generation fixture uses the curve
+OID rather than SoftHSM's curve name. Restarting the entire BouncyHsm server loses its Cryptoki
+initialization: signing fails closed with `CKR_CRYPTOKI_NOT_INITIALIZED`, and the signer process
+must be restarted. This server-restart case did not pass automatic recovery.
 
 ## Google Cloud KMS backend
 
