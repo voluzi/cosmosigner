@@ -53,6 +53,65 @@ wait "$pid"
 pid=""
 test -s "$COSMOSIGNER_PKCS11_BINDING_FILE"
 
+# A rejected PIN must keep probes alive without another login, even if the PIN file is corrected.
+printf 'wrong-pin\n' > "$state/wrong-pin"
+chmod 600 "$state/wrong-pin"
+"$binary" start "${common[@]}" --pkcs11-pin-file "$state/wrong-pin" \
+  --raft-data-dir "$state/pin-hold-raft" --http-addr 127.0.0.1:0 > "$state/pin-hold.log" 2>&1 &
+pid=$!
+held=false
+for _ in {1..100}; do
+  if ! kill -0 "$pid" 2>/dev/null; then cat "$state/pin-hold.log" >&2; exit 1; fi
+  address=$(sed -n 's/.*health endpoints listening.*addr=\(127\.0\.0\.1:[0-9]*\).*/\1/p' "$state/pin-hold.log" | head -1)
+  if [[ -n "$address" ]] && grep -q 'PKCS#11 startup blocked until restart' "$state/pin-hold.log"; then
+    held=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$held" != true ]]; then cat "$state/pin-hold.log" >&2; exit 1; fi
+test "$(curl -sS -o /dev/null -w '%{http_code}' "http://$address/livez")" = 200
+test "$(curl -sS -o /dev/null -w '%{http_code}' "http://$address/readyz")" = 503
+curl -fsS "http://$address/status" | grep -q '"ready":false'
+test ! -e "$state/pin-hold-raft"
+cp "$COSMOSIGNER_PKCS11_PIN_FILE" "$state/wrong-pin"
+sleep 1
+kill -0 "$pid"
+test "$(curl -sS -o /dev/null -w '%{http_code}' "http://$address/readyz")" = 503
+test "$(grep -c 'PKCS#11 startup blocked until restart' "$state/pin-hold.log")" = 1
+kill -TERM "$pid"
+for _ in {1..100}; do
+  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+if kill -0 "$pid" 2>/dev/null; then echo 'PIN hold did not stop on SIGTERM' >&2; exit 1; fi
+wait "$pid"
+pid=""
+test "$(grep -c 'PKCS#11 startup blocked until restart' "$state/pin-hold.log")" = 1
+test "$(grep -c 'err=.*pkcs11 PIN failure latched' "$state/pin-hold.log")" = 1
+if curl -fsS --max-time 1 "http://$address/livez" > /dev/null 2>&1; then
+  echo 'PIN hold left the health listener open after SIGTERM' >&2
+  exit 1
+fi
+cat "$state/pin-hold.log"
+
+printf 'wrong-pin\n' > "$state/wrong-pin"
+"$binary" start "${common[@]}" --pkcs11-pin-file "$state/wrong-pin" \
+  --http-addr '' > "$state/pin-exit.log" 2>&1 &
+pid=$!
+for _ in {1..100}; do
+  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+if kill -0 "$pid" 2>/dev/null; then echo 'PIN failure without HTTP did not exit' >&2; exit 1; fi
+if wait "$pid"; then echo 'PIN failure without HTTP exited successfully' >&2; exit 1; fi
+pid=""
+grep -q 'pkcs11 PIN failure latched' "$state/pin-exit.log"
+if grep -q 'PKCS#11 startup blocked until restart' "$state/pin-exit.log"; then
+  echo 'PIN failure without HTTP entered the hold' >&2
+  exit 1
+fi
+
 make build
 ./bin/cosmosigner version | grep -q 'pkcs11: false'
 if ./bin/cosmosigner pubkey > "$state/default.log" 2>&1; then
@@ -60,4 +119,4 @@ if ./bin/cosmosigner pubkey > "$state/default.log" 2>&1; then
   exit 1
 fi
 grep -q 'built without PKCS#11 support' "$state/default.log"
-printf 'PKCS#11 SoftHSM drill passed: recovery, key replacement, binding and CLI startup\n'
+printf 'PKCS#11 SoftHSM drill passed: recovery, key replacement, binding, CLI startup and PIN hold/SIGTERM/no-HTTP exit\n'

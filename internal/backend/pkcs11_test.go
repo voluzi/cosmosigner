@@ -309,13 +309,15 @@ func TestPKCS11Recovery(t *testing.T) {
 			f.signErr = pkcs11Error(0x101)
 			f.loginErr = pkcs11Error(code)
 			_, err := b.Sign([]byte("message"))
-			require.Error(t, err)
+			require.ErrorIs(t, err, ErrPKCS11PINFailure)
 			attempts := f.logins
 			for range 3 {
 				sig, e := b.Sign([]byte("message"))
-				require.Error(t, e)
+				require.ErrorIs(t, e, ErrPKCS11PINFailure)
 				require.Nil(t, sig)
 			}
+			require.ErrorIs(t, b.VerifyCanSign(t.Context()), ErrPKCS11PINFailure)
+			require.ErrorIs(t, b.ClaimCluster(t.Context(), clusterA), ErrPKCS11PINFailure)
 			require.Equal(t, attempts, f.logins)
 		})
 	}
@@ -345,4 +347,37 @@ func TestPKCS11BindingChecksLiveKey(t *testing.T) {
 	require.ErrorIs(t, b.ClaimCluster(t.Context(), clusterB), ErrBindingMismatch)
 	f.public.point = bytes.Repeat([]byte{1}, 32)
 	require.ErrorIs(t, b.ClaimCluster(t.Context(), clusterA), ErrBindingCorrupt)
+}
+
+func TestPKCS11ClaimRecoveryPreservesPINFailure(t *testing.T) {
+	cfg, f := pkcs11Fixture(t)
+	b := openFakePKCS11(t, cfg, f)
+	f.signErr = pkcs11Error(5)
+	_, err := b.Sign([]byte("message"))
+	require.Error(t, err)
+	f.loginErr = pkcs11Error(0xa0)
+	err = b.ClaimCluster(t.Context(), clusterA)
+	require.True(t, pkcs11Code(err, 0xa0), "claim recovery must preserve the PIN cause: %v", err)
+	require.ErrorIs(t, err, ErrPKCS11PINFailure)
+	require.NotErrorIs(t, err, ErrBindingCorrupt)
+	require.Equal(t, 2, f.logins)
+	_, err = b.ClusterBinding(t.Context())
+	require.ErrorIs(t, err, ErrBindingUnclaimed)
+}
+
+func TestPKCS11ConstructorLoginFailure(t *testing.T) {
+	for _, code := range []uint{0xa0, 0xa4, 5} {
+		t.Run(pkcs11Error(code).Error(), func(t *testing.T) {
+			cfg, f := pkcs11Fixture(t)
+			f.loginErr = pkcs11Error(code)
+			releases := 0
+			b, err := newPKCS11(cfg, f, func() error { releases++; return nil })
+			require.Nil(t, b)
+			require.True(t, pkcs11Code(err, code), "constructor must preserve the login cause: %v", err)
+			require.Equal(t, code != 5, errors.Is(err, ErrPKCS11PINFailure))
+			require.Equal(t, 1, f.logins)
+			require.Equal(t, 1, f.closes)
+			require.Equal(t, 1, releases)
+		})
+	}
 }

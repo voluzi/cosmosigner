@@ -151,51 +151,68 @@ func parseMembers(raw []string) ([]config.Member, error) {
 }
 
 func runStartMode(cfg config.Config, initializeOnly bool, out io.Writer) error {
-	logger, raftLogger := startLoggers(cfg.LogLevel)
-	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
-	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
-
-	hs, err := startHealthServer(cfg, logger)
-	if err != nil {
-		return err
-	}
-	defer hs.Close()
-
-	be, err := backend.New(cfg.Backend)
-	if err != nil {
-		return err
-	}
-	defer be.Close()
-	if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
-		return err
-	}
-
-	// Backend construction and public-key discovery above have context-free APIs. Intercepting signals
-	// only after them avoids swallowing SIGTERM while either call is blocked. All following startup
-	// operations and provider preflights receive the signal-aware context.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	return runStartWithContext(ctx, cfg, initializeOnly, out, be, hs, logger, raftLogger)
+	return runStart(cfg, initializeOnly, out, backend.New, func() (context.Context, context.CancelFunc) {
+		return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	})
 }
 
 func runStartModeContext(ctx context.Context, cfg config.Config, initializeOnly bool, out io.Writer) error {
+	return runStart(cfg, initializeOnly, out, backend.New, func() (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	})
+}
+
+func runStart(
+	cfg config.Config,
+	initializeOnly bool,
+	out io.Writer,
+	open func(backend.Config) (backend.KeyBackend, error),
+	startContext func() (context.Context, context.CancelFunc),
+) error {
 	logger, raftLogger := startLoggers(cfg.LogLevel)
 	writeInsecureRaftWarning(os.Stderr, cfg.Raft.Insecure)
 	writeMaxRetriesWarning(os.Stderr, os.Getenv(maxRetriesEnv))
+
 	hs, err := startHealthServer(cfg, logger)
 	if err != nil {
 		return err
 	}
 	defer hs.Close()
-	be, err := backend.New(cfg.Backend)
-	if err != nil {
+
+	var ctx context.Context
+	var stop context.CancelFunc
+	defer func() {
+		if stop != nil {
+			stop()
+		}
+	}()
+	err = func() error {
+		be, err := open(cfg.Backend)
+		if err != nil {
+			return err
+		}
+		defer be.Close()
+		if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
+			return err
+		}
+
+		// Context-free construction and public-key discovery must not swallow SIGTERM while blocked.
+		ctx, stop = startContext()
+		return runStartWithContext(ctx, cfg, initializeOnly, out, be, hs, logger, raftLogger)
+	}()
+	if hs == nil || !errors.Is(err, backend.ErrPKCS11PINFailure) {
 		return err
 	}
-	defer be.Close()
-	if err := verifyExpectedPublicKey(be, cfg.ExpectedPublicKey); err != nil {
-		return err
+	if ctx == nil {
+		ctx, stop = startContext()
 	}
-	return runStartWithContext(ctx, cfg, initializeOnly, out, be, hs, logger, raftLogger)
+	// Failed startup has released the backend and Raft; only the health listener remains.
+	logger.Error("PKCS#11 startup blocked until restart", "err", err)
+	<-ctx.Done()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // startHealthServer serves the health endpoints when http_addr is set and returns nil otherwise.

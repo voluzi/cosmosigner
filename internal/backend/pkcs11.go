@@ -15,6 +15,9 @@ import (
 	"github.com/cometbft/cometbft/crypto/ed25519"
 )
 
+// ErrPKCS11PINFailure identifies incorrect or locked PINs that prohibit further login attempts.
+var ErrPKCS11PINFailure = errors.New("pkcs11 PIN failure latched")
+
 // PKCS11Config selects a pre-existing token key. The PIN is read only from PINFile.
 type PKCS11Config struct {
 	Module      string `yaml:"module" env:"COSMOSIGNER_PKCS11_MODULE"`
@@ -160,7 +163,7 @@ func (b *PKCS11) reopen() error {
 	err = b.module.Login(b.session, pinText)
 	if err != nil && !pkcs11Code(err, 0x100) {
 		if pkcs11Code(err, 0xa0, 0xa4) {
-			b.pinFailure = fmt.Errorf("pkcs11 PIN failure latched; restart only after correcting token access: %w", err)
+			b.pinFailure = fmt.Errorf("%w; restart only after correcting token access: %w", ErrPKCS11PINFailure, err)
 		}
 		b.dropSession()
 		if b.pinFailure != nil {
@@ -309,6 +312,9 @@ func (b *PKCS11) ClaimCluster(ctx context.Context, id string) error {
 		}
 		if !b.sessionOpen {
 			if err := b.reopen(); err != nil {
+				if errors.Is(err, ErrPKCS11PINFailure) {
+					return err
+				}
 				return fmt.Errorf("%w: %v", ErrBindingCorrupt, err)
 			}
 		}

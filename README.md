@@ -522,9 +522,22 @@ session without an immediate retry; the next call reopens it. Signature validati
 an error and keep the session open. Any failure returns no signature; the Raft reservation
 stays in flight. A later call may recover when the token returns. Incorrect or locked PIN errors
 latch token access for the process by manufacturer, model and token serial number, including across
-module copies and slot changes. A token must report a non-empty serial number. Automatic restarts reset that latch and
-consume another hardware PIN attempt. Stop automatic restarts and correct access before restarting;
-repeated incorrect PINs can lock or zeroize a device according to its policy.
+module copies and slot changes. A token must report a non-empty serial number.
+
+With `http_addr` enabled, an incorrect or locked PIN during `start` construction, preflight or
+startup claim closes the backend and Raft resources, logs the cause once and keeps only the health
+listener running: `/livez` stays `200`, `/readyz` stays `503`. No further login is attempted until
+an explicit process restart, even if the PIN file is replaced. SIGTERM stops this hold cleanly
+without logging the PIN cause again. `start --initialize-only` also holds on a constructor PIN
+failure when HTTP is enabled; an init container or Job will wait for operator intervention.
+Management commands such as `pubkey` and `claim-key` still return the error immediately.
+
+Without `http_addr`, startup returns the PIN error immediately. Automatic restarts reset the
+latch and consume another hardware PIN attempt. Configure both Kubernetes startup and liveness
+probes to use `/livez`, and readiness to use `/readyz`: a startup probe on `/readyz` would restart
+a held replica. Each replica can spend one attempt, including replicas started in parallel with
+the same incorrect PIN. Correct access before explicitly restarting; repeated incorrect PINs
+can lock or zeroize a device according to its policy.
 Recovery never finalizes the module or logs out other sessions. Modules are shared
 by canonical path with reference counts; only the last close can finalize an initialization owned
 by Cosmosigner. A vendor C call that hangs cannot be cancelled and blocks signing.
@@ -907,7 +920,9 @@ HTTP endpoints. The listener is disabled by default; a port that cannot be bound
 outage or a lost quorum never makes Kubernetes restart every replica at once. The listener starts
 before the backend is opened, so it also answers during a slow startup. `/readyz` is true on
 followers as well as on the leader; it reports that the replica has joined and may take over, not
-that it is signing. `start --initialize-only` never becomes ready.
+that it is signing. A replica held after a startup PIN failure stays live and never becomes ready.
+Use `/livez` for both startup and liveness probes, and `/readyz` for readiness.
+`start --initialize-only` never becomes ready and can also hold on a PIN failure with HTTP enabled.
 
 ```json
 {
