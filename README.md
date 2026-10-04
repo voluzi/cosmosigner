@@ -275,7 +275,8 @@ otherwise the SDK region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, shared confi
 For `start --claim-if-unclaimed`, `--aws-claim-role-arn` / `backend.aws.claim_role_arn` /
 `COSMOSIGNER_AWS_CLAIM_ROLE_ARN` optionally selects a role assumed through the SDK's
 standard STS credentials provider for the claim only. The runtime identity needs
-`sts:AssumeRole` on that role; the role needs the same key permissions as `claim-key`.
+`sts:AssumeRole` on that role, and the role's trust policy must allow that runtime
+principal. The role also needs the same key permissions as `claim-key`.
 Without a claim role, startup claiming uses the runtime identity and requires
 `kms:TagResource`. An unused claim role ARN is simply unused. Standalone `claim-key`
 always uses the caller's standard credential chain, like `import` and `pubkey`.
@@ -314,6 +315,10 @@ timeout. If propagation takes longer, retry with the same cluster ID. Restrict t
 and removal permissions; an administrator who rewrites or removes this tag can break
 history protection. See [AWS KMS eventual consistency](https://docs.aws.amazon.com/kms/latest/developerguide/programming-eventual-consistency.html).
 
+The command substitution below is for a single-member Raft configuration with
+`http_addr` unset. For multiple members, follow the [Raft cluster](#high-availability-raft-cluster)
+initialize/capture/stop sequence: initialization participants stay alive to keep quorum.
+
 ```sh
 # Create a new signing key; record the printed ARN.
 ./bin/cosmosigner provision --backend awskms --aws-region eu-west-1
@@ -345,12 +350,14 @@ backend:
 `--aws-key-id`. CreateKey retries are disabled because it has no idempotency token:
 a lost response can leave a created key, so inspect KMS before retrying.
 
-`import --aws-key-id <alias-name-or-arn>` resolves the alias or, when it is missing,
+`import --aws-key-id alias/<name>` resolves the alias or, when it is missing,
 creates a customer-managed, single-Region EXTERNAL Ed25519 key and publishes the alias
 before importing material. An existing alias, key ID or key ARN follows the same path:
 `PendingImport` resumes the import; `Enabled` returns success without writes only when
 its public key matches the source. A different identity fails without writes. A missing
-ordinary key ID or key ARN is an error and never creates a replacement. Omitting
+key ID, key ARN or alias ARN is an error and never creates a replacement. Automatic
+creation accepts alias names only; an alias ARN retains its explicit account and Region
+and must already exist. Omitting
 `--aws-key-id` creates a new key on every run; use an alias for retried imports.
 The command checks any existing cluster claim and preserves it. A valid claim can
 accompany recovery after imported material was deleted: AWS permits only the original immutable material to be
