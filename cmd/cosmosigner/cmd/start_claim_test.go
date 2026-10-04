@@ -147,12 +147,14 @@ func TestOverlayStartFlagsSetsClaimSettings(t *testing.T) {
 	require.NoError(t, cmd.Flags().Set("claim-if-unclaimed", "true"))
 	require.NoError(t, cmd.Flags().Set("vault-claim-token-file", "/vault/claim"))
 	require.NoError(t, cmd.Flags().Set("gcp-claim-credentials-file", "/gcp/claim.json"))
+	require.NoError(t, cmd.Flags().Set("aws-claim-role-arn", "arn:aws:iam::123456789012:role/claim"))
 	require.NoError(t, cmd.Flags().Set("binding-file", "/data/cluster.json"))
 	cfg := &config.Config{}
 	require.NoError(t, overlayStartFlags(cmd, cfg))
 	require.True(t, cfg.ClaimIfUnclaimed)
 	require.Equal(t, "/vault/claim", cfg.Backend.Vault.ClaimTokenFile)
 	require.Equal(t, "/gcp/claim.json", cfg.Backend.GCPKMS.ClaimCredentialsFile)
+	require.Equal(t, "arn:aws:iam::123456789012:role/claim", cfg.Backend.AWSKMS.ClaimRoleARN)
 	require.Equal(t, "/data/cluster.json", cfg.Backend.SoftwareBindingFile)
 }
 

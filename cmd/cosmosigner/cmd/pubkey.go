@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/voluzi/cosmosigner/internal/backend"
@@ -26,7 +28,10 @@ func NewPubkeyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printPubKey(pub.Address().String(), pub.Bytes())
+			if aws, ok := b.(*backend.AWSKMS); ok {
+				fmt.Fprintf(cmd.OutOrStdout(), "aws key arn:    %s\n", aws.KeyARN())
+			}
+			printPubKeyTo(cmd.OutOrStdout(), pub.Address().String(), pub.Bytes())
 			return nil
 		},
 	}

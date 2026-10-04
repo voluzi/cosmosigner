@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"os"
 
 	"cloud.google.com/go/kms/apiv1/kmspb"
 	"github.com/spf13/cobra"
@@ -51,6 +53,7 @@ func NewProvisionCmd() *cobra.Command {
   software: write a priv_validator_key.json-compatible file (--key-file)
   vault:    create a non-exportable ed25519 key in the Transit engine
   gcpkms:   create an EC_SIGN_ED25519 key in Cloud KMS
+  awskms:   create a single-Region ECC_NIST_EDWARDS25519 key in AWS KMS
 
 To migrate an existing validator key, use "cosmosigner import" instead.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -68,6 +71,13 @@ To migrate an existing validator key, use "cosmosigner import" instead.`,
 				return provisionSoftware(cmd.Context(), be.SoftwareKeyFile, overwrite)
 			case backend.TypeVault:
 				return provisionVault(be.Vault)
+			case backend.TypeAWSKMS:
+				keyARN, err := backend.AWSProvisionKey(cmd.Context(), be.AWSKMS)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "provisioned AWS KMS Ed25519 key: %s\nrun cosmosigner with %s\n", keyARN, awsBackendArgs(keyARN, be.AWSKMS.Region))
+				return nil
 			case backend.TypeGCPKMS:
 				return provisionGCP(gcp, be.GCPKMS.CredentialsFile)
 			default:
@@ -149,6 +159,17 @@ func protectionLevel(s string) (kmspb.ProtectionLevel, error) {
 }
 
 func printPubKey(address string, pub []byte) {
-	fmt.Printf("address:        %s\n", address)
-	fmt.Printf("pubkey (base64): %s\n", base64.StdEncoding.EncodeToString(pub))
+	printPubKeyTo(os.Stdout, address, pub)
+}
+
+func printPubKeyTo(w io.Writer, address string, pub []byte) {
+	fmt.Fprintf(w, "address:        %s\npubkey (base64): %s\n", address, base64.StdEncoding.EncodeToString(pub))
+}
+
+func awsBackendArgs(keyARN, region string) string {
+	args := "--backend awskms --aws-key-id " + keyARN
+	if region != "" {
+		args += " --aws-region " + region
+	}
+	return args
 }

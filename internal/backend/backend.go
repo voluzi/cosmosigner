@@ -74,6 +74,7 @@ const (
 	TypeSoftware Type = "software"
 	TypeVault    Type = "vault"
 	TypeGCPKMS   Type = "gcpkms"
+	TypeAWSKMS   Type = "awskms"
 )
 
 // Config selects and configures a KeyBackend.
@@ -86,6 +87,7 @@ type Config struct {
 	SoftwareBindingFile string       `yaml:"binding_file" env:"COSMOSIGNER_BINDING_FILE"`
 	Vault               VaultConfig  `yaml:"vault"`
 	GCPKMS              GCPKMSConfig `yaml:"gcp"`
+	AWSKMS              AWSKMSConfig `yaml:"aws"`
 }
 
 // ClaimConfig returns the configuration used to write a missing cluster claim at startup. It is
@@ -98,6 +100,7 @@ func ClaimConfig(cfg Config) Config {
 	if cfg.GCPKMS.ClaimCredentialsFile != "" {
 		cfg.GCPKMS.CredentialsFile = cfg.GCPKMS.ClaimCredentialsFile
 	}
+	cfg.AWSKMS.assumeRoleARN = cfg.AWSKMS.ClaimRoleARN
 	return cfg
 }
 
@@ -108,6 +111,8 @@ func HasSeparateClaimCredentials(cfg Config) bool {
 		return cfg.Vault.ClaimTokenFile != ""
 	case TypeGCPKMS:
 		return cfg.GCPKMS.ClaimCredentialsFile != ""
+	case TypeAWSKMS:
+		return cfg.AWSKMS.ClaimRoleARN != ""
 	default:
 		return false
 	}
@@ -122,6 +127,8 @@ func New(cfg Config) (KeyBackend, error) {
 		return NewVault(cfg.Vault)
 	case TypeGCPKMS:
 		return NewGCPKMS(cfg.GCPKMS)
+	case TypeAWSKMS:
+		return NewAWSKMS(cfg.AWSKMS)
 	default:
 		return nil, fmt.Errorf("unknown backend type %q", cfg.Type)
 	}

@@ -63,6 +63,31 @@ GCP_KMS_KEY_VERSION=projects/.../cryptoKeyVersions/1 \
   go test -tags gcpkms_integration -run GCPKMS ./internal/backend/
 ```
 
+### AWS KMS
+
+The default suite uses a local HTTP KMS service with the real AWS SDK; it needs no
+credentials or cloud resources. Real signing uses a dedicated single-Region Ed25519
+key and the standard AWS credential/region chains:
+
+```sh
+AWS_REGION=eu-west-1 AWS_KMS_KEY_ID='<dedicated-test-key-arn>' \
+  go test -race -tags awskms_integration -run TestAWSKMSIntegrationSignDeterminism ./internal/backend/
+```
+
+The import drill requires explicit opt-in. It creates a billable EXTERNAL key and
+schedules deletion (seven-day waiting period) on test completion, including failures
+once the key ARN is known:
+
+```sh
+AWS_REGION=eu-west-1 AWS_KMS_IMPORT_TEST=1 \
+  go test -race -tags awskms_integration -run TestAWSKMSIntegrationImportRoundTrip ./internal/backend/
+```
+
+Use a disposable account/role with the permissions listed in the
+[README](README.md#aws-kms-backend). Run both drills before deploying this backend;
+local transport tests cannot establish AWS determinism or acceptance of Ed25519 PKCS#8 imports.
+Retain protected recovery material for real imported keys, as required by AWS.
+
 Do not commit credentials, real validator keys, generated token files, raft data, or local test data.
 
 ## Pull Request Guidelines

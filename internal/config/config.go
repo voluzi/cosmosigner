@@ -154,6 +154,10 @@ func (c *Config) Validate() error {
 		if err := backend.ValidateVaultAddressing(c.Backend.Vault.Mount, c.Backend.Vault.BindingMount, c.Backend.Vault.KeyName); err != nil {
 			return err
 		}
+	case backend.TypeAWSKMS:
+		if c.Backend.AWSKMS.KeyID == "" {
+			return fmt.Errorf("awskms backend requires backend.aws.key_id")
+		}
 	case backend.TypeGCPKMS:
 		if c.Backend.GCPKMS.KeyVersion == "" {
 			return fmt.Errorf("gcpkms backend requires backend.gcp.key_version")
