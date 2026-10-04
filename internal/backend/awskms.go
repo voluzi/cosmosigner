@@ -13,17 +13,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/cometbft/cometbft/crypto"
 	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
 )
 
 // AWSKMSConfig selects a key; credentials and region fall back to the AWS SDK chains.
 type AWSKMSConfig struct {
-	KeyID   string        `yaml:"key_id" env:"COSMOSIGNER_AWS_KEY_ID"`
-	Region  string        `yaml:"region" env:"COSMOSIGNER_AWS_REGION"`
-	Timeout time.Duration `yaml:"-" env:"COSMOSIGNER_AWS_TIMEOUT" default:"10s"`
+	KeyID  string `yaml:"key_id" env:"COSMOSIGNER_AWS_KEY_ID"`
+	Region string `yaml:"region" env:"COSMOSIGNER_AWS_REGION"`
+	// ClaimRoleARN is an optional role used only to write a missing cluster claim at startup.
+	// Without it the runtime identity must be allowed to claim.
+	ClaimRoleARN  string `yaml:"claim_role_arn" env:"COSMOSIGNER_AWS_CLAIM_ROLE_ARN"`
+	assumeRoleARN string
+	Timeout       time.Duration `yaml:"-" env:"COSMOSIGNER_AWS_TIMEOUT" default:"10s"`
 }
 
 // AWSKMS pins a single-Region key ARN and verifies every signature locally.
@@ -49,6 +55,9 @@ func newAWSClient(ctx context.Context, cfg AWSKMSConfig) (*kms.Client, error) {
 	loaded, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS configuration: %w", err)
+	}
+	if cfg.assumeRoleARN != "" {
+		loaded.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(sts.NewFromConfig(loaded), cfg.assumeRoleARN))
 	}
 	return kms.NewFromConfig(loaded), nil
 }

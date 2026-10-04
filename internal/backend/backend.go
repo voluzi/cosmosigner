@@ -100,6 +100,7 @@ func ClaimConfig(cfg Config) Config {
 	if cfg.GCPKMS.ClaimCredentialsFile != "" {
 		cfg.GCPKMS.CredentialsFile = cfg.GCPKMS.ClaimCredentialsFile
 	}
+	cfg.AWSKMS.assumeRoleARN = cfg.AWSKMS.ClaimRoleARN
 	return cfg
 }
 
@@ -110,6 +111,8 @@ func HasSeparateClaimCredentials(cfg Config) bool {
 		return cfg.Vault.ClaimTokenFile != ""
 	case TypeGCPKMS:
 		return cfg.GCPKMS.ClaimCredentialsFile != ""
+	case TypeAWSKMS:
+		return cfg.AWSKMS.ClaimRoleARN != ""
 	default:
 		return false
 	}

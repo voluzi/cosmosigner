@@ -318,13 +318,14 @@ func TestValidate_ClaimCredentialsMustMatchTheBackend(t *testing.T) {
 
 func TestLoadAWSKMSConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cosmosigner.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("chain_id: chain\nnodes: [node:5555]\nbackend:\n  type: awskms\n  aws:\n    key_id: alias/from-file\n    region: eu-west-1\nraft:\n  insecure: true\n"), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte("chain_id: chain\nnodes: [node:5555]\nbackend:\n  type: awskms\n  aws:\n    key_id: alias/from-file\n    region: eu-west-1\n    claim_role_arn: arn:aws:iam::123456789012:role/claim\nraft:\n  insecure: true\n"), 0o600))
 	t.Setenv("COSMOSIGNER_AWS_KEY_ID", "alias/from-env")
 	t.Setenv("COSMOSIGNER_AWS_TIMEOUT", "3s")
 	cfg, err := Load(path, nil)
 	require.NoError(t, err)
 	require.Equal(t, "alias/from-env", cfg.Backend.AWSKMS.KeyID)
 	require.Equal(t, "eu-west-1", cfg.Backend.AWSKMS.Region)
+	require.Equal(t, "arn:aws:iam::123456789012:role/claim", cfg.Backend.AWSKMS.ClaimRoleARN)
 	require.Equal(t, 3*time.Second, cfg.Backend.AWSKMS.Timeout)
 	cfg.Backend.AWSKMS.KeyID = ""
 	require.ErrorContains(t, cfg.Validate(), "backend.aws.key_id")

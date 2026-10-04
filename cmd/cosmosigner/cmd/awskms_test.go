@@ -9,12 +9,14 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -244,4 +246,108 @@ func TestPubkeyAWSCommandPrintsResolvedARN(t *testing.T) {
 	require.NoError(t, command.Execute())
 	pub := cmted25519.PubKey(key.Public().(ed25519.PublicKey))
 	require.Equal(t, "aws key arn:    "+awsCommandARN+"\naddress:        "+pub.Address().String()+"\npubkey (base64): "+base64.StdEncoding.EncodeToString(pub)+"\n", output.String())
+}
+
+func TestAWSClaimRoleAssumedOnlyForClaim(t *testing.T) {
+	const roleARN = "arn:aws:iam::123456789012:role/claim"
+	for _, mode := range []string{"startup role", "startup caller", "standalone caller"} {
+		t.Run(mode, func(t *testing.T) {
+			var assumes, tags, signs, runtimeReads atomic.Int32
+			var claiming, claimed atomic.Bool
+			stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assumes.Add(1)
+				assert.NoError(t, r.ParseForm())
+				assert.Equal(t, "AssumeRole", r.Form.Get("Action"))
+				assert.Equal(t, roleARN, r.Form.Get("RoleArn"))
+				assert.Contains(t, r.Header.Get("Authorization"), "Credential=test-access-key/")
+				w.Header().Set("Content-Type", "text/xml")
+				_, err := fmt.Fprintf(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>assumed-access-key</AccessKeyId><SecretAccessKey>assumed-secret-key</SecretAccessKey><SessionToken>claim-session-token</SessionToken><Expiration>%s</Expiration></Credentials><AssumedRoleUser><Arn>arn:aws:sts::123456789012:assumed-role/claim/test</Arn><AssumedRoleId>claim:test</AssumedRoleId></AssumedRoleUser></AssumeRoleResult></AssumeRoleResponse>`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+				assert.NoError(t, err)
+			}))
+			t.Cleanup(stsServer.Close)
+			key := ed25519.NewKeyFromSeed(make([]byte, 32))
+			der, err := x509.MarshalPKIXPublicKey(key.Public())
+			require.NoError(t, err)
+			kmsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					KeyId   string
+					Message []byte
+					Tags    []struct{ TagKey, TagValue string }
+				}
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				assert.Equal(t, awsCommandARN, req.KeyId)
+				accessKey, token := "test-access-key", ""
+				if claiming.Load() && mode == "startup role" {
+					accessKey, token = "assumed-access-key", "claim-session-token"
+				}
+				assert.Contains(t, r.Header.Get("Authorization"), "Credential="+accessKey+"/")
+				assert.Equal(t, token, r.Header.Get("X-Amz-Security-Token"))
+				var body any
+				switch op := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "TrentService."); op {
+				case "GetPublicKey":
+					if !claiming.Load() {
+						runtimeReads.Add(1)
+					}
+					body = map[string]any{"KeyId": awsCommandARN, "KeySpec": "ECC_NIST_EDWARDS25519", "KeyUsage": "SIGN_VERIFY", "SigningAlgorithms": []string{"ED25519_SHA_512"}, "PublicKey": der}
+				case "ListResourceTags":
+					if !claiming.Load() {
+						runtimeReads.Add(1)
+					}
+					body = map[string]any{}
+					if claimed.Load() {
+						body = map[string]any{"Tags": []map[string]string{{"TagKey": "cosmosigner-cluster-id", "TagValue": startTestClusterID}}}
+					}
+				case "TagResource":
+					tags.Add(1)
+					assert.Equal(t, []struct{ TagKey, TagValue string }{{"cosmosigner-cluster-id", startTestClusterID}}, req.Tags)
+					claimed.Store(true)
+					body = map[string]any{}
+				case "Sign":
+					signs.Add(1)
+					body = map[string]any{"KeyId": awsCommandARN, "SigningAlgorithm": "ED25519_SHA_512", "Signature": ed25519.Sign(key, req.Message)}
+				default:
+					t.Errorf("unexpected AWS call %s", op)
+					w.WriteHeader(400)
+					return
+				}
+				w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+				assert.NoError(t, json.NewEncoder(w).Encode(body))
+			}))
+			t.Cleanup(kmsServer.Close)
+			commandAWSConfig(t, kmsServer.URL)
+			t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+			cfg := backend.Config{Type: backend.TypeAWSKMS, AWSKMS: backend.AWSKMSConfig{KeyID: awsCommandARN, Region: "eu-west-2"}}
+			if mode != "startup caller" {
+				cfg.AWSKMS.ClaimRoleARN = roleARN
+			}
+			be, err := backend.New(cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, be.Close()) })
+			claiming.Store(true)
+			if mode == "standalone caller" {
+				t.Setenv("COSMOSIGNER_AWS_CLAIM_ROLE_ARN", roleARN)
+				command := NewClaimKeyCmd()
+				command.SetOut(io.Discard)
+				command.SetErr(io.Discard)
+				command.SetArgs([]string{"--backend", "awskms", "--aws-key-id", awsCommandARN, "--aws-region", "eu-west-2", "--cluster-id", startTestClusterID})
+				require.NoError(t, command.Execute())
+			} else {
+				require.NoError(t, claimWithConfig(backend.ClaimConfig(cfg), be, backend.HasSeparateClaimCredentials(cfg), newCmtLogger("error"))(t.Context(), startTestClusterID))
+			}
+			claiming.Store(false)
+			require.NoError(t, backend.RequireClusterBinding(t.Context(), be, startTestClusterID))
+			message := []byte("runtime message after claim")
+			signature, err := be.Sign(message)
+			require.NoError(t, err)
+			require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), message, signature))
+			require.EqualValues(t, 1, tags.Load())
+			require.EqualValues(t, 1, signs.Load())
+			require.EqualValues(t, 2, runtimeReads.Load())
+			if mode == "startup role" {
+				require.EqualValues(t, 1, assumes.Load())
+			} else {
+				require.Zero(t, assumes.Load())
+			}
+		})
+	}
 }

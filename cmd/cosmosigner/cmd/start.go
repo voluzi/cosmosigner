@@ -71,6 +71,7 @@ func NewStartCmd() *cobra.Command {
 	f.Bool("claim-if-unclaimed", false, "write the key's cluster claim at startup when none exists; a claim held by another cluster is still refused")
 	f.String("vault-claim-token-file", "", "optional vault token used only for the --claim-if-unclaimed startup claim")
 	f.String("gcp-claim-credentials-file", "", "optional gcp service account JSON used only for the --claim-if-unclaimed startup claim")
+	f.String("aws-claim-role-arn", "", "optional aws role assumed only for the --claim-if-unclaimed startup claim")
 	registerBackendFlags(cmd)
 	return cmd
 }
@@ -130,6 +131,7 @@ func overlayStartFlags(cmd *cobra.Command, c *config.Config) error {
 	}
 	s("vault-claim-token-file", &c.Backend.Vault.ClaimTokenFile)
 	s("gcp-claim-credentials-file", &c.Backend.GCPKMS.ClaimCredentialsFile)
+	s("aws-claim-role-arn", &c.Backend.AWSKMS.ClaimRoleARN)
 	overlayBackendFlags(cmd, &c.Backend)
 	return nil
 }
