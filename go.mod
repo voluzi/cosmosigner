@@ -1,8 +1,6 @@
 module github.com/voluzi/cosmosigner
 
-go 1.26.10
-
-toolchain go1.27.3
+go 1.27.3
 
 require (
 	cloud.google.com/go/kms v1.35.0
