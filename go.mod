@@ -2,6 +2,8 @@ module github.com/voluzi/cosmosigner
 
 go 1.26.0
 
+toolchain go1.27.3
+
 require (
 	cloud.google.com/go/kms v1.35.0
 	github.com/aws/aws-sdk-go-v2 v1.47.3

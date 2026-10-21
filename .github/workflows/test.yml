@@ -67,7 +67,7 @@ jobs:
     name: Native release snapshot (Debian 12 amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    container: golang:1.27.1-bookworm
+    container: golang:1.27.3-bookworm
     permissions:
       contents: read
     steps:
