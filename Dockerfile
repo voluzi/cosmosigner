@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27.3-alpine AS builder
 
 ARG VERSION=dev
 ARG COMMIT=none
@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/go/pkg \
   VERSION=$VERSION COMMIT=$COMMIT make build
 
-FROM golang:1.27.1-bookworm AS builder-pkcs11
+FROM golang:1.27.3-bookworm AS builder-pkcs11
 ARG VERSION=dev
 ARG COMMIT=none
 WORKDIR /src/app/
