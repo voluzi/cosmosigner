@@ -71,7 +71,7 @@ jobs:
       - name: Trust the mounted checkout for release tools
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Validate and build all release archives
-        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: '~> v2'
           args: release --snapshot --clean --skip=publish
